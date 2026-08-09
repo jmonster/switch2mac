@@ -27,6 +27,13 @@ final class ControllerSettings: ObservableObject {
         UserDefaults.standard.set(store, forKey: Self.defaultsKey)
     }
 
+    /// Re-read from UserDefaults (after an import overwrote the store).
+    func reload() {
+        store = UserDefaults.standard.dictionary(forKey: Self.defaultsKey)
+            as? [String: [String: Any]] ?? [:]
+        objectWillChange.send()
+    }
+
     /// Forget everything stored about a controller (name, mappings, axis
     /// options, mouse mode, hold style).
     func removeSettings(forSerial serial: String) {
@@ -170,6 +177,37 @@ final class ControllerSettings: ObservableObject {
     func setMouseSensitivity(_ value: Double, forSerial serial: String) {
         var entry = store[serial] ?? [:]
         entry["mouseSensitivity"] = value
+        store[serial] = entry
+        persist()
+    }
+
+    // MARK: Trigger threshold (0..1 travel before ZL/ZR registers)
+
+    func triggerThreshold(forSerial serial: String) -> Double {
+        store[serial]?["triggerThreshold"] as? Double ?? 0.0
+    }
+
+    func setTriggerThreshold(_ value: Double, forSerial serial: String) {
+        var entry = store[serial] ?? [:]
+        entry["triggerThreshold"] = value
+        store[serial] = entry
+        persist()
+    }
+
+    // MARK: Stick center calibration (drift correction offsets, raw units)
+
+    func stickCenterOffset(forSerial serial: String) -> (l: (Double, Double), r: (Double, Double)) {
+        let e = store[serial] ?? [:]
+        let l = e["stickCenterL"] as? [Double] ?? [0, 0]
+        let r = e["stickCenterR"] as? [Double] ?? [0, 0]
+        return ((l.first ?? 0, l.count > 1 ? l[1] : 0),
+                (r.first ?? 0, r.count > 1 ? r[1] : 0))
+    }
+
+    func setStickCenterOffset(l: (Double, Double), r: (Double, Double), forSerial serial: String) {
+        var entry = store[serial] ?? [:]
+        entry["stickCenterL"] = [l.0, l.1]
+        entry["stickCenterR"] = [r.0, r.1]
         store[serial] = entry
         persist()
     }

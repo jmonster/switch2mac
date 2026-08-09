@@ -35,6 +35,9 @@ struct FTCWApp: App {
             ChallengeView(coordinator: appDelegate.challenges, engine: appDelegate.engine)
         }
         .defaultSize(width: 500, height: 480)
+
+        Window("About", id: "about") { AboutView() }
+            .windowResizability(.contentSize)
     }
 }
 
@@ -50,6 +53,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         engine.addSink(UDPHub())
         engine.addSink(VirtualHIDSink())
         notifications.attach(to: engine)
+
+        // First-run onboarding.
+        if !UserDefaults.standard.bool(forKey: "onboardingSeen") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.showOnboarding()
+            }
+        }
+    }
+
+    private var onboardingWindow: NSWindow?
+
+    func showOnboarding() {
+        if let w = onboardingWindow { w.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
+        let hosting = NSHostingController(rootView: OnboardingView())
+        let window = NSWindow(contentViewController: hosting)
+        window.title = "Welcome"
+        window.styleMask = [.titled, .closable]
+        window.isReleasedWhenClosed = false
+        window.center()
+        onboardingWindow = window
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 }
 
@@ -85,6 +110,13 @@ struct MenuContent: View {
 
         Button("Sensor Challenges") {
             openWindow(id: "challenges")
+            NSApp.activate(ignoringOtherApps: true)
+        }
+
+        Divider()
+
+        Button("About") {
+            openWindow(id: "about")
             NSApp.activate(ignoringOtherApps: true)
         }
 

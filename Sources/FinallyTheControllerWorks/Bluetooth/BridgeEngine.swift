@@ -803,6 +803,21 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
             s.leftStick = Self.radialDeadzone(s.leftStick, dz)
             s.rightStick = Self.radialDeadzone(s.rightStick, dz)
         }
+        // Stick center offset (drift correction): shift then re-clamp.
+        if let cl = entry["stickCenterL"] as? [Double], cl.count == 2 {
+            s.leftStick.x = max(-1, min(1, s.leftStick.x - cl[0]))
+            s.leftStick.y = max(-1, min(1, s.leftStick.y - cl[1]))
+        }
+        if let cr = entry["stickCenterR"] as? [Double], cr.count == 2 {
+            s.rightStick.x = max(-1, min(1, s.rightStick.x - cr[0]))
+            s.rightStick.y = max(-1, min(1, s.rightStick.y - cr[1]))
+        }
+        // Trigger threshold: ZL/ZR only assert past the configured travel.
+        if let thr = entry["triggerThreshold"] as? Double, thr > 0 {
+            let cut = UInt8(min(255, thr * 255))
+            if s.leftTrigger < cut { s.leftTrigger = 0 }
+            if s.rightTrigger < cut { s.rightTrigger = 0 }
+        }
         if entry["invertLX"] as? Bool ?? false { s.leftStick.x = -s.leftStick.x }
         if entry["invertLY"] as? Bool ?? false { s.leftStick.y = -s.leftStick.y }
         if entry["invertRX"] as? Bool ?? false { s.rightStick.x = -s.rightStick.x }

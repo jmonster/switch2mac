@@ -74,26 +74,32 @@ struct DashboardView: View {
     private var controllerList: some View {
         VStack(spacing: 8) {
             ForEach(engine.controllers) { controller in
-                ControllerCard(status: controller,
-                               pairing: pairingInfo(for: controller),
-                               live: controller.player >= 0
-                                   ? engine.liveStates[controller.player] : nil,
-                               findRSSI: engine.findingSerial == controller.serial
-                                   ? engine.findRSSI : nil,
-                               onTestRumble: { engine.testRumble(player: controller.player) },
-                               onNFCProbe: { engine.nfcProbe(serial: controller.serial) },
-                               onAudioCapture: { engine.audioCapture(serial: controller.serial) },
-                               onAudioTone: { engine.audioToneTest(serial: controller.serial) },
-                               onAudioBaseline: { engine.audioBaseline(serial: controller.serial) },
-                               onDisconnect: { engine.disconnect(serial: controller.serial) },
-                               onForget: { engine.forget(serial: controller.serial) },
-                               onFind: { engine.findController(serial: controller.serial) },
-                               isFinding: engine.findingSerial == controller.serial,
-                               onLedChanged: { engine.refreshLEDs(serial: controller.serial) },
-                               info: engine.info(serial: controller.serial))
+                card(for: controller)
             }
         }
         .padding()
+    }
+
+    @ViewBuilder
+    private func card(for controller: ControllerStatus) -> some View {
+        let serial = controller.serial
+        let player = controller.player
+        ControllerCard(
+            status: controller,
+            pairing: pairingInfo(for: controller),
+            live: player >= 0 ? engine.liveStates[player] : nil,
+            findRSSI: engine.findingSerial == serial ? engine.findRSSI : nil,
+            onTestRumble: { engine.testRumble(player: player) },
+            onNFCProbe: { engine.nfcProbe(serial: serial) },
+            onAudioCapture: { engine.audioCapture(serial: serial) },
+            onAudioTone: { engine.audioToneTest(serial: serial) },
+            onAudioBaseline: { engine.audioBaseline(serial: serial) },
+            onDisconnect: { engine.disconnect(serial: serial) },
+            onForget: { engine.forget(serial: serial) },
+            onFind: { engine.findController(serial: serial) },
+            isFinding: engine.findingSerial == serial,
+            onLedChanged: { engine.refreshLEDs(serial: serial) },
+            info: engine.info(serial: serial))
     }
 
     /// Grip context for a card. A merged pair offers Unlink; a lone Joy-Con
@@ -349,6 +355,24 @@ struct ControllerCard: View {
                                     .frame(width: 44, alignment: .trailing)
                                     .foregroundStyle(.secondary)
                             }
+                            Divider()
+                            HStack {
+                                Text("Stick drift").frame(width: 90, alignment: .leading)
+                                Button("Recenter sticks now") { recenterSticks() }
+                                    .help("Let go of the sticks, then click — captures the resting position as the new center")
+                                Button("Reset") {
+                                    settings.setStickCenterOffset(l: (0, 0), r: (0, 0),
+                                                                  forSerial: status.serial)
+                                }
+                            }
+                            HStack(spacing: 12) {
+                                Text("Trigger threshold").frame(width: 120, alignment: .leading)
+                                Slider(value: triggerBinding, in: 0...0.9, step: 0.05)
+                                    .help("How far ZL/ZR must travel before registering (analog triggers)")
+                                Text("\(Int(settings.triggerThreshold(forSerial: status.serial) * 100))%")
+                                    .monospacedDigit().frame(width: 44, alignment: .trailing)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                         .padding(.top, 6)
                     }
@@ -572,6 +596,25 @@ struct ControllerCard: View {
         Binding(get: get, set: set)
     }
 
+    private var triggerBinding: Binding<Double> {
+        Binding(
+            get: { settings.triggerThreshold(forSerial: status.serial) },
+            set: { settings.setTriggerThreshold($0, forSerial: status.serial) }
+        )
+    }
+
+    /// Capture the current resting stick position and fold it into the
+    /// stored center offset (live values are already offset-adjusted, so
+    /// the new offset is old + current).
+    private func recenterSticks() {
+        guard let live else { return }
+        let old = settings.stickCenterOffset(forSerial: status.serial)
+        settings.setStickCenterOffset(
+            l: (old.l.0 + live.leftStick.x, old.l.1 + live.leftStick.y),
+            r: (old.r.0 + live.rightStick.x, old.r.1 + live.rightStick.y),
+            forSerial: status.serial)
+    }
+
     /// Joy-Con accent colors on the model line: neon red for the right
     /// unit, neon blue for the left — matching the hardware.
     private var modelColor: Color {
@@ -625,9 +668,34 @@ struct ConfigurationSection: View {
             Text("A sleeping controller reconnects the moment any button is pressed.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            Divider()
+            HStack(spacing: 10) {
+                Text("Settings backup")
+                Button("Export…") { exportSettings() }
+                Button("Import…") { importSettings() }
+            }
         }
         .toggleStyle(.checkbox)
         .padding(.vertical, 8)
+    }
+
+    private func exportSettings() {
+        guard let data = SettingsTransfer.export() else { return }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "FinallyControllers.ftcw"
+        panel.begin { resp in
+            if resp == .OK, let url = panel.url { try? data.write(to: url) }
+        }
+    }
+
+    private func importSettings() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.data]
+        panel.begin { resp in
+            if resp == .OK, let url = panel.url, let data = try? Data(contentsOf: url) {
+                _ = SettingsTransfer.import(data)
+            }
+        }
     }
 }
 
