@@ -1,19 +1,89 @@
 // MotionVisualizer.swift
-// Turns the raw motion numbers into instruments:
+// Turns the raw motion numbers into smooth instruments:
 //  * Attitude bubble — pitch/roll from the accelerometer (gravity vector),
 //    like a bullseye spirit level: the dot is where "down" is.
-//  * Gyro bars — rotation-rate magnitude per axis, so any twitch is visible.
-//  * Compass — heading from the magnetometer after hard-iron calibration
-//    (wave the controller in a figure-8 during the 10 s calibration window;
-//    the min/max midpoints become the stored per-controller bias).
+//  * Gyro bars — rotation-rate magnitude per axis.
+//  * Compass — TILT-COMPENSATED heading: the magnetic vector is de-rotated
+//    by the accelerometer-derived pitch/roll before atan2, so the needle
+//    stays correct even when the controller isn't lying flat.
+//
+// All displayed values pass through a light exponential smoother
+// (SmoothedMotion) so the animations glide instead of jittering, while a
+// high smoothing factor keeps them responsive.
 
 import SwiftUI
+
+/// Exponential moving average of the motion channels we display. Updated on
+/// the main actor from the ~10 Hz liveStates feed; a display-linked timer is
+/// unnecessary because SwiftUI animates between published values.
+@MainActor
+final class SmoothedMotion: ObservableObject {
+    @Published var accel: (x: Double, y: Double, z: Double) = (0, 0, 1)
+    @Published var gyroMag: (x: Double, y: Double, z: Double) = (0, 0, 0)
+    @Published var heading: Double? = nil
+
+    /// 0..1; higher = snappier, lower = smoother. 0.35 is a good balance.
+    private let alpha = 0.35
+
+    func update(_ state: ControllerState?, serial: String) {
+        guard let s = state else { return }
+        let ax = Double(s.accel.0), ay = Double(s.accel.1), az = Double(s.accel.2)
+        accel = (lerp(accel.x, ax), lerp(accel.y, ay), lerp(accel.z, az))
+        gyroMag = (lerp(gyroMag.x, abs(Double(s.gyro.0))),
+                   lerp(gyroMag.y, abs(Double(s.gyro.1))),
+                   lerp(gyroMag.z, abs(Double(s.gyro.2))))
+        heading = Self.tiltCompensatedHeading(mag: s.mag, ax: ax, ay: ay, az: az,
+                                              serial: serial, previous: heading)
+    }
+
+    private func lerp(_ current: Double, _ target: Double) -> Double {
+        current + (target - current) * alpha
+    }
+
+    /// Tilt-compensated compass heading in degrees, or nil if no field.
+    /// Standard AHRS derivation: pitch/roll from gravity, then rotate the
+    /// magnetometer vector into the horizontal plane.
+    static func tiltCompensatedHeading(mag: (Int16, Int16, Int16),
+                                       ax: Double, ay: Double, az: Double,
+                                       serial: String,
+                                       previous: Double?) -> Double? {
+        guard mag != (0, 0, 0) else { return nil }
+        let bias = ControllerSettings.shared.magBias(forSerial: serial) ?? (0, 0, 0)
+        let mx = Double(mag.0) - bias.x
+        let my = Double(mag.1) - bias.y
+        let mz = Double(mag.2) - bias.z
+
+        // Normalize gravity → pitch (around x) and roll (around y).
+        let norm = (ax*ax + ay*ay + az*az).squareRoot()
+        guard norm > 1 else { return previous }
+        let axn = ax / norm, ayn = ay / norm
+        let pitch = asin(-axn)
+        let roll = asin(ayn / cos(pitch))
+        guard pitch.isFinite, roll.isFinite else { return previous }
+
+        // De-rotate the magnetic vector into the horizontal plane.
+        let xh = mx * cos(pitch) + mz * sin(pitch)
+        let yh = mx * sin(roll) * sin(pitch) + my * cos(roll) - mz * sin(roll) * cos(pitch)
+        var heading = atan2(yh, xh) * 180 / .pi
+        if heading < 0 { heading += 360 }
+
+        // Shortest-path smoothing across the 0/360 wrap.
+        if let prev = previous {
+            var delta = heading - prev
+            if delta > 180 { delta -= 360 }
+            if delta < -180 { delta += 360 }
+            heading = (prev + delta * 0.35 + 360).truncatingRemainder(dividingBy: 360)
+        }
+        return heading
+    }
+}
 
 struct MotionVisualizer: View {
     let state: ControllerState?
     let serial: String
 
     @ObservedObject private var settings = ControllerSettings.shared
+    @StateObject private var motion = SmoothedMotion()
     @State private var calibrating = false
     @State private var calibrationEnd = Date()
     @State private var minSample = (x: Double.infinity, y: Double.infinity, z: Double.infinity)
@@ -21,46 +91,29 @@ struct MotionVisualizer: View {
 
     var body: some View {
         VStack(spacing: 8) {
-            HStack(spacing: 24) {
-                AttitudeBubble(accel: state?.accel)
-                GyroBars(gyro: state?.gyro)
-                CompassDial(heading: heading)
+            HStack(spacing: 28) {
+                AttitudeBubble(accel: motion.accel)
+                GyroBars(gyro: motion.gyroMag)
+                CompassDial(heading: motion.heading)
             }
-            HStack(spacing: 10) {
-                Button(calibrating ? "Wave it in a figure-8…" : "Calibrate compass") {
-                    startCalibration()
-                }
-                .disabled(calibrating)
-                .controlSize(.small)
-                if let m = state?.mag {
-                    Text("mag \(m.0) \(m.1) \(m.2) · gyro \(state?.gyro.0 ?? 0) \(state?.gyro.1 ?? 0) \(state?.gyro.2 ?? 0)")
-                        .font(.system(.caption2, design: .monospaced))
-                        .foregroundStyle(.tertiary)
-                }
+            Button(calibrating ? "Wave it in a figure-8…" : "Calibrate compass") {
+                startCalibration()
             }
+            .disabled(calibrating)
+            .controlSize(.small)
         }
-        .onChange(of: magKey) { _, _ in
-            guard calibrating, let m = state?.mag else { return }
-            let s = (x: Double(m.0), y: Double(m.1), z: Double(m.2))
-            minSample = (min(minSample.x, s.x), min(minSample.y, s.y), min(minSample.z, s.z))
-            maxSample = (max(maxSample.x, s.x), max(maxSample.y, s.y), max(maxSample.z, s.z))
-            if Date() >= calibrationEnd {
-                calibrating = false
-                let bias = (x: (minSample.x + maxSample.x) / 2,
-                            y: (minSample.y + maxSample.y) / 2,
-                            z: (minSample.z + maxSample.z) / 2)
-                settings.setMagBias(bias, forSerial: serial)
-                bridgeLog(.info, "motion",
-                          "compass calibrated: bias \(Int(bias.x)) \(Int(bias.y)) \(Int(bias.z))")
+        .onChange(of: liveKey) { _, _ in
+            withAnimation(.easeOut(duration: 0.08)) {
+                motion.update(state, serial: serial)
             }
+            accumulateCalibration()
         }
     }
 
-    /// Change-detection key for the magnetometer tuple (tuples aren't
-    /// Equatable in onChange).
-    private var magKey: String {
-        guard let m = state?.mag else { return "-" }
-        return "\(m.0),\(m.1),\(m.2)"
+    /// Compact change key so onChange fires on every fresh liveState.
+    private var liveKey: String {
+        guard let s = state else { return "-" }
+        return "\(s.accel.0),\(s.accel.1),\(s.mag.0),\(s.gyro.0)"
     }
 
     private func startCalibration() {
@@ -69,23 +122,30 @@ struct MotionVisualizer: View {
         minSample = (.infinity, .infinity, .infinity)
         maxSample = (-.infinity, -.infinity, -.infinity)
         bridgeLog(.info, "motion",
-                  "compass calibration: wave the controller in a slow figure-8 for 10 seconds")
+                  "compass calibration: wave the controller in a slow figure-8, "
+                  + "rolling it through all orientations, for 10 seconds")
     }
 
-    /// Heading in degrees from the bias-corrected horizontal field.
-    private var heading: Double? {
-        guard let m = state?.mag, m != (0, 0, 0) else { return nil }
-        let bias = settings.magBias(forSerial: serial) ?? (0, 0, 0)
-        let x = Double(m.0) - bias.x
-        let y = Double(m.1) - bias.y
-        let radians = atan2(y, x)
-        return (radians * 180 / .pi + 360).truncatingRemainder(dividingBy: 360)
+    private func accumulateCalibration() {
+        guard calibrating, let m = state?.mag, m != (0, 0, 0) else { return }
+        let s = (x: Double(m.0), y: Double(m.1), z: Double(m.2))
+        minSample = (min(minSample.x, s.x), min(minSample.y, s.y), min(minSample.z, s.z))
+        maxSample = (max(maxSample.x, s.x), max(maxSample.y, s.y), max(maxSample.z, s.z))
+        if Date() >= calibrationEnd {
+            calibrating = false
+            let bias = (x: (minSample.x + maxSample.x) / 2,
+                        y: (minSample.y + maxSample.y) / 2,
+                        z: (minSample.z + maxSample.z) / 2)
+            settings.setMagBias(bias, forSerial: serial)
+            bridgeLog(.info, "motion",
+                      "compass calibrated: bias \(Int(bias.x)) \(Int(bias.y)) \(Int(bias.z))")
+        }
     }
 }
 
 /// Bullseye level: the dot shows where gravity points.
 private struct AttitudeBubble: View {
-    let accel: (Int16, Int16, Int16)?
+    let accel: (x: Double, y: Double, z: Double)
 
     var body: some View {
         VStack(spacing: 2) {
@@ -104,33 +164,31 @@ private struct AttitudeBubble: View {
     }
 
     private var offset: CGSize {
-        guard let a = accel else { return .zero }
         // Normalize gravity to the disc; 1 g ≈ 4096 raw (typical ±8 g range).
         let scale = 22.0 / 4096.0
-        let dx = max(-22, min(22, Double(a.0) * scale))
-        let dy = max(-22, min(22, Double(a.1) * scale))
-        return CGSize(width: dx, height: dy)
+        return CGSize(width: max(-22, min(22, accel.x * scale)),
+                      height: max(-22, min(22, accel.y * scale)))
     }
 }
 
 /// Rotation-rate magnitude per axis.
 private struct GyroBars: View {
-    let gyro: (Int16, Int16, Int16)?
+    let gyro: (x: Double, y: Double, z: Double)
 
     var body: some View {
         VStack(spacing: 2) {
             HStack(alignment: .bottom, spacing: 5) {
-                bar(gyro?.0, "x")
-                bar(gyro?.1, "y")
-                bar(gyro?.2, "z")
+                bar(gyro.x, "x")
+                bar(gyro.y, "y")
+                bar(gyro.z, "z")
             }
             .frame(height: 56, alignment: .bottom)
             Text("spin").font(.caption2).foregroundStyle(.tertiary)
         }
     }
 
-    private func bar(_ value: Int16?, _ label: String) -> some View {
-        let magnitude = min(1.0, abs(Double(value ?? 0)) / 8000.0)
+    private func bar(_ value: Double, _ label: String) -> some View {
+        let magnitude = min(1.0, value / 8000.0)
         return VStack(spacing: 2) {
             RoundedRectangle(cornerRadius: 2)
                 .fill(magnitude > 0.02 ? Color.accentColor : Color.gray.opacity(0.25))
