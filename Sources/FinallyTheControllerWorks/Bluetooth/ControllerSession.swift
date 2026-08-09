@@ -60,6 +60,9 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     private var commandTimeout: DispatchWorkItem?
     private var handshakeSteps: [(String, (@escaping (Bool) -> Void) -> Void)] = []
 
+    /// 1-based player number shown on the LEDs; the engine reassigns it when
+    /// logical players shuffle (e.g. Joy-Cons link into a grip).
+    private(set) var playerNumber: Int
     private var keepAliveTimer: DispatchSourceTimer?
     private var lastWriteAt: TimeInterval = 0
     private var vibrationPacketID: UInt8 = 0
@@ -81,11 +84,21 @@ final class ControllerSession: NSObject, @unchecked Sendable {
          queue: DispatchQueue, delegate: ControllerSessionDelegate) {
         self.peripheral = peripheral
         self.slot = slot
+        self.playerNumber = slot + 1
         self.wasPairingMode = wasPairingMode
         self.queue = queue
         self.delegate = delegate
         super.init()
         peripheral.delegate = self
+    }
+
+    /// Engine (btQueue): update the player LEDs to a new logical number.
+    func setPlayerNumber(_ player: Int) {
+        guard player != playerNumber else { return }
+        playerNumber = player
+        if keepAliveTimer != nil {   // only once streaming (commands live)
+            setPlayerLEDs()
+        }
     }
 
     var displayName: String { model.displayName }
@@ -282,7 +295,7 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     }
 
     private func setPlayerLEDs(_ completion: @escaping (Bool) -> Void = { _ in }) {
-        let pattern = Switch2.ledPatterns[min(max(slot, 0), 7)]
+        let pattern = Switch2.ledPatterns[min(max(playerNumber - 1, 0), 7)]
         writeCommand(Switch2.Command.leds, Switch2.Subcommand.ledsSetPlayer,
                      Data([pattern, 0, 0, 0])) { resp in
             completion(resp != nil)

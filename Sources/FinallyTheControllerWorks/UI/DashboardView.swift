@@ -29,7 +29,7 @@ struct DashboardView: View {
             Text(engine.engineState.rawValue)
                 .font(.headline)
             Spacer()
-            Text("\(engine.controllers.count)/\(BridgeEngine.maxSlots) controllers")
+            Text("\(engine.controllers.count) connected")
                 .foregroundStyle(.secondary)
         }
         .padding()
@@ -55,45 +55,67 @@ struct DashboardView: View {
             ForEach(engine.controllers) { controller in
                 ControllerCard(status: controller,
                                pairing: pairingInfo(for: controller)) {
-                    engine.testRumble(slot: controller.id)
+                    engine.testRumble(player: controller.player)
                 }
             }
         }
         .padding()
     }
 
-    /// Grip-mode context for a card: nil for non-Joy-Cons and for a lone
-    /// Joy-Con with no counterpart connected. The counterpart is
-    /// auto-detected — a right unit offers the connected left, and vice versa.
+    /// Grip context for a card. A merged pair offers Unlink; a lone Joy-Con
+    /// offers every connected, unlinked opposite-side unit as a link
+    /// candidate, each with an identify buzzer so the user can tell
+    /// physically identical units apart.
     private func pairingInfo(for status: ControllerStatus) -> ControllerCard.Pairing? {
         if status.isJoyConPair {
-            return .init(counterpartName: nil, isPaired: true) {
-                engine.setCombineJoyCons($0)
-            }
+            return .init(candidates: [], linked: true,
+                         link: { _ in },
+                         unlink: { engine.unlink(serial: status.serial) },
+                         identify: { engine.identify(serial: $0) })
         }
-        let counterpartModel: Switch2.Model?
+        let counterpartModel: Switch2.Model
         switch status.model {
         case .joyCon2Right: counterpartModel = .joyCon2Left
         case .joyCon2Left: counterpartModel = .joyCon2Right
-        default: counterpartModel = nil
+        default: return nil
         }
-        guard let counterpartModel,
-              let counterpart = engine.controllers.first(where: { $0.model == counterpartModel })
-        else { return nil }
-        let name = ControllerSettings.shared.displayName(
-            forSerial: counterpart.serial, modelName: counterpart.name)
-        return .init(counterpartName: name, isPaired: false) {
-            engine.setCombineJoyCons($0)
-        }
+        let candidates = engine.controllers
+            .filter { $0.model == counterpartModel && !$0.isJoyConPair }
+            .map { c in
+                ControllerCard.Pairing.Candidate(
+                    serial: c.serial,
+                    name: ControllerSettings.shared.displayName(
+                        forSerial: c.serial, modelName: c.name))
+            }
+        guard !candidates.isEmpty else { return nil }
+        let mySerial = status.serial
+        let myModel = status.model
+        return .init(candidates: candidates, linked: false,
+                     link: { otherSerial in
+                         if myModel == .joyCon2Left {
+                             engine.link(leftSerial: mySerial, rightSerial: otherSerial)
+                         } else {
+                             engine.link(leftSerial: otherSerial, rightSerial: mySerial)
+                         }
+                     },
+                     unlink: { engine.unlink(serial: mySerial) },
+                     identify: { engine.identify(serial: $0) })
     }
 }
 
 struct ControllerCard: View {
     /// Grip-mode pairing context for Joy-Con cards.
     struct Pairing {
-        let counterpartName: String?    // nil on an already-merged pair card
-        let isPaired: Bool
-        let setPaired: (Bool) -> Void
+        struct Candidate: Identifiable {
+            let serial: String
+            let name: String
+            var id: String { serial }
+        }
+        let candidates: [Candidate]     // opposite-side units available to link
+        let linked: Bool                // true on a merged pair card
+        let link: (String) -> Void      // link with candidate serial
+        let unlink: () -> Void
+        let identify: (String) -> Void  // buzz a candidate by serial
     }
 
     let status: ControllerStatus
@@ -113,10 +135,12 @@ struct ControllerCard: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 12) {
-                Text("P\(status.id + 1)")
+                Text(status.player >= 0 ? "P\(status.player + 1)" : "—")
                     .font(.system(.title2, design: .rounded).bold())
                     .frame(width: 44, height: 44)
                     .background(Circle().fill(.tint.opacity(0.15)))
+                    .help(status.player >= 0 ? "Player \(status.player + 1)"
+                          : "Connected, but all 4 player slots are in use")
 
                 VStack(alignment: .leading, spacing: 2) {
                     if editingName {
@@ -178,17 +202,37 @@ struct ControllerCard: View {
                 Divider().padding(.horizontal, 10)
                 VStack(spacing: 10) {
                     if let pairing {
-                        HStack(spacing: 12) {
-                            Text("Mode")
-                            Picker("", selection: Binding(
-                                get: { pairing.isPaired },
-                                set: { pairing.setPaired($0) })) {
-                                Text("Standalone").tag(false)
-                                Text(pairing.counterpartName.map { "In grip with \($0)" }
-                                     ?? "In grip (combined)").tag(true)
+                        if pairing.linked {
+                            HStack(spacing: 12) {
+                                Label("In grip — combined into one gamepad",
+                                      systemImage: "link")
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                                Button("Unlink") { pairing.unlink() }
+                                    .help("Split back into two standalone Joy-Cons")
                             }
-                            .pickerStyle(.segmented)
-                            Spacer()
+                        } else {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("Standalone — link into a grip with:")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                ForEach(pairing.candidates) { candidate in
+                                    HStack(spacing: 10) {
+                                        Button {
+                                            pairing.identify(candidate.serial)
+                                        } label: {
+                                            Image(systemName: "dot.radiowaves.left.and.right")
+                                        }
+                                        .help("Buzz this Joy-Con so you can tell which one it is")
+                                        Text(candidate.name)
+                                        Text(candidate.serial)
+                                            .font(.caption)
+                                            .foregroundStyle(.tertiary)
+                                        Spacer()
+                                        Button("Link") { pairing.link(candidate.serial) }
+                                    }
+                                }
+                            }
                         }
                     }
                     HStack(spacing: 12) {

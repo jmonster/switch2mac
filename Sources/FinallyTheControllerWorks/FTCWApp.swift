@@ -52,7 +52,7 @@ struct MenuContent: View {
             Text("or hold Sync (next to USB-C) to pair a new one.")
         } else {
             ForEach(engine.controllers) { c in
-                Text("P\(c.id + 1)  \(settings.displayName(forSerial: c.serial, modelName: c.name)) — \(c.batteryPercent)%")
+                Text("\(c.player >= 0 ? "P\(c.player + 1)" : "—")  \(settings.displayName(forSerial: c.serial, modelName: c.name)) — \(c.batteryPercent)%")
             }
         }
 

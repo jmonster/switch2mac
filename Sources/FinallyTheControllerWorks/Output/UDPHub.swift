@@ -45,18 +45,18 @@ final class UDPHub: ControllerOutputSink, @unchecked Sendable {
     /// instance may be shutting down, e.g. the old Python one).
     private func openSockets() {
         openMissingSockets()
-        if slots.count < BridgeEngine.maxSlots {
+        if slots.count < BridgeEngine.maxPlayers {
             queue.asyncAfter(deadline: .now() + 5) { [weak self] in
                 self?.openSockets()
             }
         } else {
             bridgeLog(.info, "udphub",
-                      "SDL-compat hub on udp://127.0.0.1:\(Self.basePort)-\(Self.basePort + UInt16(BridgeEngine.maxSlots - 1))")
+                      "SDL-compat hub on udp://127.0.0.1:\(Self.basePort)-\(Self.basePort + UInt16(BridgeEngine.maxPlayers - 1))")
         }
     }
 
     private func openMissingSockets() {
-        for slot in 0..<BridgeEngine.maxSlots where slots[slot] == nil {
+        for slot in 0..<BridgeEngine.maxPlayers where slots[slot] == nil {
             let fd = socket(AF_INET, SOCK_DGRAM, 0)
             guard fd >= 0 else { continue }
             var yes: Int32 = 1
