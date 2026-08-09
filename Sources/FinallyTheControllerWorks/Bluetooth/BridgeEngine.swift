@@ -16,7 +16,7 @@
 import Foundation
 import CoreBluetooth
 
-/// UI-facing snapshot of one connected controller.
+/// UI-facing snapshot of one connected controller (or a merged Joy-Con pair).
 struct ControllerStatus: Identifiable, Sendable {
     let id: Int                 // slot
     let name: String
@@ -24,6 +24,8 @@ struct ControllerStatus: Identifiable, Sendable {
     let batteryMillivolts: UInt16
     let reportCount: UInt64
     let connectedAt: Date
+    var model: Switch2.Model = .proController2
+    var isJoyConPair: Bool = false
 
     /// Rough Li-ion percentage from voltage (3.30 V empty, 4.15 V full).
     var batteryPercent: Int {
@@ -48,6 +50,11 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
     // Main-thread state, for SwiftUI only.
     @Published private(set) var engineState: EngineState = .off
     @Published private(set) var controllers: [ControllerStatus] = []
+    /// True when one left and one right Joy-Con are connected (merge possible).
+    @Published private(set) var joyConPairAvailable = false
+    @Published private(set) var joyConsCombined = false
+
+    private static let combineKey = "combineJoyCons"
 
     private var central: CBCentralManager!
     private let btQueue = DispatchQueue(label: "com.petersharma.ftcw.bluetooth")
@@ -57,6 +64,10 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
     private var connecting: [UUID: (session: ControllerSession, slot: Int)] = [:]
     private var connectedAt: [Int: Date] = [:]
     private var sinks: [any ControllerOutputSink] = []
+    /// Active Joy-Con merge: the pair presents to sinks as ONE controller on
+    /// the left unit's slot; the right unit's slot is suppressed.
+    private var mergedPair: (l: Int, r: Int)?
+    private var combineEnabled = UserDefaults.standard.bool(forKey: BridgeEngine.combineKey)
 
     override init() {
         super.init()
@@ -82,10 +93,111 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
 
     func setRumble(slot: Int, strong: Double, weak weakMag: Double) {
         btQueue.async { [weak self] in
-            guard let self, let session = self.sessions[slot] else { return }
+            guard let self else { return }
+            // A merged pair rumbles both units, scaled by the pair's setting.
+            if let pair = self.mergedPair, slot == pair.l,
+               let l = self.sessions[pair.l], let r = self.sessions[pair.r] {
+                let scale = Self.rumbleIntensity(
+                    forSerial: Self.pairSerial(l.serialNumber, r.serialNumber))
+                l.setRumble(strong: strong * scale, weak: weakMag * scale)
+                r.setRumble(strong: strong * scale, weak: weakMag * scale)
+                return
+            }
+            guard let session = self.sessions[slot] else { return }
             let scale = Self.rumbleIntensity(forSerial: session.serialNumber)
             session.setRumble(strong: strong * scale, weak: weakMag * scale)
         }
+    }
+
+    // MARK: - Joy-Con pairing (grip mode)
+
+    static func pairSerial(_ l: String, _ r: String) -> String { "\(l)+\(r)" }
+
+    func setCombineJoyCons(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: Self.combineKey)
+        btQueue.async { [weak self] in
+            guard let self else { return }
+            self.combineEnabled = enabled
+            self.recomputeMerge()
+        }
+    }
+
+    /// btQueue. Establish or dissolve the merged pair to match reality:
+    /// merge exactly when enabled and one left + one right unit are present.
+    private func recomputeMerge() {
+        let lSlot = sessions.first { $0.value.model == .joyCon2Left }?.key
+        let rSlot = sessions.first { $0.value.model == .joyCon2Right }?.key
+        let shouldMerge = combineEnabled && lSlot != nil && rSlot != nil
+
+        if let pair = mergedPair,
+           !shouldMerge || pair.l != lSlot || pair.r != rSlot {
+            // Dissolve: the pair's synthetic controller vanishes; surviving
+            // units re-present individually.
+            mergedPair = nil
+            for sink in sinks { sink.controllerDisconnected(slot: pair.l) }
+            if let s = sessions[pair.l] {
+                for sink in sinks { sink.controllerConnected(slot: pair.l, model: s.model) }
+            }
+            if let s = sessions[pair.r] {
+                for sink in sinks { sink.controllerConnected(slot: pair.r, model: s.model) }
+            }
+            bridgeLog(.info, "engine", "Joy-Con pair dissolved")
+        }
+
+        if shouldMerge, mergedPair == nil, let l = lSlot, let r = rSlot {
+            // Merge: suppress the individual units, present one synthetic
+            // pad (Pro Controller identity) on the left unit's slot.
+            for sink in sinks {
+                sink.controllerDisconnected(slot: l)
+                sink.controllerDisconnected(slot: r)
+                sink.controllerConnected(slot: l, model: .proController2)
+            }
+            mergedPair = (l, r)
+            bridgeLog(.info, "engine",
+                      "Joy-Con pair combined → one gamepad on player \(l + 1)")
+        }
+
+        let available = lSlot != nil && rSlot != nil
+        let combined = mergedPair != nil
+        DispatchQueue.main.async { [weak self] in
+            self?.joyConPairAvailable = available
+            self?.joyConsCombined = combined
+        }
+        publishControllers()
+    }
+
+    /// btQueue. Route one unit's report: merged pairs emit a combined state
+    /// on the left slot; everything else passes straight through.
+    private func emitState(slot: Int, state: ControllerState) {
+        if let pair = mergedPair, slot == pair.l || slot == pair.r {
+            guard let l = sessions[pair.l], let r = sessions[pair.r] else { return }
+            let merged = Self.mergeStates(left: l.state, right: r.state)
+            for sink in sinks { sink.controllerState(slot: pair.l, state: merged) }
+            return
+        }
+        for sink in sinks { sink.controllerState(slot: slot, state: state) }
+    }
+
+    /// Combine two Joy-Con states into one gamepad. The shared button
+    /// bitmask makes this a union; each unit reports its own stick in the
+    /// report's first stick field, so the right unit's "left" stick is the
+    /// pad's right stick.
+    static func mergeStates(left l: ControllerState,
+                            right r: ControllerState) -> ControllerState {
+        var s = ControllerState()
+        s.buttons = Switch2.Buttons(rawValue: l.buttons.rawValue | r.buttons.rawValue)
+        s.leftStick = l.leftStick
+        s.rightStick = r.leftStick
+        s.leftTrigger = l.leftTrigger
+        s.rightTrigger = r.rightTrigger
+        s.batteryMillivolts = {
+            if l.batteryMillivolts == 0 { return r.batteryMillivolts }
+            if r.batteryMillivolts == 0 { return l.batteryMillivolts }
+            return min(l.batteryMillivolts, r.batteryMillivolts)
+        }()
+        s.gyro = r.gyro
+        s.accel = r.accel
+        return s
     }
 
     /// Short full-strength pulse (through the user's intensity setting) so
@@ -134,14 +246,34 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
     }
 
     private func publishControllers() {
-        let snapshot = sessions.map { slot, session in
-            ControllerStatus(id: slot,
-                             name: session.displayName,
-                             serial: session.serialNumber,
-                             batteryMillivolts: session.batteryMillivolts,
-                             reportCount: session.reportCount,
-                             connectedAt: connectedAt[slot] ?? Date())
-        }.sorted { $0.id < $1.id }
+        var snapshot: [ControllerStatus] = []
+        for (slot, session) in sessions {
+            if let pair = mergedPair {
+                if slot == pair.r { continue }   // folded into the pair entry
+                if slot == pair.l, let r = sessions[pair.r] {
+                    let merged = Self.mergeStates(left: session.state, right: r.state)
+                    snapshot.append(ControllerStatus(
+                        id: slot,
+                        name: "Joy-Con 2 Pair",
+                        serial: Self.pairSerial(session.serialNumber, r.serialNumber),
+                        batteryMillivolts: merged.batteryMillivolts,
+                        reportCount: session.reportCount + r.reportCount,
+                        connectedAt: connectedAt[slot] ?? Date(),
+                        model: .proController2,
+                        isJoyConPair: true))
+                    continue
+                }
+            }
+            snapshot.append(ControllerStatus(
+                id: slot,
+                name: session.displayName,
+                serial: session.serialNumber,
+                batteryMillivolts: session.batteryMillivolts,
+                reportCount: session.reportCount,
+                connectedAt: connectedAt[slot] ?? Date(),
+                model: session.model))
+        }
+        snapshot.sort { $0.id < $1.id }
         DispatchQueue.main.async { [weak self] in
             self?.controllers = snapshot
         }
@@ -229,9 +361,12 @@ extension BridgeEngine: CBCentralManagerDelegate {
             session.teardown()
             sessions.removeValue(forKey: slot)
             connectedAt.removeValue(forKey: slot)
-            for sink in sinks { sink.controllerDisconnected(slot: slot) }
+            let wasMerged = mergedPair.map { slot == $0.l || slot == $0.r } ?? false
+            if !wasMerged {
+                for sink in sinks { sink.controllerDisconnected(slot: slot) }
+            }
             bridgeLog(.info, "engine", "slot \(slot + 1): disconnected")
-            publishControllers()
+            recomputeMerge()   // dissolves the pair if this unit was half of it
         }
         updateScanning()
     }
@@ -246,13 +381,12 @@ extension BridgeEngine: ControllerSessionDelegate {
         sessions[session.slot] = session
         connectedAt[session.slot] = Date()
         session.onState = { [weak self] slot, state in
-            guard let self else { return }
-            for sink in self.sinks { sink.controllerState(slot: slot, state: state) }
+            self?.emitState(slot: slot, state: state)
         }
         for sink in sinks {
             sink.controllerConnected(slot: session.slot, model: session.model)
         }
-        publishControllers()
+        recomputeMerge()   // may immediately fold this unit into a pair
         updateScanning()
     }
 

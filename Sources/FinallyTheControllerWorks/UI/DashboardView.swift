@@ -57,6 +57,19 @@ struct DashboardView: View {
                     engine.testRumble(slot: controller.id)
                 }
             }
+            if engine.joyConPairAvailable || engine.joyConsCombined {
+                HStack(spacing: 12) {
+                    Image(systemName: "rectangle.grid.1x2")
+                        .foregroundStyle(.secondary)
+                    Toggle("Combine Joy-Cons into one gamepad (grip mode)",
+                           isOn: Binding(
+                               get: { engine.joyConsCombined },
+                               set: { engine.setCombineJoyCons($0) }))
+                    Spacer()
+                }
+                .padding(10)
+                .background(RoundedRectangle(cornerRadius: 10).fill(.quaternary.opacity(0.3)))
+            }
         }
         .padding()
     }
@@ -98,6 +111,7 @@ struct ControllerCard: View {
                             Text(settings.displayName(forSerial: status.serial,
                                                       modelName: status.name))
                                 .font(.headline)
+                                .foregroundStyle(nameColor)
                             Button {
                                 nameDraft = settings.customName(forSerial: status.serial)
                                 editingName = true
@@ -163,6 +177,16 @@ struct ControllerCard: View {
             get: { settings.rumbleIntensity(forSerial: status.serial) },
             set: { settings.setRumbleIntensity($0, forSerial: status.serial) }
         )
+    }
+
+    /// Joy-Con accent colors: neon red for the right unit, neon blue for
+    /// the left — matching the hardware.
+    private var nameColor: Color {
+        switch status.model {
+        case .joyCon2Right: return Color(red: 1.00, green: 0.24, blue: 0.16)
+        case .joyCon2Left: return Color(red: 0.04, green: 0.73, blue: 0.90)
+        default: return .primary
+        }
     }
 
     private var batteryIcon: String {
