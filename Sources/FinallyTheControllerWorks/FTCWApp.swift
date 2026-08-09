@@ -30,6 +30,11 @@ struct FTCWApp: App {
             ReactionGameView(game: appDelegate.game, engine: appDelegate.engine)
         }
         .defaultSize(width: 480, height: 460)
+
+        Window("Sensor Challenges", id: "challenges") {
+            ChallengeView(coordinator: appDelegate.challenges, engine: appDelegate.engine)
+        }
+        .defaultSize(width: 500, height: 480)
     }
 }
 
@@ -37,6 +42,7 @@ struct FTCWApp: App {
 final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     let engine = BridgeEngine()
     let game = ReactionGame()
+    let challenges = ChallengeCoordinator()
     private let notifications = NotificationManager()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -74,6 +80,11 @@ struct MenuContent: View {
 
         Button("Reaction Draft (party game)") {
             openWindow(id: "reaction-game")
+            NSApp.activate(ignoringOtherApps: true)
+        }
+
+        Button("Sensor Challenges") {
+            openWindow(id: "challenges")
             NSApp.activate(ignoringOtherApps: true)
         }
 

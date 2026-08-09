@@ -587,6 +587,10 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
     var onParticipantPress: ((_ id: String, _ time: TimeInterval) -> Void)?
     private var lastButtonsByPlayer: [Int: Switch2.Buttons] = [:]
 
+    /// Full-rate per-participant sensor stream for the challenge games
+    /// (keyed by logical id). Set by the challenge coordinator.
+    var onParticipantState: ((_ id: String, _ state: ControllerState) -> Void)?
+
     /// Rumble every connected participant simultaneously (party buzz).
     /// Returns the buzz timestamp so reaction times can be measured against it.
     @discardableResult
@@ -671,6 +675,10 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
                 onPress(id, t)
             }
             lastButtonsByPlayer[player] = out.buttons
+        }
+        // Challenge games: full-rate sensor stream keyed by participant id.
+        if let onSensor = onParticipantState {
+            onSensor(logical.id, out)
         }
 
         // Feed the dashboard visualizer at ~10 Hz.
