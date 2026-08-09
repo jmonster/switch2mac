@@ -406,6 +406,14 @@ final class ControllerSession: NSObject, @unchecked Sendable {
         lastReportAt = now
         reportCount &+= 1
 
+        // One-shot diagnostic: dump the mouse/magnetometer report region so
+        // sensor-enable problems are visible in the log.
+        if reportCount == 100 {
+            let region = data.subdata(in: data.startIndex + 0x10 ..< min(data.startIndex + 0x1F, data.endIndex))
+            let hex = region.map { String(format: "%02x", $0) }.joined(separator: " ")
+            log(.info, "\(displayName) report bytes 0x10-0x1E (mouse+mag): \(hex)")
+        }
+
         var s = ControllerState()
         s.buttons = report.buttons
         switch model {
