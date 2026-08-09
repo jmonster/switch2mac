@@ -36,6 +36,9 @@ enum AppConfig {
 /// (resets when the controller reconnects).
 /// Engine posts this (any thread) when it puts a controller to sleep.
 let controllerSleptNotification = Notification.Name("ftcw.controllerSlept")
+/// Engine posts this (any thread) after an NFC tag read completes.
+/// userInfo: "uid" (String), "text" (String?), "bytes" (Int).
+let nfcTagReadNotification = Notification.Name("ftcw.nfcTagRead")
 
 @MainActor
 final class NotificationManager: ObservableObject {
@@ -59,6 +62,19 @@ final class NotificationManager: ObservableObject {
                 NotificationManager.post(
                     title: "\(name) went to sleep",
                     body: "No input for a while — press any button to reconnect.")
+            }
+        }
+        NotificationCenter.default.addObserver(
+            forName: nfcTagReadNotification, object: nil, queue: .main
+        ) { note in
+            let uid = note.userInfo?["uid"] as? String ?? "?"
+            let text = note.userInfo?["text"] as? String
+            let bytes = note.userInfo?["bytes"] as? Int ?? 0
+            Task { @MainActor in
+                NotificationManager.post(
+                    title: text.map { "NFC tag read: “\($0)”" } ?? "NFC tag read",
+                    body: "UID \(uid) · \(bytes) bytes"
+                          + (text == nil ? " (no NDEF text record)" : ""))
             }
         }
     }

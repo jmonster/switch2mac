@@ -468,7 +468,8 @@ struct ControllerCard: View {
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                                 HStack(spacing: 10) {
-                                    Button("Detect amiibo (NFC)") { onNFCProbe() }
+                                    Button("Read NFC tag") { onNFCProbe() }
+                                        .help("Detects an amiibo or NTAG on the touchpoint and dumps it; NDEF text is decoded")
                                     Button("Capture audio 30 s") { onAudioCapture() }
                                     Button("Audio baseline") { onAudioBaseline() }
                                         .help("Safe check: 3 s sine, original config only")

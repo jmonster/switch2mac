@@ -214,9 +214,13 @@ enum Switch2 {
     }
 
     /// Frame a controller command (the shared 0x91 protocol).
+    /// Frame a command. `flag` is header byte 2 — 0x01 in all sniffed
+    /// Bluetooth traffic (the default); NFC captures over USB show 0x00,
+    /// so experiments can override it to replicate console traffic exactly.
     static func buildCommand(_ command: UInt8, _ subcommand: UInt8,
+                             flag: UInt8 = 0x01,
                              data: Data = Data()) -> Data {
-        var buf = Data([command, 0x91, 0x01, subcommand, 0x00,
+        var buf = Data([command, 0x91, flag, subcommand, 0x00,
                         UInt8(data.count), 0x00, 0x00])
         buf.append(data)
         return buf

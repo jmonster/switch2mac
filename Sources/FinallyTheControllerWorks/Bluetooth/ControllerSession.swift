@@ -266,6 +266,7 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     // MARK: - Commands
 
     private func writeCommand(_ command: UInt8, _ subcommand: UInt8, _ data: Data,
+                              flag: UInt8 = 0x01,
                               completion: @escaping (Data?) -> Void) {
         guard let writeChar = chars[Switch2.GATT.commandWrite] else {
             completion(nil); return
@@ -276,7 +277,7 @@ final class ControllerSession: NSObject, @unchecked Sendable {
             completion(nil)
             return
         }
-        let frame = Switch2.buildCommand(command, subcommand, data: data)
+        let frame = Switch2.buildCommand(command, subcommand, flag: flag, data: data)
         pendingCommand = (command, completion)
         let timeout = DispatchWorkItem { [weak self] in
             guard let self, let pending = self.pendingCommand else { return }
@@ -294,6 +295,11 @@ final class ControllerSession: NSObject, @unchecked Sendable {
         guard let pending = pendingCommand else { return }
         commandTimeout?.cancel()
         pendingCommand = nil
+        // NFC experiments: log the COMPLETE frame (header included) — the
+        // header status bytes distinguish "no data" from "error" replies.
+        if pending.id == 0x01 {
+            log(.debug, "nfc raw frame: \(data.map { String(format: "%02x", $0) }.joined(separator: " "))")
+        }
         guard data.count >= 8, data[data.startIndex] == pending.id,
               data[data.startIndex + 1] == 0x01 else {
             pending.completion(nil)
@@ -361,11 +367,12 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     /// other commands; completion gets the response payload (post-header)
     /// or nil on timeout/error. Runs on the Bluetooth queue.
     func experimentalCommand(_ command: UInt8, _ subcommand: UInt8,
-                             payload: Data,
+                             payload: Data, flag: UInt8 = 0x01,
                              completion: @escaping (Data?) -> Void) {
         queue.async { [weak self] in
             guard let self else { completion(nil); return }
-            self.writeCommand(command, subcommand, payload, completion: completion)
+            self.writeCommand(command, subcommand, payload, flag: flag,
+                              completion: completion)
         }
     }
 
