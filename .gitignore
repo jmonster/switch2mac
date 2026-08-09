@@ -3,3 +3,4 @@ build/
 signing/devid_private.key
 signing/*.cer
 .DS_Store
+.claude/worktrees/
