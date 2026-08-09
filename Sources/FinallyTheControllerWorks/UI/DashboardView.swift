@@ -315,14 +315,10 @@ struct ControllerCard: View {
                         .padding(.top, 6)
                     }
                     DisclosureGroup("Input test") {
-                        VStack(spacing: 8) {
+                        VStack(spacing: 10) {
                             InputVisualizer(state: live, layout: vizLayout)
-                            if let live {
-                                Text("gyro \(live.gyro.0) \(live.gyro.1) \(live.gyro.2)   "
-                                     + "mag \(live.mag.0) \(live.mag.1) \(live.mag.2)")
-                                    .font(.system(.caption2, design: .monospaced))
-                                    .foregroundStyle(.tertiary)
-                            }
+                            Divider()
+                            MotionVisualizer(state: live, serial: status.serial)
                         }
                         .padding(.top, 6)
                     }

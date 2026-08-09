@@ -109,6 +109,21 @@ final class ControllerSettings: ObservableObject {
         persist()
     }
 
+    // MARK: Magnetometer calibration (hard-iron bias)
+
+    func magBias(forSerial serial: String) -> (x: Double, y: Double, z: Double)? {
+        guard let arr = store[serial]?["magBias"] as? [Double], arr.count == 3
+        else { return nil }
+        return (arr[0], arr[1], arr[2])
+    }
+
+    func setMagBias(_ bias: (x: Double, y: Double, z: Double), forSerial serial: String) {
+        var entry = store[serial] ?? [:]
+        entry["magBias"] = [bias.x, bias.y, bias.z]
+        store[serial] = entry
+        persist()
+    }
+
     // MARK: Mouse mode (Joy-Con 2 optical sensor)
 
     func mouseEnabled(forSerial serial: String) -> Bool {
