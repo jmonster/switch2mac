@@ -36,6 +36,11 @@ struct FTCWApp: App {
         }
         .defaultSize(width: 500, height: 480)
 
+        Window("Air Gestures", id: "gestures") {
+            GesturesView(engine: appDelegate.engine)
+        }
+        .defaultSize(width: 500, height: 480)
+
         Window("About", id: "about") { AboutView() }
             .windowResizability(.contentSize)
     }
@@ -110,6 +115,11 @@ struct MenuContent: View {
 
         Button("Sensor Challenges") {
             openWindow(id: "challenges")
+            NSApp.activate(ignoringOtherApps: true)
+        }
+
+        Button("Air Gestures") {
+            openWindow(id: "gestures")
             NSApp.activate(ignoringOtherApps: true)
         }
 

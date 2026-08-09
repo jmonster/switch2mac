@@ -582,6 +582,7 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
 
     private let mouseController = MouseController()
     private let keyboardMapper = KeyboardMapper()
+    let gestureRecognizer = GestureRecognizer()
 
     // Reaction game: full-rate rising-edge button detection per logical
     // participant (keyed by logical id). Set by the game coordinator.
@@ -777,6 +778,9 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
         if let onSensor = onParticipantState {
             onSensor(logical.id, out)
         }
+
+        // Air-gesture macros: buffer gyro while the trigger button is held.
+        gestureRecognizer.process(player: player, buttons: out.buttons, gyro: out.gyro)
 
         // Capture button → macOS screenshot (opt-in per controller).
         let prevButtons = captureLast[player] ?? []
