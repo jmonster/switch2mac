@@ -37,6 +37,12 @@ enum Switch2 {
         /// report ZL/ZR as digital buttons.
         var hasAnalogTriggers: Bool { self == .nsoGameCube }
 
+        /// Two-stick models. Joy-Cons have ONE stick: its calibration lives
+        /// in the unit's stick-1 slots, but its live data reports in the
+        /// field matching its handedness (left unit → first stick field,
+        /// right unit → second).
+        var hasSecondStick: Bool { self == .proController2 || self == .nsoGameCube }
+
         /// The GameCube pad has no HD-rumble actuator (writing its motor
         /// characteristic powers it off) — it plays built-in presets instead.
         var hasHDRumble: Bool { self != .nsoGameCube }

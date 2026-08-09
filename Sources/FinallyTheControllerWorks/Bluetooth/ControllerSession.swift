@@ -176,6 +176,10 @@ final class ControllerSession: NSObject, @unchecked Sendable {
                              factory: Switch2.Address.factoryStick1) { [weak self] cal in
             guard let self else { return }
             self.leftCal = cal
+            guard self.model.hasSecondStick else {
+                done(true)   // single-stick unit: slot-2 holds no valid data
+                return
+            }
             self.readStickCalibration(user: Switch2.Address.userStick2,
                                       factory: Switch2.Address.factoryStick2) { [weak self] cal in
                 guard let self else { return }
@@ -361,8 +365,18 @@ final class ControllerSession: NSObject, @unchecked Sendable {
 
         var s = ControllerState()
         s.buttons = report.buttons
-        s.leftStick = leftCal?.apply(report.leftStickRaw) ?? (0, 0)
-        s.rightStick = rightCal?.apply(report.rightStickRaw) ?? (0, 0)
+        switch model {
+        case .joyCon2Left:
+            // One stick, reporting in the first field, calibrated by slot 1.
+            s.leftStick = leftCal?.apply(report.leftStickRaw) ?? (0, 0)
+        case .joyCon2Right:
+            // One stick, reporting in the SECOND field — but calibrated by
+            // the unit's slot-1 data (a Joy-Con has no slot-2 calibration).
+            s.rightStick = leftCal?.apply(report.rightStickRaw) ?? (0, 0)
+        default:
+            s.leftStick = leftCal?.apply(report.leftStickRaw) ?? (0, 0)
+            s.rightStick = rightCal?.apply(report.rightStickRaw) ?? (0, 0)
+        }
         if model.hasAnalogTriggers {
             s.leftTrigger = report.leftTriggerRaw
             s.rightTrigger = report.rightTriggerRaw
