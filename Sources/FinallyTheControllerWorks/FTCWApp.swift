@@ -25,12 +25,18 @@ struct FTCWApp: App {
                 .frame(minWidth: 560, minHeight: 480)
         }
         .defaultSize(width: 680, height: 620)
+
+        Window("Reaction Draft", id: "reaction-game") {
+            ReactionGameView(game: appDelegate.game, engine: appDelegate.engine)
+        }
+        .defaultSize(width: 480, height: 460)
     }
 }
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     let engine = BridgeEngine()
+    let game = ReactionGame()
     private let notifications = NotificationManager()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -63,6 +69,11 @@ struct MenuContent: View {
 
         Button("Open Dashboard") {
             openWindow(id: "dashboard")
+            NSApp.activate(ignoringOtherApps: true)
+        }
+
+        Button("Reaction Draft (party game)") {
+            openWindow(id: "reaction-game")
             NSApp.activate(ignoringOtherApps: true)
         }
 

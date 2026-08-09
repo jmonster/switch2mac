@@ -582,6 +582,66 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
 
     private let mouseController = MouseController()
 
+    // Reaction game: full-rate rising-edge button detection per logical
+    // participant (keyed by logical id). Set by the game coordinator.
+    var onParticipantPress: ((_ id: String, _ time: TimeInterval) -> Void)?
+    private var lastButtonsByPlayer: [Int: Switch2.Buttons] = [:]
+
+    /// Rumble every connected participant simultaneously (party buzz).
+    /// Returns the buzz timestamp so reaction times can be measured against it.
+    @discardableResult
+    func buzzAll(strong: Double = 1.0, durationMs: Int = 250) -> TimeInterval {
+        let now = CFAbsoluteTimeGetCurrent()
+        btQueue.async { [weak self] in
+            guard let self else { return }
+            for player in self.players.keys {
+                self.setRumble(player: player, strong: strong, weak: 0)
+            }
+            self.btQueue.asyncAfter(deadline: .now() + .milliseconds(durationMs)) {
+                for player in self.players.keys {
+                    self.setRumble(player: player, strong: 0, weak: 0)
+                }
+            }
+        }
+        return now
+    }
+
+    /// Buzz + flash LEDs on ONE participant (used for "you're up" cues).
+    func buzz(id: String, strong: Double = 1.0, durationMs: Int = 200) {
+        btQueue.async { [weak self] in
+            guard let self,
+                  let (player, _) = self.players.first(where: { $0.value.id == id })
+            else { return }
+            self.setRumble(player: player, strong: strong, weak: 0)
+            self.btQueue.asyncAfter(deadline: .now() + .milliseconds(durationMs)) {
+                self.setRumble(player: player, strong: 0, weak: 0)
+            }
+        }
+    }
+
+    /// Fix the player order explicitly: ids in order become players 1..N.
+    /// Persisted via playerMemory so the assignment sticks.
+    func assignPlayerOrder(_ idsInOrder: [String]) {
+        btQueue.async { [weak self] in
+            guard let self else { return }
+            for (rank, id) in idsInOrder.enumerated() where rank < Self.maxPlayers {
+                self.playerMemory[id] = rank
+            }
+            self.recomputeLogical()
+        }
+    }
+
+    /// The current logical participants (id + display name), for the game UI.
+    func participants() -> [(id: String, name: String)] {
+        var result: [(String, String)] = []
+        btQueue.sync {
+            for logical in players.values {
+                result.append((logical.id, self.displayName(for: logical)))
+            }
+        }
+        return result.map { (id: $0.0, name: $0.1) }
+    }
+
     /// Route one physical unit's report to its logical player.
     private func emitState(slot: Int, state: ControllerState) {
         // Mouse mode operates on PHYSICAL units (a linked pair's right
@@ -600,6 +660,18 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
         out = Self.applyAxisOptions(out, serial: logical.id,
                                     analogTriggers: logical.model.hasAnalogTriggers)
         for sink in sinks { sink.controllerState(slot: player, state: out) }
+
+        // Reaction game: fire on the rising edge of ANY button, at full
+        // report rate with a precise timestamp.
+        if let onPress = onParticipantPress {
+            let prev = lastButtonsByPlayer[player] ?? []
+            if prev.isEmpty && !out.buttons.isEmpty {
+                let id = logical.id
+                let t = CFAbsoluteTimeGetCurrent()
+                onPress(id, t)
+            }
+            lastButtonsByPlayer[player] = out.buttons
+        }
 
         // Feed the dashboard visualizer at ~10 Hz.
         let now = CFAbsoluteTimeGetCurrent()
