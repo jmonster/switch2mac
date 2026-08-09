@@ -581,6 +581,7 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
     }
 
     private let mouseController = MouseController()
+    private let keyboardMapper = KeyboardMapper()
 
     // Reaction game: full-rate rising-edge button detection per logical
     // participant (keyed by logical id). Set by the game coordinator.
@@ -752,6 +753,13 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
         }
         out = Self.applyAxisOptions(out, serial: logical.id,
                                     analogTriggers: logical.model.hasAnalogTriggers)
+
+        // Keyboard mapping: post keystrokes and suppress mapped buttons from
+        // the gamepad output so they don't double-act.
+        if keyboardMapper.process(player: player, serial: logical.id, buttons: out.buttons) {
+            out.buttons.subtract(keyboardMapper.mappedButtons(serial: logical.id))
+        }
+
         for sink in sinks { sink.controllerState(slot: player, state: out) }
 
         // Reaction game: fire on the rising edge of ANY button, at full

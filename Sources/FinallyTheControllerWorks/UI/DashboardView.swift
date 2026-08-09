@@ -376,6 +376,9 @@ struct ControllerCard: View {
                         }
                         .padding(.top, 6)
                     }
+                    DisclosureGroup("Keyboard mapping") {
+                        KeyboardMappingView(serial: status.serial)
+                    }
                     DisclosureGroup("Input test") {
                         VStack(spacing: 10) {
                             InputVisualizer(state: live, layout: vizLayout)

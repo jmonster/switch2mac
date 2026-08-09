@@ -181,6 +181,53 @@ final class ControllerSettings: ObservableObject {
         persist()
     }
 
+    // MARK: Keyboard mapping (button → keystroke), global or per-app
+
+    /// Read the key map for a controller, optionally for a specific app
+    /// bundle id (nil/"" = the global map).
+    func keyMap(forSerial serial: String, app: String?) -> [String: KeySpec] {
+        let entry = store[serial] ?? [:]
+        let raw: [String: [String: Any]]?
+        if let app, !app.isEmpty {
+            raw = (entry["keyMapByApp"] as? [String: [String: [String: Any]]])?[app]
+        } else {
+            raw = entry["keyMap"] as? [String: [String: Any]]
+        }
+        var out: [String: KeySpec] = [:]
+        for (k, v) in raw ?? [:] { if let s = KeySpec(dictionary: v) { out[k] = s } }
+        return out
+    }
+
+    func setKeyMapping(button: String, key: KeySpec?, forSerial serial: String, app: String?) {
+        var entry = store[serial] ?? [:]
+        if let app, !app.isEmpty {
+            var byApp = entry["keyMapByApp"] as? [String: [String: [String: Any]]] ?? [:]
+            var appMap = byApp[app] ?? [:]
+            if let key { appMap[button] = key.asDictionary } else { appMap.removeValue(forKey: button) }
+            byApp[app] = appMap
+            entry["keyMapByApp"] = byApp
+        } else {
+            var map = entry["keyMap"] as? [String: [String: Any]] ?? [:]
+            if let key { map[button] = key.asDictionary } else { map.removeValue(forKey: button) }
+            entry["keyMap"] = map
+        }
+        store[serial] = entry
+        persist()
+    }
+
+    func clearKeyMap(forSerial serial: String, app: String?) {
+        var entry = store[serial] ?? [:]
+        if let app, !app.isEmpty {
+            var byApp = entry["keyMapByApp"] as? [String: [String: [String: Any]]] ?? [:]
+            byApp.removeValue(forKey: app)
+            entry["keyMapByApp"] = byApp
+        } else {
+            entry["keyMap"] = [String: [String: Any]]()
+        }
+        store[serial] = entry
+        persist()
+    }
+
     // MARK: Trigger threshold (0..1 travel before ZL/ZR registers)
 
     func triggerThreshold(forSerial serial: String) -> Double {
