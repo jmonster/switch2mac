@@ -227,10 +227,16 @@ struct ControllerCard: View {
                 VStack(spacing: 10) {
                     if let pairing {
                         if pairing.linked {
-                            HStack(spacing: 12) {
-                                Label("In grip — combined into one gamepad",
-                                      systemImage: "link")
-                                    .foregroundStyle(.secondary)
+                            HStack(alignment: .top, spacing: 12) {
+                                Picker("Held", selection: boolBinding(
+                                    get: { settings.holdStyle(forSerial: status.serial) == "grip" },
+                                    set: { settings.setHoldStyle($0 ? "grip" : "independent",
+                                                                 forSerial: status.serial) })) {
+                                    Text("In controller grip").tag(true)
+                                    Text("Independently held").tag(false)
+                                }
+                                .pickerStyle(.radioGroup)
+                                .help("How you're physically holding the pair — affects the input-test layout and future motion features")
                                 Spacer()
                                 Button("Unlink") { pairing.unlink() }
                                     .help("Split back into two standalone Joy-Cons")
@@ -290,7 +296,7 @@ struct ControllerCard: View {
                         .padding(.top, 6)
                     }
                     DisclosureGroup("Input test") {
-                        InputVisualizer(state: live)
+                        InputVisualizer(state: live, layout: vizLayout)
                             .padding(.top, 6)
                     }
                     Toggle("Xbox button layout (swap A↔B, X↔Y)", isOn: boolBinding(
@@ -325,6 +331,20 @@ struct ControllerCard: View {
             get: { settings.rumbleIntensity(forSerial: status.serial) },
             set: { settings.setRumbleIntensity($0, forSerial: status.serial) }
         )
+    }
+
+    /// Input-test arrangement matching the physical hardware and, for a
+    /// pair, how the user says they're holding it.
+    private var vizLayout: VizLayout {
+        if status.isJoyConPair {
+            return settings.holdStyle(forSerial: status.serial) == "grip"
+                ? .pro : .pairIndependent
+        }
+        switch status.model {
+        case .joyCon2Left: return .joyConLeft
+        case .joyCon2Right: return .joyConRight
+        default: return .pro
+        }
     }
 
     private var deadzoneBinding: Binding<Double> {

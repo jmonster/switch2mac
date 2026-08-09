@@ -1,61 +1,208 @@
 // InputVisualizer.swift
-// Live input test pad: sticks as crosshair dots, buttons as chips that light
-// up, triggers as bars. Fed by BridgeEngine.liveStates at ~10 Hz — enough to
-// verify every control without launching a game.
+// Live input test pad, laid out to match the physical hardware:
+//  * Pro Controller 2 / pair in grip: left stick high-left, d-pad low-left,
+//    A/B/X/Y diamond high-right, right stick low-center-right, system
+//    buttons in the middle.
+//  * Single left Joy-Con (upright): stick above d-pad, minus top, capture low.
+//  * Single right Joy-Con (upright): diamond above stick, plus top, Home/C low.
+//  * Pair held independently: the two upright Joy-Con panels side by side.
+// Fed by BridgeEngine.liveStates at ~10 Hz.
 
 import SwiftUI
 
+enum VizLayout {
+    case pro            // Pro Controller 2, or linked pair in the grip
+    case joyConLeft
+    case joyConRight
+    case pairIndependent
+}
+
 struct InputVisualizer: View {
     let state: ControllerState?
+    var layout: VizLayout = .pro
 
     var body: some View {
-        HStack(alignment: .center, spacing: 18) {
-            StickDot(label: "L", x: state?.leftStick.x ?? 0,
-                     y: state?.leftStick.y ?? 0,
-                     pressed: pressed(.lStick))
-            VStack(spacing: 6) {
-                buttonRow([("↑", .dpadUp), ("↓", .dpadDown),
-                           ("←", .dpadLeft), ("→", .dpadRight)])
-                buttonRow([("A", .a), ("B", .b), ("X", .x), ("Y", .y)])
-                buttonRow([("L", .l), ("R", .r), ("−", .minus), ("+", .plus)])
-                buttonRow([("Home", .home), ("Cap", .capture), ("C", .c),
-                           ("GL", .gl), ("GR", .gr)])
+        switch layout {
+        case .pro:
+            proBody
+        case .joyConLeft:
+            JoyConLeftPanel(state: state)
+        case .joyConRight:
+            JoyConRightPanel(state: state)
+        case .pairIndependent:
+            HStack(alignment: .top, spacing: 28) {
+                JoyConLeftPanel(state: state)
+                JoyConRightPanel(state: state)
+            }
+            .frame(maxWidth: .infinity)
+        }
+    }
+
+    /// Pro Controller 2 arrangement (traced from the hardware photo).
+    private var proBody: some View {
+        HStack(alignment: .top, spacing: 18) {
+            VStack(spacing: 10) {
+                TriggerBar(label: "ZL", value: state?.leftTrigger ?? 0)
+                Chip("L", .l, state)
+                StickDot(label: "L", stick: state?.leftStick,
+                         pressed: pressed(.lStick, state))
+                DpadDiamond(state: state)
+            }
+            VStack(spacing: 10) {
                 HStack(spacing: 8) {
-                    TriggerBar(label: "ZL", value: state?.leftTrigger ?? 0)
-                    TriggerBar(label: "ZR", value: state?.rightTrigger ?? 0)
+                    Chip("Cap", .capture, state)
+                    Chip("−", .minus, state)
+                    Chip("+", .plus, state)
+                    Chip("Home", .home, state)
+                }
+                Spacer().frame(height: 18)
+                Chip("C", .c, state)
+                Spacer().frame(height: 4)
+                HStack(spacing: 8) {
+                    Chip("GL", .gl, state)
+                    Chip("GR", .gr, state)
                 }
             }
-            StickDot(label: "R", x: state?.rightStick.x ?? 0,
-                     y: state?.rightStick.y ?? 0,
-                     pressed: pressed(.rStick))
+            .padding(.top, 26)
+            VStack(spacing: 10) {
+                TriggerBar(label: "ZR", value: state?.rightTrigger ?? 0)
+                Chip("R", .r, state)
+                FaceDiamond(state: state)
+                StickDot(label: "R", stick: state?.rightStick,
+                         pressed: pressed(.rStick, state))
+            }
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 4)
     }
+}
 
-    private func pressed(_ button: Switch2.Buttons) -> Bool {
-        state?.buttons.contains(button) ?? false
+// MARK: - Joy-Con panels (upright orientation, per the reference diagram)
+
+private struct JoyConLeftPanel: View {
+    let state: ControllerState?
+
+    var body: some View {
+        VStack(spacing: 10) {
+            HStack(spacing: 8) {
+                TriggerBar(label: "ZL", value: state?.leftTrigger ?? 0)
+                Chip("L", .l, state)
+            }
+            HStack {
+                Spacer()
+                Chip("−", .minus, state)
+            }
+            .frame(width: 120)
+            StickDot(label: "", stick: state?.leftStick,
+                     pressed: pressed(.lStick, state))
+            DpadDiamond(state: state)
+            HStack(spacing: 8) {
+                Chip("SL", .slL, state)
+                Chip("SR", .srL, state)
+            }
+            HStack {
+                Chip("Cap", .capture, state)
+                Spacer()
+            }
+            .frame(width: 120)
+        }
+    }
+}
+
+private struct JoyConRightPanel: View {
+    let state: ControllerState?
+
+    var body: some View {
+        VStack(spacing: 10) {
+            HStack(spacing: 8) {
+                Chip("R", .r, state)
+                TriggerBar(label: "ZR", value: state?.rightTrigger ?? 0)
+            }
+            HStack {
+                Chip("+", .plus, state)
+                Spacer()
+            }
+            .frame(width: 120)
+            FaceDiamond(state: state)
+            StickDot(label: "", stick: state?.rightStick,
+                     pressed: pressed(.rStick, state))
+            HStack(spacing: 8) {
+                Chip("SL", .slR, state)
+                Chip("SR", .srR, state)
+            }
+            HStack {
+                Spacer()
+                Chip("Home", .home, state)
+                Chip("C", .c, state)
+            }
+            .frame(width: 120)
+        }
+    }
+}
+
+// MARK: - Shared parts
+
+private func pressed(_ button: Switch2.Buttons, _ state: ControllerState?) -> Bool {
+    state?.buttons.contains(button) ?? false
+}
+
+/// Nintendo face diamond: X top, Y left, A right, B bottom.
+private struct FaceDiamond: View {
+    let state: ControllerState?
+
+    var body: some View {
+        ZStack {
+            Chip("X", .x, state).offset(y: -24)
+            Chip("Y", .y, state).offset(x: -26)
+            Chip("A", .a, state).offset(x: 26)
+            Chip("B", .b, state).offset(y: 24)
+        }
+        .frame(width: 84, height: 72)
+    }
+}
+
+/// D-pad diamond: up top, left left, right right, down bottom.
+private struct DpadDiamond: View {
+    let state: ControllerState?
+
+    var body: some View {
+        ZStack {
+            Chip("▲", .dpadUp, state).offset(y: -24)
+            Chip("◀", .dpadLeft, state).offset(x: -26)
+            Chip("▶", .dpadRight, state).offset(x: 26)
+            Chip("▼", .dpadDown, state).offset(y: 24)
+        }
+        .frame(width: 84, height: 72)
+    }
+}
+
+private struct Chip: View {
+    let label: String
+    let mask: Switch2.Buttons
+    let state: ControllerState?
+
+    init(_ label: String, _ mask: Switch2.Buttons, _ state: ControllerState?) {
+        self.label = label
+        self.mask = mask
+        self.state = state
     }
 
-    private func buttonRow(_ chips: [(String, Switch2.Buttons)]) -> some View {
-        HStack(spacing: 6) {
-            ForEach(chips, id: \.0) { label, mask in
-                Text(label)
-                    .font(.system(.caption, design: .rounded).bold())
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 3)
-                    .background(RoundedRectangle(cornerRadius: 5)
-                        .fill(pressed(mask) ? Color.accentColor : Color.gray.opacity(0.2)))
-                    .foregroundStyle(pressed(mask) ? .white : .secondary)
-            }
-        }
+    private var isOn: Bool { pressed(mask, state) }
+
+    var body: some View {
+        Text(label)
+            .font(.system(.caption, design: .rounded).bold())
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(RoundedRectangle(cornerRadius: 5)
+                .fill(isOn ? Color.accentColor : Color.gray.opacity(0.2)))
+            .foregroundStyle(isOn ? .white : .secondary)
     }
 }
 
 private struct StickDot: View {
     let label: String
-    let x: Double
-    let y: Double
+    let stick: (x: Double, y: Double)?
     let pressed: Bool
 
     var body: some View {
@@ -67,11 +214,12 @@ private struct StickDot: View {
                 .fill(Color.accentColor)
                 .frame(width: 10, height: 10)
                 // SwiftUI y grows downward; stick y is up-positive.
-                .offset(x: x * 24, y: -y * 24)
-            Text(label)
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-                .offset(y: 26)
+                .offset(x: (stick?.x ?? 0) * 24, y: -(stick?.y ?? 0) * 24)
+            if !label.isEmpty {
+                Text(label)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
         }
         .frame(width: 64, height: 64)
     }

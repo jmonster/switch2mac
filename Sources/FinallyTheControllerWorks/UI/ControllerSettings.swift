@@ -101,6 +101,22 @@ final class ControllerSettings: ObservableObject {
         persist()
     }
 
+    // MARK: Joy-Con pair hold style
+
+    /// How a linked pair is physically held: "grip" (controller grip shell)
+    /// or "independent" (one Joy-Con per hand). Affects the input-test
+    /// layout now and sensor orientation math later.
+    func holdStyle(forSerial serial: String) -> String {
+        store[serial]?["holdStyle"] as? String ?? "grip"
+    }
+
+    func setHoldStyle(_ value: String, forSerial serial: String) {
+        var entry = store[serial] ?? [:]
+        entry["holdStyle"] = value
+        store[serial] = entry
+        persist()
+    }
+
     // MARK: Button layout
 
     func xboxLayout(forSerial serial: String) -> Bool {
