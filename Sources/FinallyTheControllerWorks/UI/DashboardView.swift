@@ -677,10 +677,20 @@ struct ConfigurationSection: View {
                 Button("Export…") { exportSettings() }
                 Button("Import…") { importSettings() }
             }
+            Divider()
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Software update feed URL").font(.caption).foregroundStyle(.secondary)
+                TextField("https://…/appcast.json", text: $updateFeed)
+                    .textFieldStyle(.roundedBorder)
+                Text("The app checks this once a day and can update itself. Leave blank to disable.")
+                    .font(.caption2).foregroundStyle(.tertiary)
+            }
         }
         .toggleStyle(.checkbox)
         .padding(.vertical, 8)
     }
+
+    @AppStorage(Updater.feedURLKey) private var updateFeed = ""
 
     private func exportSettings() {
         guard let data = SettingsTransfer.export() else { return }

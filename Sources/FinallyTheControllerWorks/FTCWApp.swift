@@ -43,6 +43,9 @@ struct FTCWApp: App {
 
         Window("About", id: "about") { AboutView() }
             .windowResizability(.contentSize)
+
+        Window("Software Update", id: "update") { UpdaterView(updater: appDelegate.updater) }
+            .windowResizability(.contentSize)
     }
 }
 
@@ -51,6 +54,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     let engine = BridgeEngine()
     let game = ReactionGame()
     let challenges = ChallengeCoordinator()
+    let updater = Updater()
     private let notifications = NotificationManager()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -65,6 +69,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
                 self?.showOnboarding()
             }
         }
+        // Daily auto-update check (only if a feed URL is configured).
+        updater.checkOnLaunchIfDue()
     }
 
     private var onboardingWindow: NSWindow?
@@ -124,6 +130,15 @@ struct MenuContent: View {
         }
 
         Divider()
+
+        Button("Check for Updates…") {
+            openWindow(id: "update")
+            NSApp.activate(ignoringOtherApps: true)
+        }
+
+        Button("Buy me a coffee ☕") {
+            AppInfo.openBuyMeACoffee()
+        }
 
         Button("About") {
             openWindow(id: "about")
