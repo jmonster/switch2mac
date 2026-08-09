@@ -53,30 +53,51 @@ struct DashboardView: View {
     private var controllerList: some View {
         VStack(spacing: 8) {
             ForEach(engine.controllers) { controller in
-                ControllerCard(status: controller) {
+                ControllerCard(status: controller,
+                               pairing: pairingInfo(for: controller)) {
                     engine.testRumble(slot: controller.id)
                 }
-            }
-            if engine.joyConPairAvailable || engine.joyConsCombined {
-                HStack(spacing: 12) {
-                    Image(systemName: "rectangle.grid.1x2")
-                        .foregroundStyle(.secondary)
-                    Toggle("Combine Joy-Cons into one gamepad (grip mode)",
-                           isOn: Binding(
-                               get: { engine.joyConsCombined },
-                               set: { engine.setCombineJoyCons($0) }))
-                    Spacer()
-                }
-                .padding(10)
-                .background(RoundedRectangle(cornerRadius: 10).fill(.quaternary.opacity(0.3)))
             }
         }
         .padding()
     }
+
+    /// Grip-mode context for a card: nil for non-Joy-Cons and for a lone
+    /// Joy-Con with no counterpart connected. The counterpart is
+    /// auto-detected — a right unit offers the connected left, and vice versa.
+    private func pairingInfo(for status: ControllerStatus) -> ControllerCard.Pairing? {
+        if status.isJoyConPair {
+            return .init(counterpartName: nil, isPaired: true) {
+                engine.setCombineJoyCons($0)
+            }
+        }
+        let counterpartModel: Switch2.Model?
+        switch status.model {
+        case .joyCon2Right: counterpartModel = .joyCon2Left
+        case .joyCon2Left: counterpartModel = .joyCon2Right
+        default: counterpartModel = nil
+        }
+        guard let counterpartModel,
+              let counterpart = engine.controllers.first(where: { $0.model == counterpartModel })
+        else { return nil }
+        let name = ControllerSettings.shared.displayName(
+            forSerial: counterpart.serial, modelName: counterpart.name)
+        return .init(counterpartName: name, isPaired: false) {
+            engine.setCombineJoyCons($0)
+        }
+    }
 }
 
 struct ControllerCard: View {
+    /// Grip-mode pairing context for Joy-Con cards.
+    struct Pairing {
+        let counterpartName: String?    // nil on an already-merged pair card
+        let isPaired: Bool
+        let setPaired: (Bool) -> Void
+    }
+
     let status: ControllerStatus
+    var pairing: Pairing?
     var onTestRumble: () -> Void = {}
 
     @ObservedObject private var settings = ControllerSettings.shared
@@ -111,7 +132,6 @@ struct ControllerCard: View {
                             Text(settings.displayName(forSerial: status.serial,
                                                       modelName: status.name))
                                 .font(.headline)
-                                .foregroundStyle(nameColor)
                             Button {
                                 nameDraft = settings.customName(forSerial: status.serial)
                                 editingName = true
@@ -125,7 +145,7 @@ struct ControllerCard: View {
                     }
                     Text(status.name)
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(modelColor)
                     Text("Serial \(status.serial)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -156,15 +176,31 @@ struct ControllerCard: View {
 
             if expanded {
                 Divider().padding(.horizontal, 10)
-                HStack(spacing: 12) {
-                    Text("Rumble")
-                    Slider(value: rumbleBinding, in: 0...1, step: 0.05)
-                    Text("\(Int(settings.rumbleIntensity(forSerial: status.serial) * 100))%")
-                        .monospacedDigit()
-                        .frame(width: 44, alignment: .trailing)
-                        .foregroundStyle(.secondary)
-                    Button("Test") { onTestRumble() }
-                        .help("Play a short rumble pulse at this controller's strength")
+                VStack(spacing: 10) {
+                    if let pairing {
+                        HStack(spacing: 12) {
+                            Text("Mode")
+                            Picker("", selection: Binding(
+                                get: { pairing.isPaired },
+                                set: { pairing.setPaired($0) })) {
+                                Text("Standalone").tag(false)
+                                Text(pairing.counterpartName.map { "In grip with \($0)" }
+                                     ?? "In grip (combined)").tag(true)
+                            }
+                            .pickerStyle(.segmented)
+                            Spacer()
+                        }
+                    }
+                    HStack(spacing: 12) {
+                        Text("Rumble")
+                        Slider(value: rumbleBinding, in: 0...1, step: 0.05)
+                        Text("\(Int(settings.rumbleIntensity(forSerial: status.serial) * 100))%")
+                            .monospacedDigit()
+                            .frame(width: 44, alignment: .trailing)
+                            .foregroundStyle(.secondary)
+                        Button("Test") { onTestRumble() }
+                            .help("Play a short rumble pulse at this controller's strength")
+                    }
                 }
                 .padding(10)
             }
@@ -179,13 +215,13 @@ struct ControllerCard: View {
         )
     }
 
-    /// Joy-Con accent colors: neon red for the right unit, neon blue for
-    /// the left — matching the hardware.
-    private var nameColor: Color {
+    /// Joy-Con accent colors on the model line: neon red for the right
+    /// unit, neon blue for the left — matching the hardware.
+    private var modelColor: Color {
         switch status.model {
         case .joyCon2Right: return Color(red: 1.00, green: 0.24, blue: 0.16)
         case .joyCon2Left: return Color(red: 0.04, green: 0.73, blue: 0.90)
-        default: return .primary
+        default: return .secondary
         }
     }
 
