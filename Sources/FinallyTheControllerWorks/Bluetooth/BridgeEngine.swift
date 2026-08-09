@@ -295,6 +295,115 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
         }
     }
 
+    /// Audio OUTPUT experiment: stream three candidate encodings at the
+    /// playback characteristic — the user's ears are the codec detector.
+    /// Phase 1: 440 Hz sine as raw 16-bit LE PCM (if the codec is raw PCM
+    /// at some rate, this yields a tone at SOME pitch). Phase 2: white
+    /// noise (any linear codec yields static). Phase 3: max-amplitude
+    /// square wave (loud clicks/buzz under almost any linear encoding).
+    func audioToneTest(serial: String) {
+        btQueue.async { [weak self] in
+            guard let self,
+                  let session = self.sessions.values.first(where: { $0.serialNumber == serial })
+            else { return }
+            // Power up the audio path first (same config as capture).
+            let config = Data([0x80, 0xBB, 0x00, 0x00, 0x02, 0xF0, 0x00])
+            session.experimentalCommand(0x17, 0x02, payload: config) { resp in
+                bridgeLog(.info, "audio",
+                          "config response: \(resp.map(Self.hex) ?? "TIMEOUT") — starting output phases")
+            }
+
+            let frameBytes = 50
+            let framesPerPhase = 600          // 3 s per phase at 5 ms pacing
+            var phase = 0
+            var frame = 0
+            var sinePhase = 0.0
+            var wrote = false
+            let phaseNames = ["440 Hz sine (raw s16 PCM)", "white noise", "square wave"]
+            bridgeLog(.info, "audio",
+                      "OUTPUT TEST: three 3-second phases — sine, noise, square. "
+                      + "Listen on the controller's headphones and report what you hear!")
+
+            let timer = DispatchSource.makeTimerSource(queue: self.btQueue)
+            timer.schedule(deadline: .now(), repeating: .milliseconds(5))
+            timer.setEventHandler {
+                if frame == 0 {
+                    bridgeLog(.info, "audio", "phase \(phase + 1): \(phaseNames[phase])")
+                }
+                var payload = Data(capacity: frameBytes)
+                switch phase {
+                case 0:
+                    // 25 x s16 samples; 440 Hz assuming 48 kHz mono.
+                    for _ in 0..<(frameBytes / 2) {
+                        let sample = Int16(sin(sinePhase) * 20000)
+                        sinePhase += 2 * .pi * 440 / 48000
+                        withUnsafeBytes(of: sample.littleEndian) {
+                            payload.append(contentsOf: $0)
+                        }
+                    }
+                case 1:
+                    for _ in 0..<frameBytes {
+                        payload.append(UInt8.random(in: 0...255))
+                    }
+                default:
+                    let half = frame % 2 == 0
+                    payload.append(contentsOf: [UInt8](repeating: half ? 0x7F : 0x80,
+                                                       count: frameBytes))
+                }
+                wrote = session.writeAudioFrame(payload) || wrote
+                frame += 1
+                if frame >= framesPerPhase {
+                    frame = 0
+                    phase += 1
+                    if phase >= phaseNames.count {
+                        timer.cancel()
+                        bridgeLog(.info, "audio",
+                                  wrote ? "output test done — what did you hear? (silence / clicks / static / tone)"
+                                        : "output characteristic not found — firmware may lack audio")
+                    }
+                }
+            }
+            timer.resume()
+        }
+    }
+
+    // MARK: - Disconnect / forget
+
+    /// Disconnect a controller (or both halves of a pair) now. It will
+    /// reconnect on the next button press — the bond is on the controller.
+    func disconnect(serial: String) {
+        btQueue.async { [weak self] in
+            guard let self else { return }
+            for part in serial.split(separator: "+").map(String.init) {
+                if let session = self.sessions.values.first(where: { $0.serialNumber == part }) {
+                    bridgeLog(.info, "engine", "\(session.displayName): disconnect requested")
+                    self.central.cancelPeripheralConnection(session.peripheral)
+                }
+            }
+        }
+    }
+
+    /// Forget: unlink, wipe stored settings (name, mappings, everything),
+    /// forget its player slot, and disconnect. The controller itself still
+    /// remembers this Mac, so pressing a button will reconnect it fresh.
+    func forget(serial: String) {
+        unlink(serial: serial)
+        btQueue.async { [weak self] in
+            guard let self else { return }
+            for part in serial.split(separator: "+").map(String.init) {
+                self.playerMemory.removeValue(forKey: part)
+            }
+            self.playerMemory.removeValue(forKey: serial)
+            DispatchQueue.main.async {
+                for part in serial.split(separator: "+").map(String.init) {
+                    ControllerSettings.shared.removeSettings(forSerial: part)
+                }
+                ControllerSettings.shared.removeSettings(forSerial: serial)
+            }
+            self.disconnect(serial: serial)
+        }
+    }
+
     private static func hex(_ data: Data) -> String {
         data.prefix(48).map { String(format: "%02x", $0) }.joined(separator: " ")
             + (data.count > 48 ? " …(\(data.count)B)" : "")

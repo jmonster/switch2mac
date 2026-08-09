@@ -27,6 +27,14 @@ final class ControllerSettings: ObservableObject {
         UserDefaults.standard.set(store, forKey: Self.defaultsKey)
     }
 
+    /// Forget everything stored about a controller (name, mappings, axis
+    /// options, mouse mode, hold style).
+    func removeSettings(forSerial serial: String) {
+        store.removeValue(forKey: serial)
+        persist()
+        NotificationCenter.default.post(name: Self.namesChangedNotification, object: nil)
+    }
+
     // MARK: Custom name
 
     func customName(forSerial serial: String) -> String {

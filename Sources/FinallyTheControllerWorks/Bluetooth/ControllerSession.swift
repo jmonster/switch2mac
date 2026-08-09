@@ -333,6 +333,18 @@ final class ControllerSession: NSObject, @unchecked Sendable {
 
     /// Firmware 2.0+ Pro Controller audio input characteristic.
     static let audioInputUUID = UUID(uuidString: "7492866C-EC3E-4619-8258-32755FFCC0F9")!
+    /// Firmware 2.0+ audio OUTPUT (host → controller headphone jack).
+    static let audioOutputUUID = UUID(uuidString: "CC483F51-9258-427D-A939-630C31F72B06")!
+
+    /// Write one raw frame to the audio output characteristic (Bluetooth
+    /// queue only). Returns false when the characteristic is absent.
+    @discardableResult
+    func writeAudioFrame(_ data: Data) -> Bool {
+        guard let ch = chars[Self.audioOutputUUID] else { return false }
+        peripheral.writeValue(data, for: ch, type: .withoutResponse)
+        lastWriteAt = CFAbsoluteTimeGetCurrent()
+        return true
+    }
 
     /// Called per audio notification when capture is active.
     var onAudioPacket: ((Data) -> Void)?

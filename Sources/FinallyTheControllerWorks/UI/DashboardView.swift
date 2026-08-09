@@ -80,7 +80,10 @@ struct DashboardView: View {
                                    ? engine.liveStates[controller.player] : nil,
                                onTestRumble: { engine.testRumble(player: controller.player) },
                                onNFCProbe: { engine.nfcProbe(serial: controller.serial) },
-                               onAudioCapture: { engine.audioCapture(serial: controller.serial) })
+                               onAudioCapture: { engine.audioCapture(serial: controller.serial) },
+                               onAudioTone: { engine.audioToneTest(serial: controller.serial) },
+                               onDisconnect: { engine.disconnect(serial: controller.serial) },
+                               onForget: { engine.forget(serial: controller.serial) })
             }
         }
         .padding()
@@ -148,6 +151,9 @@ struct ControllerCard: View {
     var onTestRumble: () -> Void = {}
     var onNFCProbe: () -> Void = {}
     var onAudioCapture: () -> Void = {}
+    var onAudioTone: () -> Void = {}
+    var onDisconnect: () -> Void = {}
+    var onForget: () -> Void = {}
 
     @ObservedObject private var settings = ControllerSettings.shared
     @State private var expanded = false
@@ -202,6 +208,14 @@ struct ControllerCard: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
+                VStack(alignment: .trailing, spacing: 4) {
+                    Button("Disconnect") { onDisconnect() }
+                        .controlSize(.small)
+                        .help("Disconnect now — any button press reconnects it")
+                    Button("Forget") { onForget() }
+                        .controlSize(.small)
+                        .help("Disconnect and erase this controller's name, mappings, and settings")
+                }
                 VStack(alignment: .trailing, spacing: 4) {
                     Label("\(status.batteryPercent)%", systemImage: batteryIcon)
                     HStack(spacing: 5) {
@@ -350,6 +364,8 @@ struct ControllerCard: View {
                                 HStack(spacing: 10) {
                                     Button("Detect amiibo (NFC)") { onNFCProbe() }
                                     Button("Capture audio 30 s") { onAudioCapture() }
+                                    Button("Send test audio") { onAudioTone() }
+                                        .help("Plays 3 test phases at the controller's headphone jack — listen and report")
                                 }
                             }
                             .padding(.top, 6)
