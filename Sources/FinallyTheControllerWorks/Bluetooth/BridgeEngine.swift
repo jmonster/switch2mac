@@ -193,6 +193,113 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
         }
     }
 
+    // MARK: - Experiments (NFC + audio; results go to the log)
+
+    /// NFC discovery probe per ndeadly's sniffed console traffic: start
+    /// discovery (0x01/0x03), then poll status (0x01/0x05) for a tag UID.
+    func nfcProbe(serial: String) {
+        btQueue.async { [weak self] in
+            guard let self,
+                  let session = self.sessions.values.first(where: { $0.serialNumber == serial })
+            else { return }
+            bridgeLog(.info, "nfc",
+                      "starting NFC discovery — place an amiibo flat on the "
+                      + "controller's NFC touchpoint (right stick area)")
+            let startPayload = Data([0x00, 0xE8, 0x03, 0x2C, 0x01])
+            session.experimentalCommand(0x01, 0x03, payload: startPayload) { resp in
+                bridgeLog(.info, "nfc",
+                          "discovery start response: \(resp.map(Self.hex) ?? "TIMEOUT")")
+                self.nfcPollStatus(session: session, attempt: 0)
+            }
+        }
+    }
+
+    private func nfcPollStatus(session: ControllerSession, attempt: Int) {
+        guard attempt < 20 else {
+            bridgeLog(.warning, "nfc", "no tag detected after 10 s — probe over")
+            return
+        }
+        btQueue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self else { return }
+            session.experimentalCommand(0x01, 0x05, payload: Data()) { resp in
+                guard let resp else {
+                    bridgeLog(.warning, "nfc", "status poll timed out; retrying")
+                    self.nfcPollStatus(session: session, attempt: attempt + 1)
+                    return
+                }
+                bridgeLog(.debug, "nfc", "status: \(Self.hex(resp))")
+                // Observed layout: ... byte[8] = UID length, bytes 9.. = UID.
+                if resp.count > 9, resp[resp.startIndex + 8] > 0,
+                   resp.count >= 9 + Int(resp[resp.startIndex + 8]) {
+                    let len = Int(resp[resp.startIndex + 8])
+                    let uid = resp.subdata(in: resp.startIndex + 9 ..< resp.startIndex + 9 + len)
+                    bridgeLog(.info, "nfc",
+                              "🎉 TAG DETECTED — UID \(uid.map { String(format: "%02X", $0) }.joined(separator: ":"))")
+                    bridgeLog(.info, "nfc",
+                              "full status: \(Self.hex(resp)) — next frontier: buffer read (0x01/0x06 + 0x01/0x15)")
+                } else {
+                    self.nfcPollStatus(session: session, attempt: attempt + 1)
+                }
+            }
+        }
+    }
+
+    /// Audio experiment: subscribe the fw-2.0+ audio characteristic, send
+    /// the sniffed 48 kHz config command, and dump packets to a file for
+    /// offline codec analysis.
+    func audioCapture(serial: String, seconds: Double = 30) {
+        btQueue.async { [weak self] in
+            guard let self,
+                  let session = self.sessions.values.first(where: { $0.serialNumber == serial })
+            else { return }
+            session.setAudioCapture(true) { ok in
+                guard ok else {
+                    bridgeLog(.warning, "audio",
+                              "audio characteristic not found — controller firmware "
+                              + "may be older than 2.0 (update it via a Switch 2 console)")
+                    return
+                }
+                let url = FileManager.default.urls(for: .documentDirectory,
+                                                   in: .userDomainMask)[0]
+                    .appendingPathComponent("FTCW-audio-capture.bin")
+                FileManager.default.createFile(atPath: url.path, contents: nil)
+                guard let handle = try? FileHandle(forWritingTo: url) else { return }
+                var packets = 0
+                var sizes: Set<Int> = []
+                session.onAudioPacket = { data in
+                    packets += 1
+                    sizes.insert(data.count)
+                    var record = Data()
+                    withUnsafeBytes(of: UInt32(data.count).littleEndian) {
+                        record.append(contentsOf: $0)
+                    }
+                    record.append(data)
+                    try? handle.write(contentsOf: record)
+                }
+                bridgeLog(.info, "audio",
+                          "capturing audio packets for \(Int(seconds)) s — plug "
+                          + "headphones into the controller if you have them")
+                let config = Data([0x80, 0xBB, 0x00, 0x00, 0x02, 0xF0, 0x00])
+                session.experimentalCommand(0x17, 0x02, payload: config) { resp in
+                    bridgeLog(.info, "audio",
+                              "audio config (48 kHz) response: \(resp.map(Self.hex) ?? "TIMEOUT")")
+                }
+                self.btQueue.asyncAfter(deadline: .now() + seconds) {
+                    session.onAudioPacket = nil
+                    session.setAudioCapture(false) { _ in }
+                    try? handle.close()
+                    bridgeLog(.info, "audio",
+                              "capture done: \(packets) packets, sizes \(sizes.sorted()) → \(url.path)")
+                }
+            }
+        }
+    }
+
+    private static func hex(_ data: Data) -> String {
+        data.prefix(48).map { String(format: "%02x", $0) }.joined(separator: " ")
+            + (data.count > 48 ? " …(\(data.count)B)" : "")
+    }
+
     // MARK: - Grip links
 
     func link(leftSerial: String, rightSerial: String) {
@@ -306,8 +413,16 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
         publishControllers()
     }
 
+    private let mouseController = MouseController()
+
     /// Route one physical unit's report to its logical player.
     private func emitState(slot: Int, state: ControllerState) {
+        // Mouse mode operates on PHYSICAL units (a linked pair's right
+        // Joy-Con can be lifted off the grip and used as the mouse).
+        if let session = sessions[slot] {
+            mouseController.handle(serial: session.serialNumber,
+                                   model: session.model, state: state)
+        }
         guard let (player, logical) = players.first(where: { $0.value.slots.contains(slot) })
         else { return }
         var out = state

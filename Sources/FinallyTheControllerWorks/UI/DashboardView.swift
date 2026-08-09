@@ -77,9 +77,10 @@ struct DashboardView: View {
                 ControllerCard(status: controller,
                                pairing: pairingInfo(for: controller),
                                live: controller.player >= 0
-                                   ? engine.liveStates[controller.player] : nil) {
-                    engine.testRumble(player: controller.player)
-                }
+                                   ? engine.liveStates[controller.player] : nil,
+                               onTestRumble: { engine.testRumble(player: controller.player) },
+                               onNFCProbe: { engine.nfcProbe(serial: controller.serial) },
+                               onAudioCapture: { engine.audioCapture(serial: controller.serial) })
             }
         }
         .padding()
@@ -145,6 +146,8 @@ struct ControllerCard: View {
     var pairing: Pairing?
     var live: ControllerState?
     var onTestRumble: () -> Void = {}
+    var onNFCProbe: () -> Void = {}
+    var onAudioCapture: () -> Void = {}
 
     @ObservedObject private var settings = ControllerSettings.shared
     @State private var expanded = false
@@ -296,8 +299,61 @@ struct ControllerCard: View {
                         .padding(.top, 6)
                     }
                     DisclosureGroup("Input test") {
-                        InputVisualizer(state: live, layout: vizLayout)
+                        VStack(spacing: 8) {
+                            InputVisualizer(state: live, layout: vizLayout)
+                            if let live {
+                                Text("gyro \(live.gyro.0) \(live.gyro.1) \(live.gyro.2)   "
+                                     + "mag \(live.mag.0) \(live.mag.1) \(live.mag.2)")
+                                    .font(.system(.caption2, design: .monospaced))
+                                    .foregroundStyle(.tertiary)
+                            }
+                        }
+                        .padding(.top, 6)
+                    }
+                    if status.model == .joyCon2Left || status.model == .joyCon2Right {
+                        DisclosureGroup("Mouse mode") {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Lay the Joy-Con flat on a table like a mouse "
+                                     + "(optical sensor down). SL clicks left, SR "
+                                     + "clicks right. Needs Accessibility permission "
+                                     + "the first time.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                Toggle("Use as mouse", isOn: boolBinding(
+                                    get: { settings.mouseEnabled(forSerial: status.serial) },
+                                    set: { settings.setMouseEnabled($0, forSerial: status.serial) }))
+                                    .toggleStyle(.switch)
+                                HStack(spacing: 12) {
+                                    Text("Sensitivity")
+                                    Slider(value: boolDoubleBinding(
+                                        get: { settings.mouseSensitivity(forSerial: status.serial) },
+                                        set: { settings.setMouseSensitivity($0, forSerial: status.serial) }),
+                                        in: 0.2...4.0)
+                                    Text(String(format: "%.1f×",
+                                                settings.mouseSensitivity(forSerial: status.serial)))
+                                        .monospacedDigit()
+                                        .frame(width: 40, alignment: .trailing)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
                             .padding(.top, 6)
+                        }
+                    }
+                    if status.model == .proController2 && !status.isJoyConPair {
+                        DisclosureGroup("Experiments") {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Frontier features — results appear in the Logs "
+                                     + "section below.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                HStack(spacing: 10) {
+                                    Button("Detect amiibo (NFC)") { onNFCProbe() }
+                                    Button("Capture audio 30 s") { onAudioCapture() }
+                                }
+                            }
+                            .padding(.top, 6)
+                        }
                     }
                     DisclosureGroup("Button mapping") {
                         VStack(alignment: .leading, spacing: 6) {
@@ -389,6 +445,11 @@ struct ControllerCard: View {
 
     private func boolBinding(get: @escaping () -> Bool,
                              set: @escaping (Bool) -> Void) -> Binding<Bool> {
+        Binding(get: get, set: set)
+    }
+
+    private func boolDoubleBinding(get: @escaping () -> Double,
+                                   set: @escaping (Double) -> Void) -> Binding<Double> {
         Binding(get: get, set: set)
     }
 

@@ -91,8 +91,21 @@ enum Switch2 {
 
     enum Feature {
         static let motion: UInt8 = 0x04
+        static let mouse: UInt8 = 0x10       // optical sensor, Joy-Con 2 only
+        static let magnetometer: UInt8 = 0x80
         /// Base flags the console always sets alongside motion.
         static let baseline: UInt8 = 0x03
+
+        /// Flags we enable per model. (0xFF causes phantom ZL/ZR on
+        /// Joy-Cons per Switch2Connect; mouse bit is Joy-Con-only.)
+        static func flags(for model: Model) -> UInt8 {
+            switch model {
+            case .joyCon2Left, .joyCon2Right:
+                return baseline | motion | mouse | magnetometer   // 0x97
+            default:
+                return baseline | motion | magnetometer           // 0x87
+            }
+        }
     }
 
     /// Fixed LTK halves the protocol expects during bonding (each prefixed
@@ -317,6 +330,16 @@ enum Switch2 {
         let accel: (Int16, Int16, Int16)
         let leftTriggerRaw: UInt8
         let rightTriggerRaw: UInt8
+        /// Optical mouse (Joy-Con 2, feature 0x10): free-running absolute
+        /// counters that wrap mod 2^16 — diff consecutive reports for deltas.
+        let mouseX: UInt16
+        let mouseY: UInt16
+        /// Surface quality; low = good tracking (ndeadly: "roughness").
+        let surfaceQuality: UInt16
+        /// Lift-off distance; 0 = no surface reference.
+        let liftDistance: UInt16
+        /// Magnetometer (feature 0x80): AK09919, 0.15 µT/LSB.
+        let mag: (Int16, Int16, Int16)
 
         init?(data: Data) {
             guard data.count >= 0x3C else { return nil }
@@ -324,6 +347,11 @@ enum Switch2 {
             buttons = Buttons(rawValue: Switch2.u32(data, 4))
             leftStickRaw = Switch2.stickXY(data, 10)
             rightStickRaw = Switch2.stickXY(data, 13)
+            mouseX = Switch2.u16(data, 0x10)
+            mouseY = Switch2.u16(data, 0x12)
+            surfaceQuality = Switch2.u16(data, 0x14)
+            liftDistance = Switch2.u16(data, 0x16)
+            mag = (Switch2.s16(data, 0x19), Switch2.s16(data, 0x1B), Switch2.s16(data, 0x1D))
             batteryMillivolts = Switch2.u16(data, 0x1F)
             gyro = (Switch2.s16(data, 0x36), Switch2.s16(data, 0x38), Switch2.s16(data, 0x3A))
             accel = (Switch2.s16(data, 0x30), Switch2.s16(data, 0x32), Switch2.s16(data, 0x34))

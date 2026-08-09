@@ -101,6 +101,30 @@ final class ControllerSettings: ObservableObject {
         persist()
     }
 
+    // MARK: Mouse mode (Joy-Con 2 optical sensor)
+
+    func mouseEnabled(forSerial serial: String) -> Bool {
+        store[serial]?["mouseEnabled"] as? Bool ?? false
+    }
+
+    func setMouseEnabled(_ value: Bool, forSerial serial: String) {
+        var entry = store[serial] ?? [:]
+        entry["mouseEnabled"] = value
+        store[serial] = entry
+        persist()
+    }
+
+    func mouseSensitivity(forSerial serial: String) -> Double {
+        store[serial]?["mouseSensitivity"] as? Double ?? 1.0
+    }
+
+    func setMouseSensitivity(_ value: Double, forSerial serial: String) {
+        var entry = store[serial] ?? [:]
+        entry["mouseSensitivity"] = value
+        store[serial] = entry
+        persist()
+    }
+
     // MARK: Joy-Con pair hold style
 
     /// How a linked pair is physically held: "grip" (controller grip shell)

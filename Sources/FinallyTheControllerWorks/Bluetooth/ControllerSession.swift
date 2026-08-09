@@ -28,6 +28,13 @@ struct ControllerState: Sendable {
     var batteryMillivolts: UInt16 = 0
     var gyro: (Int16, Int16, Int16) = (0, 0, 0)
     var accel: (Int16, Int16, Int16) = (0, 0, 0)
+    /// Optical mouse raw absolute counters (Joy-Con 2; wrap mod 2^16).
+    var mouseX: UInt16 = 0
+    var mouseY: UInt16 = 0
+    var surfaceQuality: UInt16 = 0
+    var liftDistance: UInt16 = 0
+    /// Magnetometer raw (0.15 µT/LSB).
+    var mag: (Int16, Int16, Int16) = (0, 0, 0)
 }
 
 /// Called on the Bluetooth queue.
@@ -212,7 +219,7 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     }
 
     private func stepFeatures(_ done: @escaping (Bool) -> Void) {
-        let flags = Data([Switch2.Feature.baseline | Switch2.Feature.motion, 0, 0, 0])
+        let flags = Data([Switch2.Feature.flags(for: model), 0, 0, 0])
         writeCommand(Switch2.Command.feature, Switch2.Subcommand.featureInit, flags) { [weak self] resp in
             guard let self, resp != nil else { done(false); return }
             self.writeCommand(Switch2.Command.feature, Switch2.Subcommand.featureEnable, flags) { resp in
@@ -310,6 +317,38 @@ final class ControllerSession: NSObject, @unchecked Sendable {
         }
     }
 
+    // MARK: - Experiments (NFC probing, audio capture)
+
+    /// Raw command access for protocol experiments. Serialized with all
+    /// other commands; completion gets the response payload (post-header)
+    /// or nil on timeout/error. Runs on the Bluetooth queue.
+    func experimentalCommand(_ command: UInt8, _ subcommand: UInt8,
+                             payload: Data,
+                             completion: @escaping (Data?) -> Void) {
+        queue.async { [weak self] in
+            guard let self else { completion(nil); return }
+            self.writeCommand(command, subcommand, payload, completion: completion)
+        }
+    }
+
+    /// Firmware 2.0+ Pro Controller audio input characteristic.
+    static let audioInputUUID = UUID(uuidString: "7492866C-EC3E-4619-8258-32755FFCC0F9")!
+
+    /// Called per audio notification when capture is active.
+    var onAudioPacket: ((Data) -> Void)?
+
+    /// Subscribe (or unsubscribe) the audio input characteristic.
+    /// Returns false via completion when the firmware doesn't expose it.
+    func setAudioCapture(_ enabled: Bool, completion: @escaping (Bool) -> Void) {
+        queue.async { [weak self] in
+            guard let self, let ch = self.chars[Self.audioInputUUID] else {
+                completion(false); return
+            }
+            self.peripheral.setNotifyValue(enabled, for: ch)
+            completion(true)
+        }
+    }
+
     // MARK: - Keep-alive + rumble (shared 50 ms cadence)
 
     func setRumble(strong: Double, weak: Double) {
@@ -391,6 +430,11 @@ final class ControllerSession: NSObject, @unchecked Sendable {
         s.batteryMillivolts = report.batteryMillivolts
         s.gyro = report.gyro
         s.accel = report.accel
+        s.mouseX = report.mouseX
+        s.mouseY = report.mouseY
+        s.surfaceQuality = report.surfaceQuality
+        s.liftDistance = report.liftDistance
+        s.mag = report.mag
 
         // Activity: any button change, meaningful stick deflection change,
         // or trigger change counts. (Gyro noise deliberately excluded.)
@@ -475,6 +519,8 @@ extension ControllerSession: CBPeripheralDelegate {
             handleInputReport(data)
         } else if uuid == Switch2.GATT.commandResponse {
             handleCommandResponse(data)
+        } else if uuid == Self.audioInputUUID {
+            onAudioPacket?(data)
         }
     }
 }
