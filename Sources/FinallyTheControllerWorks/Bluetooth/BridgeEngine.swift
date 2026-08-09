@@ -82,6 +82,34 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
     override init() {
         super.init()
         central = CBCentralManager(delegate: self, queue: btQueue)
+        // The settings store posts this when a custom name changes; push the
+        // new names to sinks so games can relabel their joysticks live.
+        NotificationCenter.default.addObserver(
+            forName: ControllerSettings.namesChangedNotification,
+            object: nil, queue: nil) { [weak self] _ in
+            guard let self else { return }
+            self.btQueue.async { self.pushNames() }
+        }
+    }
+
+    /// btQueue. The user-facing name for a logical player, honoring renames.
+    private func displayName(for logical: Logical) -> String {
+        let store = UserDefaults.standard.dictionary(forKey: "controllerSettings")
+        if let custom = (store?[logical.id] as? [String: Any])?["name"] as? String,
+           !custom.isEmpty {
+            return custom
+        }
+        if logical.isPair { return "Joy-Con 2 Pair" }
+        return sessions[logical.slots[0]]?.displayName ?? logical.model.displayName
+    }
+
+    /// btQueue. Send current names for every assigned player to all sinks.
+    private func pushNames() {
+        for (player, logical) in players {
+            let name = displayName(for: logical)
+            for sink in sinks { sink.controllerName(slot: player, name: name) }
+        }
+        publishControllers()
     }
 
     func addSink(_ sink: any ControllerOutputSink) {
@@ -238,6 +266,7 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
             }
         }
         players = newPlayers
+        pushNames()
 
         // 4. LEDs follow logical player numbers.
         for (player, logical) in players {
@@ -482,6 +511,8 @@ protocol ControllerOutputSink: AnyObject {
     func controllerConnected(slot: Int, model: Switch2.Model)
     func controllerDisconnected(slot: Int)
     func controllerState(slot: Int, state: ControllerState)
+    /// User-facing name for a player (custom names included); may repeat.
+    func controllerName(slot: Int, name: String)
     /// Set by the engine: call to deliver rumble intent for a player.
     var onRumble: ((Int, Double, Double) -> Void)? { get set }
 }

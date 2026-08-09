@@ -118,6 +118,9 @@ final class VirtualHIDSink: ControllerOutputSink, @unchecked Sendable {
         }
     }
 
+    /// Virtual devices are named at creation; renames apply on next connect.
+    func controllerName(slot: Int, name: String) {}
+
     func controllerState(slot: Int, state: ControllerState) {
         queue.async { [weak self] in
             guard let self, let device = self.devices[slot] else { return }

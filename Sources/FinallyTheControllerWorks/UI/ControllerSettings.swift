@@ -9,6 +9,10 @@ import Combine
 final class ControllerSettings: ObservableObject {
     static let shared = ControllerSettings()
 
+    /// Posted after a custom name changes so the engine can re-announce
+    /// controller names to games.
+    static let namesChangedNotification = Notification.Name("ftcw.namesChanged")
+
     private static let defaultsKey = "controllerSettings"
 
     /// serial -> {"name": String, "rumble": Double}
@@ -40,6 +44,7 @@ final class ControllerSettings: ObservableObject {
         entry["name"] = name.trimmingCharacters(in: .whitespaces)
         store[serial] = entry
         persist()
+        NotificationCenter.default.post(name: Self.namesChangedNotification, object: nil)
     }
 
     // MARK: Rumble strength

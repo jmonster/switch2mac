@@ -24,6 +24,7 @@ final class UDPHub: ControllerOutputSink, @unchecked Sendable {
         let fd: Int32
         var peers: [SockAddr: TimeInterval] = [:]
         var seq: UInt32 = 0
+        var name: String = ""
         var readSource: DispatchSourceRead?
         init(fd: Int32) { self.fd = fd }
     }
@@ -102,7 +103,12 @@ final class UDPHub: ControllerOutputSink, @unchecked Sendable {
             }
             if n < 0 { break }  // EWOULDBLOCK: drained
             let peer = SockAddr(addr: from.sin_addr.s_addr, port: from.sin_port)
+            let isNewPeer = s.peers[peer] == nil
             s.peers[peer] = CFAbsoluteTimeGetCurrent()
+            if isNewPeer, !s.name.isEmpty {
+                // Late joiners get the name before their first state packet.
+                send(Self.namePacket(s.name), to: peer, via: s.fd)
+            }
             if n >= 6, buf[0] == 0x53, buf[1] == 0x32, buf[2] == 0x52, buf[3] == 0x31 {  // "S2R1"
                 onRumble?(slot, Double(buf[4]) / 255.0, Double(buf[5]) / 255.0)
             }
@@ -112,6 +118,39 @@ final class UDPHub: ControllerOutputSink, @unchecked Sendable {
     // MARK: ControllerOutputSink (called on the Bluetooth queue)
 
     func controllerConnected(slot: Int, model: Switch2.Model) {}
+
+    func controllerName(slot: Int, name: String) {
+        queue.async { [weak self] in
+            guard let self, let s = self.slots[slot], s.name != name else { return }
+            s.name = name
+            let packet = Self.namePacket(name)
+            for peer in s.peers.keys {
+                self.send(packet, to: peer, via: s.fd)
+            }
+        }
+    }
+
+    /// "S2N1" + UTF-8 name (truncated to 59 bytes).
+    private static func namePacket(_ name: String) -> Data {
+        var d = Data([0x53, 0x32, 0x4E, 0x31])  // "S2N1"
+        d.append(Data(name.utf8).prefix(59))
+        return d
+    }
+
+    private func send(_ packet: Data, to peer: SockAddr, via fd: Int32) {
+        var dest = sockaddr_in()
+        dest.sin_family = sa_family_t(AF_INET)
+        dest.sin_port = peer.port
+        dest.sin_addr.s_addr = peer.addr
+        _ = packet.withUnsafeBytes { bytes in
+            withUnsafePointer(to: &dest) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { destPtr in
+                    sendto(fd, bytes.baseAddress, bytes.count, 0,
+                           destPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+        }
+    }
 
     func controllerDisconnected(slot: Int) {
         queue.async { [weak self] in
