@@ -303,7 +303,9 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
             s.leftStick = Self.radialDeadzone(s.leftStick, dz)
             s.rightStick = Self.radialDeadzone(s.rightStick, dz)
         }
+        if entry["invertLX"] as? Bool ?? false { s.leftStick.x = -s.leftStick.x }
         if entry["invertLY"] as? Bool ?? false { s.leftStick.y = -s.leftStick.y }
+        if entry["invertRX"] as? Bool ?? false { s.rightStick.x = -s.rightStick.x }
         if entry["invertRY"] as? Bool ?? false { s.rightStick.y = -s.rightStick.y }
         return s
     }

@@ -73,24 +73,44 @@ final class ControllerSettings: ObservableObject {
         persist()
     }
 
-    func invertLeftY(forSerial serial: String) -> Bool {
-        store[serial]?["invertLY"] as? Bool ?? false
+    /// Stick axes that can be inverted, keyed by their UserDefaults name.
+    enum StickAxis: String, CaseIterable {
+        case leftX = "invertLX"
+        case leftY = "invertLY"
+        case rightX = "invertRX"
+        case rightY = "invertRY"
+
+        var label: String {
+            switch self {
+            case .leftX: return "Left thumbstick X"
+            case .leftY: return "Left thumbstick Y"
+            case .rightX: return "Right thumbstick X"
+            case .rightY: return "Right thumbstick Y"
+            }
+        }
     }
 
-    func invertRightY(forSerial serial: String) -> Bool {
-        store[serial]?["invertRY"] as? Bool ?? false
+    func invert(_ axis: StickAxis, forSerial serial: String) -> Bool {
+        store[serial]?[axis.rawValue] as? Bool ?? false
     }
 
-    func setInvertLeftY(_ value: Bool, forSerial serial: String) {
+    func setInvert(_ axis: StickAxis, _ value: Bool, forSerial serial: String) {
         var entry = store[serial] ?? [:]
-        entry["invertLY"] = value
+        entry[axis.rawValue] = value
         store[serial] = entry
         persist()
     }
 
-    func setInvertRightY(_ value: Bool, forSerial serial: String) {
+    /// True when every axis is inverted (the "invert all" master state).
+    func invertsAll(forSerial serial: String) -> Bool {
+        StickAxis.allCases.allSatisfy { invert($0, forSerial: serial) }
+    }
+
+    func setInvertAll(_ value: Bool, forSerial serial: String) {
         var entry = store[serial] ?? [:]
-        entry["invertRY"] = value
+        for axis in StickAxis.allCases {
+            entry[axis.rawValue] = value
+        }
         store[serial] = entry
         persist()
     }

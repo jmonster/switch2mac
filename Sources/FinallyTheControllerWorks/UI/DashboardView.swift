@@ -7,17 +7,28 @@ import AppKit
 struct DashboardView: View {
     @ObservedObject var engine: BridgeEngine
 
+    @AppStorage("showLogs") private var showLogs = false
+
     var body: some View {
         VStack(spacing: 0) {
             header
             Divider()
-            if engine.controllers.isEmpty {
-                emptyState
-            } else {
-                controllerList
+            ScrollView {
+                if engine.controllers.isEmpty {
+                    emptyState
+                } else {
+                    controllerList
+                }
             }
             Divider()
-            LogView()
+            DisclosureGroup(isExpanded: $showLogs) {
+                LogView()
+            } label: {
+                Label("Logs", systemImage: "text.alignleft")
+                    .font(.headline)
+            }
+            .padding(.horizontal)
+            .padding(.vertical, 8)
         }
     }
 
@@ -245,25 +256,41 @@ struct ControllerCard: View {
                         Button("Test") { onTestRumble() }
                             .help("Play a short rumble pulse at this controller's strength")
                     }
-                    HStack(spacing: 12) {
-                        Text("Deadzone")
-                        Slider(value: deadzoneBinding, in: 0...0.25, step: 0.01)
-                            .help("Stick input below this is ignored — raise it if a stick drifts")
-                        Text("\(Int(settings.deadzone(forSerial: status.serial) * 100))%")
-                            .monospacedDigit()
-                            .frame(width: 44, alignment: .trailing)
-                            .foregroundStyle(.secondary)
+                    DisclosureGroup("Deadzone") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("The deadzone is the area around the stick's "
+                                 + "center where input is ignored. If a character "
+                                 + "or camera drifts on its own, raise this until "
+                                 + "the drift stops — the stick's full range is "
+                                 + "rescaled so you still reach maximum tilt.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                            HStack(spacing: 12) {
+                                Slider(value: deadzoneBinding, in: 0...0.25, step: 0.01)
+                                Text("\(Int(settings.deadzone(forSerial: status.serial) * 100))%")
+                                    .monospacedDigit()
+                                    .frame(width: 44, alignment: .trailing)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .padding(.top, 6)
                     }
-                    HStack(spacing: 16) {
-                        Toggle("Invert left Y", isOn: boolBinding(
-                            get: { settings.invertLeftY(forSerial: status.serial) },
-                            set: { settings.setInvertLeftY($0, forSerial: status.serial) }))
-                        Toggle("Invert right Y", isOn: boolBinding(
-                            get: { settings.invertRightY(forSerial: status.serial) },
-                            set: { settings.setInvertRightY($0, forSerial: status.serial) }))
-                        Spacer()
+                    DisclosureGroup("Invert axes") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Toggle("Invert all axes", isOn: boolBinding(
+                                get: { settings.invertsAll(forSerial: status.serial) },
+                                set: { settings.setInvertAll($0, forSerial: status.serial) }))
+                            Divider()
+                            ForEach(ControllerSettings.StickAxis.allCases, id: \.rawValue) { axis in
+                                Toggle("Invert \(axis.label.lowercased())", isOn: boolBinding(
+                                    get: { settings.invert(axis, forSerial: status.serial) },
+                                    set: { settings.setInvert(axis, $0, forSerial: status.serial) }))
+                            }
+                        }
+                        .toggleStyle(.checkbox)
+                        .padding(.top, 6)
                     }
-                    .toggleStyle(.checkbox)
                 }
                 .padding(10)
             }
