@@ -313,53 +313,76 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
                           "config response: \(resp.map(Self.hex) ?? "TIMEOUT") — starting output phases")
             }
 
+            // Discovery so far: raw PCM frames made the HAPTIC ACTUATOR
+            // sing — the stream is linear and likely carries haptic +
+            // headphone lanes (DualSense-style). These phases localize
+            // which bytes go where, and probe config routing bytes.
             let frameBytes = 50
             let framesPerPhase = 600          // 3 s per phase at 5 ms pacing
             var phase = 0
             var frame = 0
             var sinePhase = 0.0
-            var wrote = false
-            let phaseNames = ["440 Hz sine (raw s16 PCM)", "white noise", "square wave"]
+            let phaseNames = [
+                "sine across FULL frame (baseline — expect actuator noise)",
+                "sine in FIRST 25 bytes only",
+                "sine in LAST 25 bytes only",
+                "full sine + config variant 01 (channel byte)",
+                "full sine + config variant 03",
+                "full sine + config flags f0→ff",
+            ]
+            let configs: [Int: Data] = [
+                3: Data([0x80, 0xBB, 0x00, 0x00, 0x01, 0xF0, 0x00]),
+                4: Data([0x80, 0xBB, 0x00, 0x00, 0x03, 0xF0, 0x00]),
+                5: Data([0x80, 0xBB, 0x00, 0x00, 0x02, 0xFF, 0x00]),
+            ]
             bridgeLog(.info, "audio",
-                      "OUTPUT TEST: three 3-second phases — sine, noise, square. "
-                      + "Listen on the controller's headphones and report what you hear!")
+                      "OUTPUT PROBE v2 — six 3-second phases. Note for each: "
+                      + "actuator noise, headphone sound, or silence!")
+
+            func sineBytes(_ count: Int) -> Data {
+                var d = Data(capacity: count)
+                for _ in 0..<(count / 2) {
+                    let sample = Int16(sin(sinePhase) * 20000)
+                    sinePhase += 2 * .pi * 440 / 48000
+                    withUnsafeBytes(of: sample.littleEndian) { d.append(contentsOf: $0) }
+                }
+                return d
+            }
 
             let timer = DispatchSource.makeTimerSource(queue: self.btQueue)
             timer.schedule(deadline: .now(), repeating: .milliseconds(5))
             timer.setEventHandler {
                 if frame == 0 {
-                    bridgeLog(.info, "audio", "phase \(phase + 1): \(phaseNames[phase])")
-                }
-                var payload = Data(capacity: frameBytes)
-                switch phase {
-                case 0:
-                    // 25 x s16 samples; 440 Hz assuming 48 kHz mono.
-                    for _ in 0..<(frameBytes / 2) {
-                        let sample = Int16(sin(sinePhase) * 20000)
-                        sinePhase += 2 * .pi * 440 / 48000
-                        withUnsafeBytes(of: sample.littleEndian) {
-                            payload.append(contentsOf: $0)
+                    bridgeLog(.info, "audio", "phase \(phase + 1)/6: \(phaseNames[phase])")
+                    if let cfg = configs[phase] {
+                        session.experimentalCommand(0x17, 0x02, payload: cfg) { resp in
+                            bridgeLog(.info, "audio",
+                                      "  config \(cfg.map { String(format: "%02x", $0) }.joined()) → \(resp.map(Self.hex) ?? "TIMEOUT")")
                         }
                     }
-                case 1:
-                    for _ in 0..<frameBytes {
-                        payload.append(UInt8.random(in: 0...255))
-                    }
-                default:
-                    let half = frame % 2 == 0
-                    payload.append(contentsOf: [UInt8](repeating: half ? 0x7F : 0x80,
-                                                       count: frameBytes))
                 }
-                wrote = session.writeAudioFrame(payload) || wrote
+                var payload: Data
+                switch phase {
+                case 1:
+                    payload = sineBytes(25 + 1)
+                    payload = payload.prefix(25) + Data(repeating: 0, count: 25)
+                case 2:
+                    payload = Data(repeating: 0, count: 25) + sineBytes(25 + 1).prefix(25)
+                default:
+                    payload = sineBytes(frameBytes)
+                }
+                session.writeAudioFrame(payload)
                 frame += 1
                 if frame >= framesPerPhase {
                     frame = 0
                     phase += 1
                     if phase >= phaseNames.count {
                         timer.cancel()
+                        // Restore original config.
+                        let original = Data([0x80, 0xBB, 0x00, 0x00, 0x02, 0xF0, 0x00])
+                        session.experimentalCommand(0x17, 0x02, payload: original) { _ in }
                         bridgeLog(.info, "audio",
-                                  wrote ? "output test done — what did you hear? (silence / clicks / static / tone)"
-                                        : "output characteristic not found — firmware may lack audio")
+                                  "probe done — which phases made actuator noise, and did ANY reach the headphones?")
                     }
                 }
             }
