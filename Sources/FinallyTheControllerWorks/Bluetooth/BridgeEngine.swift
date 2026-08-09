@@ -295,6 +295,41 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
         }
     }
 
+    /// Safe recovery check: 3 s of full-frame sine with the original
+    /// config only — verifies the audio DSP is alive after a power cycle
+    /// without touching any experimental config variants.
+    func audioBaseline(serial: String) {
+        btQueue.async { [weak self] in
+            guard let self,
+                  let session = self.sessions.values.first(where: { $0.serialNumber == serial })
+            else { return }
+            let config = Data([0x80, 0xBB, 0x00, 0x00, 0x02, 0xF0, 0x00])
+            session.experimentalCommand(0x17, 0x02, payload: config) { resp in
+                bridgeLog(.info, "audio",
+                          "baseline config → \(resp.map(Self.hex) ?? "TIMEOUT"); playing 3 s sine")
+            }
+            var sinePhase = 0.0
+            var frame = 0
+            let timer = DispatchSource.makeTimerSource(queue: self.btQueue)
+            timer.schedule(deadline: .now(), repeating: .milliseconds(5))
+            timer.setEventHandler {
+                var payload = Data(capacity: 50)
+                for _ in 0..<25 {
+                    let sample = Int16(sin(sinePhase) * 20000)
+                    sinePhase += 2 * .pi * 440 / 48000
+                    withUnsafeBytes(of: sample.littleEndian) { payload.append(contentsOf: $0) }
+                }
+                session.writeAudioFrame(payload)
+                frame += 1
+                if frame >= 600 {
+                    timer.cancel()
+                    bridgeLog(.info, "audio", "baseline done — did the actuator make noise?")
+                }
+            }
+            timer.resume()
+        }
+    }
+
     /// Audio OUTPUT experiment: stream three candidate encodings at the
     /// playback characteristic — the user's ears are the codec detector.
     /// Phase 1: 440 Hz sine as raw 16-bit LE PCM (if the codec is raw PCM

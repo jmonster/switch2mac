@@ -82,6 +82,7 @@ struct DashboardView: View {
                                onNFCProbe: { engine.nfcProbe(serial: controller.serial) },
                                onAudioCapture: { engine.audioCapture(serial: controller.serial) },
                                onAudioTone: { engine.audioToneTest(serial: controller.serial) },
+                               onAudioBaseline: { engine.audioBaseline(serial: controller.serial) },
                                onDisconnect: { engine.disconnect(serial: controller.serial) },
                                onForget: { engine.forget(serial: controller.serial) })
             }
@@ -152,6 +153,7 @@ struct ControllerCard: View {
     var onNFCProbe: () -> Void = {}
     var onAudioCapture: () -> Void = {}
     var onAudioTone: () -> Void = {}
+    var onAudioBaseline: () -> Void = {}
     var onDisconnect: () -> Void = {}
     var onForget: () -> Void = {}
 
@@ -364,8 +366,10 @@ struct ControllerCard: View {
                                 HStack(spacing: 10) {
                                     Button("Detect amiibo (NFC)") { onNFCProbe() }
                                     Button("Capture audio 30 s") { onAudioCapture() }
-                                    Button("Send test audio") { onAudioTone() }
-                                        .help("Plays 3 test phases at the controller's headphone jack — listen and report")
+                                    Button("Audio baseline") { onAudioBaseline() }
+                                        .help("Safe check: 3 s sine, original config only")
+                                    Button("Audio probe (6 phases)") { onAudioTone() }
+                                        .help("Experimental lane + config probe — may wedge audio until the controller power-cycles")
                                 }
                             }
                             .padding(.top, 6)
