@@ -315,7 +315,8 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
            let l = sessions[logical.slots[0]], let r = sessions[logical.slots[1]] {
             out = Self.mergeStates(left: l.state, right: r.state)
         }
-        out = Self.applyAxisOptions(out, serial: logical.id)
+        out = Self.applyAxisOptions(out, serial: logical.id,
+                                    analogTriggers: logical.model.hasAnalogTriggers)
         for sink in sinks { sink.controllerState(slot: player, state: out) }
 
         // Feed the dashboard visualizer at ~10 Hz.
@@ -333,7 +334,8 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
     /// radial deadzone with rescaling (preserves direction, keeps full
     /// range reachable) and optional Y inversions.
     private static func applyAxisOptions(_ state: ControllerState,
-                                         serial: String) -> ControllerState {
+                                         serial: String,
+                                         analogTriggers: Bool = false) -> ControllerState {
         let store = UserDefaults.standard.dictionary(forKey: "controllerSettings")
         guard let entry = store?[serial] as? [String: Any] else { return state }
         var s = state
@@ -346,17 +348,24 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
         if entry["invertLY"] as? Bool ?? false { s.leftStick.y = -s.leftStick.y }
         if entry["invertRX"] as? Bool ?? false { s.rightStick.x = -s.rightStick.x }
         if entry["invertRY"] as? Bool ?? false { s.rightStick.y = -s.rightStick.y }
-        if entry["xboxLayout"] as? Bool ?? false {
-            // Positional swap for games with western prompts: A<->B, X<->Y.
-            var b = s.buttons
-            let a = b.contains(.a), bBtn = b.contains(.b)
-            let x = b.contains(.x), y = b.contains(.y)
-            b.subtract([.a, .b, .x, .y])
-            if a { b.insert(.b) }
-            if bBtn { b.insert(.a) }
-            if x { b.insert(.y) }
-            if y { b.insert(.x) }
-            s.buttons = b
+        if let map = entry["buttonMap"] as? [String: String], !map.isEmpty {
+            // Full remap: each pressed physical control asserts its mapped
+            // output (identity when unmapped). Multiple physical buttons may
+            // legitimately map to one output (union semantics).
+            var out: Switch2.Buttons = []
+            for (name, button) in Switch2.namedButtons where s.buttons.contains(button) {
+                let targetName = map[name] ?? name
+                if let target = Switch2.button(named: targetName) {
+                    out.insert(target)
+                }
+            }
+            s.buttons = out
+            // Digital triggers follow the POST-remap ZL/ZR bits (the GC
+            // pad's true analog triggers are left untouched by remapping).
+            if !analogTriggers {
+                s.leftTrigger = out.contains(.zl) ? 255 : 0
+                s.rightTrigger = out.contains(.zr) ? 255 : 0
+            }
         }
         return s
     }

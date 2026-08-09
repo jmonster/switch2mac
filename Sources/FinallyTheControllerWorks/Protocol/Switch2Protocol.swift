@@ -148,6 +148,26 @@ enum Switch2 {
         static let gl = Buttons(rawValue: 0x0200_0000)
     }
 
+    /// Stable names for every remappable control, in UI display order.
+    /// ZL/ZR are bits like everything else (digital triggers derive from
+    /// them), so button remapping covers them naturally.
+    static let namedButtons: [(name: String, button: Buttons)] = [
+        ("A", .a), ("B", .b), ("X", .x), ("Y", .y),
+        ("D-pad Up", .dpadUp), ("D-pad Down", .dpadDown),
+        ("D-pad Left", .dpadLeft), ("D-pad Right", .dpadRight),
+        ("L", .l), ("R", .r), ("ZL", .zl), ("ZR", .zr),
+        ("Minus", .minus), ("Plus", .plus),
+        ("Home", .home), ("Capture", .capture), ("C", .c),
+        ("L-stick click", .lStick), ("R-stick click", .rStick),
+        ("GL", .gl), ("GR", .gr),
+        ("SL (left unit)", .slL), ("SR (left unit)", .srL),
+        ("SL (right unit)", .slR), ("SR (right unit)", .srR),
+    ]
+
+    static func button(named name: String) -> Buttons? {
+        namedButtons.first { $0.name == name }?.button
+    }
+
     // MARK: - Helpers
 
     static func u16(_ data: Data, _ offset: Int) -> UInt16 {

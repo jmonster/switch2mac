@@ -117,15 +117,29 @@ final class ControllerSettings: ObservableObject {
         persist()
     }
 
-    // MARK: Button layout
+    // MARK: Button mapping
 
-    func xboxLayout(forSerial serial: String) -> Bool {
-        store[serial]?["xboxLayout"] as? Bool ?? false
+    /// physical name -> output name; absent key = identity.
+    func buttonMap(forSerial serial: String) -> [String: String] {
+        store[serial]?["buttonMap"] as? [String: String] ?? [:]
     }
 
-    func setXboxLayout(_ value: Bool, forSerial serial: String) {
+    func setButtonMapping(physical: String, output: String, forSerial serial: String) {
         var entry = store[serial] ?? [:]
-        entry["xboxLayout"] = value
+        var map = entry["buttonMap"] as? [String: String] ?? [:]
+        if output == physical {
+            map.removeValue(forKey: physical)   // identity = no entry
+        } else {
+            map[physical] = output
+        }
+        entry["buttonMap"] = map
+        store[serial] = entry
+        persist()
+    }
+
+    func resetButtonMap(forSerial serial: String) {
+        var entry = store[serial] ?? [:]
+        entry["buttonMap"] = [String: String]()
         store[serial] = entry
         persist()
     }

@@ -299,11 +299,44 @@ struct ControllerCard: View {
                         InputVisualizer(state: live, layout: vizLayout)
                             .padding(.top, 6)
                     }
-                    Toggle("Xbox button layout (swap A↔B, X↔Y)", isOn: boolBinding(
-                        get: { settings.xboxLayout(forSerial: status.serial) },
-                        set: { settings.setXboxLayout($0, forSerial: status.serial) }))
-                        .toggleStyle(.checkbox)
-                        .help("For games showing Xbox prompts: press the button in the position the prompt means")
+                    DisclosureGroup("Button mapping") {
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Text("Each physical button can act as any other. "
+                                     + "Changed rows are highlighted.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                                Button("Reset to default") {
+                                    settings.resetButtonMap(forSerial: status.serial)
+                                }
+                            }
+                            let map = settings.buttonMap(forSerial: status.serial)
+                            ForEach(Switch2.namedButtons, id: \.name) { entry in
+                                HStack {
+                                    Text(entry.name)
+                                        .frame(width: 130, alignment: .leading)
+                                        .foregroundStyle(map[entry.name] != nil
+                                                         ? Color.accentColor : .primary)
+                                    Image(systemName: "arrow.right")
+                                        .foregroundStyle(.tertiary)
+                                    Picker("", selection: Binding(
+                                        get: { map[entry.name] ?? entry.name },
+                                        set: { settings.setButtonMapping(
+                                            physical: entry.name, output: $0,
+                                            forSerial: status.serial) })) {
+                                        ForEach(Switch2.namedButtons, id: \.name) { target in
+                                            Text(target.name).tag(target.name)
+                                        }
+                                    }
+                                    .labelsHidden()
+                                    .frame(width: 170)
+                                    Spacer()
+                                }
+                            }
+                        }
+                        .padding(.top, 6)
+                    }
                     DisclosureGroup("Invert axes") {
                         VStack(alignment: .leading, spacing: 8) {
                             Toggle("Invert all axes", isOn: boolBinding(
