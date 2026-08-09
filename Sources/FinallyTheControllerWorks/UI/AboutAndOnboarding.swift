@@ -12,6 +12,19 @@ enum AppInfo {
     static var build: String {
         Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "0"
     }
+
+    /// Buy Me a Coffee page. Opened in Safari so supporters get the web
+    /// Apple Pay option (Apple Pay on the web is Safari-only).
+    static let buyMeACoffeeURL = "https://buymeacoffee.com/YOUR_HANDLE"
+
+    static func openBuyMeACoffee() {
+        guard let url = URL(string: buyMeACoffeeURL) else { return }
+        let safari = URL(fileURLWithPath: "/Applications/Safari.app")
+        let cfg = NSWorkspace.OpenConfiguration()
+        NSWorkspace.shared.open([url], withApplicationAt: safari, configuration: cfg) { _, err in
+            if err != nil { NSWorkspace.shared.open(url) }   // fallback: default browser
+        }
+    }
 }
 
 struct AboutView: View {
@@ -27,6 +40,15 @@ struct AboutView: View {
             Text("Nintendo Switch 2 controllers on macOS —\nover Bluetooth, at last.")
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
+            Button {
+                AppInfo.openBuyMeACoffee()
+            } label: {
+                Label("Buy me a coffee", systemImage: "cup.and.saucer.fill")
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.orange)
+            .help("Opens in Safari — supports Apple Pay")
+
             Divider().frame(width: 240)
             Text("© 2026 Peter Sharma")
                 .font(.callout)

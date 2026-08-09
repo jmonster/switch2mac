@@ -44,4 +44,26 @@ echo "==> Re-zipping the stapled app for distribution"
 rm -f "$ZIP"
 ditto -c -k --keepParent "$APP" "$ZIP"
 
-echo "Done. Distributable, notarized build: $ZIP"
+echo "==> Generating appcast.json for the auto-updater"
+VERSION=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" "$APP/Contents/Info.plist")
+BUILD=$(/usr/libexec/PlistBuddy -c "Print CFBundleVersion" "$APP/Contents/Info.plist")
+SHA=$(shasum -a 256 "$ZIP" | awk '{print $1}')
+# Set DOWNLOAD_BASE to wherever you host the zip (GitHub release, etc.).
+DOWNLOAD_BASE="${DOWNLOAD_BASE:-https://example.com/downloads}"
+cat > build/appcast.json <<EOF
+{
+  "version": "$VERSION",
+  "build": $BUILD,
+  "url": "$DOWNLOAD_BASE/FinallyTheControllerWorks.zip",
+  "sha256": "$SHA",
+  "notes": "Version $VERSION.",
+  "minimumSystemVersion": "15.0"
+}
+EOF
+
+echo "Done."
+echo "  App:     $APP (notarized + stapled)"
+echo "  Zip:     $ZIP"
+echo "  Appcast: build/appcast.json"
+echo "Upload both the zip and appcast.json to your host, then point the app's"
+echo "update feed URL at the appcast.json."
