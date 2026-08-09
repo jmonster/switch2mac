@@ -59,4 +59,39 @@ final class ControllerSettings: ObservableObject {
         store[serial] = entry
         persist()
     }
+
+    // MARK: Axis options
+
+    func deadzone(forSerial serial: String) -> Double {
+        store[serial]?["deadzone"] as? Double ?? 0.0
+    }
+
+    func setDeadzone(_ value: Double, forSerial serial: String) {
+        var entry = store[serial] ?? [:]
+        entry["deadzone"] = value
+        store[serial] = entry
+        persist()
+    }
+
+    func invertLeftY(forSerial serial: String) -> Bool {
+        store[serial]?["invertLY"] as? Bool ?? false
+    }
+
+    func invertRightY(forSerial serial: String) -> Bool {
+        store[serial]?["invertRY"] as? Bool ?? false
+    }
+
+    func setInvertLeftY(_ value: Bool, forSerial serial: String) {
+        var entry = store[serial] ?? [:]
+        entry["invertLY"] = value
+        store[serial] = entry
+        persist()
+    }
+
+    func setInvertRightY(_ value: Bool, forSerial serial: String) {
+        var entry = store[serial] ?? [:]
+        entry["invertRY"] = value
+        store[serial] = entry
+        persist()
+    }
 }

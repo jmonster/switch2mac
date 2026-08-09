@@ -281,13 +281,39 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
     private func emitState(slot: Int, state: ControllerState) {
         guard let (player, logical) = players.first(where: { $0.value.slots.contains(slot) })
         else { return }
+        var out = state
         if logical.isPair,
            let l = sessions[logical.slots[0]], let r = sessions[logical.slots[1]] {
-            let merged = Self.mergeStates(left: l.state, right: r.state)
-            for sink in sinks { sink.controllerState(slot: player, state: merged) }
-        } else {
-            for sink in sinks { sink.controllerState(slot: player, state: state) }
+            out = Self.mergeStates(left: l.state, right: r.state)
         }
+        out = Self.applyAxisOptions(out, serial: logical.id)
+        for sink in sinks { sink.controllerState(slot: player, state: out) }
+    }
+
+    /// Per-controller axis shaping (UserDefaults is thread-safe):
+    /// radial deadzone with rescaling (preserves direction, keeps full
+    /// range reachable) and optional Y inversions.
+    private static func applyAxisOptions(_ state: ControllerState,
+                                         serial: String) -> ControllerState {
+        let store = UserDefaults.standard.dictionary(forKey: "controllerSettings")
+        guard let entry = store?[serial] as? [String: Any] else { return state }
+        var s = state
+        let dz = entry["deadzone"] as? Double ?? 0.0
+        if dz > 0 {
+            s.leftStick = Self.radialDeadzone(s.leftStick, dz)
+            s.rightStick = Self.radialDeadzone(s.rightStick, dz)
+        }
+        if entry["invertLY"] as? Bool ?? false { s.leftStick.y = -s.leftStick.y }
+        if entry["invertRY"] as? Bool ?? false { s.rightStick.y = -s.rightStick.y }
+        return s
+    }
+
+    private static func radialDeadzone(_ stick: (x: Double, y: Double),
+                                       _ deadzone: Double) -> (x: Double, y: Double) {
+        let magnitude = (stick.x * stick.x + stick.y * stick.y).squareRoot()
+        guard magnitude > deadzone else { return (0, 0) }
+        let rescaled = min(1, (magnitude - deadzone) / (1 - deadzone))
+        return (stick.x / magnitude * rescaled, stick.y / magnitude * rescaled)
     }
 
     /// Combine two Joy-Con states into one gamepad. The shared button

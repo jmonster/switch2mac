@@ -245,6 +245,25 @@ struct ControllerCard: View {
                         Button("Test") { onTestRumble() }
                             .help("Play a short rumble pulse at this controller's strength")
                     }
+                    HStack(spacing: 12) {
+                        Text("Deadzone")
+                        Slider(value: deadzoneBinding, in: 0...0.25, step: 0.01)
+                            .help("Stick input below this is ignored — raise it if a stick drifts")
+                        Text("\(Int(settings.deadzone(forSerial: status.serial) * 100))%")
+                            .monospacedDigit()
+                            .frame(width: 44, alignment: .trailing)
+                            .foregroundStyle(.secondary)
+                    }
+                    HStack(spacing: 16) {
+                        Toggle("Invert left Y", isOn: boolBinding(
+                            get: { settings.invertLeftY(forSerial: status.serial) },
+                            set: { settings.setInvertLeftY($0, forSerial: status.serial) }))
+                        Toggle("Invert right Y", isOn: boolBinding(
+                            get: { settings.invertRightY(forSerial: status.serial) },
+                            set: { settings.setInvertRightY($0, forSerial: status.serial) }))
+                        Spacer()
+                    }
+                    .toggleStyle(.checkbox)
                 }
                 .padding(10)
             }
@@ -257,6 +276,18 @@ struct ControllerCard: View {
             get: { settings.rumbleIntensity(forSerial: status.serial) },
             set: { settings.setRumbleIntensity($0, forSerial: status.serial) }
         )
+    }
+
+    private var deadzoneBinding: Binding<Double> {
+        Binding(
+            get: { settings.deadzone(forSerial: status.serial) },
+            set: { settings.setDeadzone($0, forSerial: status.serial) }
+        )
+    }
+
+    private func boolBinding(get: @escaping () -> Bool,
+                             set: @escaping (Bool) -> Void) -> Binding<Bool> {
+        Binding(get: get, set: set)
     }
 
     /// Joy-Con accent colors on the model line: neon red for the right
