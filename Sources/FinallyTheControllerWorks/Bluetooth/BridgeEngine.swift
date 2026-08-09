@@ -235,13 +235,109 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
                     let uid = resp.subdata(in: resp.startIndex + 9 ..< resp.startIndex + 9 + len)
                     bridgeLog(.info, "nfc",
                               "🎉 TAG DETECTED — UID \(uid.map { String(format: "%02X", $0) }.joined(separator: ":"))")
-                    bridgeLog(.info, "nfc",
-                              "full status: \(Self.hex(resp)) — next frontier: buffer read (0x01/0x06 + 0x01/0x15)")
+                    bridgeLog(.info, "nfc", "full status: \(Self.hex(resp))")
+                    self.nfcReadTag(session: session)
                 } else {
                     self.nfcPollStatus(session: session, attempt: attempt + 1)
                 }
             }
         }
+    }
+
+    /// After a tag is detected, read its data buffer. Sends "read device"
+    /// (0x01/0x06) to pull the tag into the controller's buffer, then loops
+    /// "read buffer" (0x01/0x15) over increasing offsets, logging each chunk
+    /// as hex + ASCII so text records (e.g. an NDEF "bananas") are visible.
+    private func nfcReadTag(session: ControllerSession) {
+        // Observed console "read device" payload (NTAG page descriptors).
+        let readDevice = Data([0xD0, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                               0x01, 0x03, 0x00, 0x3B, 0x3C, 0x77, 0x78, 0x86, 0x00, 0x00])
+        bridgeLog(.info, "nfc", "reading tag into buffer (0x01/0x06)…")
+        session.experimentalCommand(0x01, 0x06, payload: readDevice) { [weak self] resp in
+            guard let self else { return }
+            bridgeLog(.info, "nfc", "read-device response: \(resp.map(Self.hex) ?? "TIMEOUT")")
+            self.nfcReadBuffer(session: session, offset: 0, assembled: Data(), attempts: 0)
+        }
+    }
+
+    private func nfcReadBuffer(session: ControllerSession, offset: Int,
+                               assembled: Data, attempts: Int) {
+        guard offset < 540, attempts < 12 else {
+            bridgeLog(.info, "nfc",
+                      "tag dump (\(assembled.count) bytes):\n\(Self.hexAscii(assembled))")
+            if let text = Self.extractNDEFText(assembled) {
+                bridgeLog(.info, "nfc", "📖 decoded text record: \"\(text)\"")
+            }
+            return
+        }
+        var payload = Data()
+        withUnsafeBytes(of: UInt16(offset).littleEndian) { payload.append(contentsOf: $0) }
+        session.experimentalCommand(0x01, 0x15, payload: payload) { [weak self] resp in
+            guard let self else { return }
+            guard let resp, resp.count > 3 else {
+                bridgeLog(.info, "nfc", "buffer read @\(offset) returned nothing; stopping")
+                self.nfcReadBuffer(session: session, offset: 540,
+                                   assembled: assembled, attempts: attempts)
+                return
+            }
+            // Response: 00 <offset LE> <data...>; skip the 3-byte header.
+            let chunk = resp.subdata(in: resp.startIndex + 3 ..< resp.endIndex)
+            bridgeLog(.debug, "nfc", "buffer @\(offset): \(Self.hex(resp))")
+            var acc = assembled
+            acc.append(chunk)
+            self.nfcReadBuffer(session: session, offset: offset + chunk.count,
+                               assembled: acc, attempts: attempts + 1)
+        }
+    }
+
+    /// Minimal NDEF Text-record extractor: finds a well-known Text record
+    /// (type 'T', TNF 0x01) and returns its UTF-8 payload.
+    private static func extractNDEFText(_ data: Data) -> String? {
+        let bytes = [UInt8](data)
+        var i = 0
+        while i + 3 < bytes.count {
+            // NDEF TLV: 0x03 = NDEF message, then length.
+            if bytes[i] == 0x03 {
+                var j = i + 2                     // skip TLV type + length
+                // Short-record header: flags, type-length, payload-length.
+                while j + 3 < bytes.count {
+                    let flags = bytes[j]
+                    let typeLen = Int(bytes[j + 1])
+                    let payLen = Int(bytes[j + 2])
+                    let typeStart = j + 3
+                    guard typeStart + typeLen + payLen <= bytes.count else { break }
+                    let type = bytes[typeStart..<typeStart + typeLen]
+                    if type.first == 0x54 {       // 'T' text record
+                        let payStart = typeStart + typeLen
+                        let status = bytes[payStart]
+                        let langLen = Int(status & 0x3F)
+                        let textStart = payStart + 1 + langLen
+                        let textEnd = payStart + payLen
+                        if textStart <= textEnd, textEnd <= bytes.count {
+                            return String(bytes: bytes[textStart..<textEnd], encoding: .utf8)
+                        }
+                    }
+                    if flags & 0x40 != 0 { break }  // ME (last record)
+                    j = typeStart + typeLen + payLen
+                }
+            }
+            i += 1
+        }
+        return nil
+    }
+
+    private static func hexAscii(_ data: Data) -> String {
+        var out = ""
+        let bytes = [UInt8](data)
+        for row in stride(from: 0, to: bytes.count, by: 16) {
+            let slice = Array(bytes[row..<min(row + 16, bytes.count)])
+            let hex = slice.map { String(format: "%02x", $0) }.joined(separator: " ")
+                .padding(toLength: 47, withPad: " ", startingAt: 0)
+            let ascii = String(slice.map { (32...126).contains($0)
+                ? Character(UnicodeScalar($0)) : "." })
+            out += String(format: "  %04x: ", row) + hex + " |" + ascii + "|\n"
+        }
+        return out
     }
 
     /// Audio experiment: subscribe the fw-2.0+ audio characteristic, send
