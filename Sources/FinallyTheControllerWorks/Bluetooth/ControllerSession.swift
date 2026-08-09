@@ -35,6 +35,11 @@ struct ControllerState: Sendable {
     var liftDistance: UInt16 = 0
     /// Magnetometer raw (0.15 µT/LSB).
     var mag: (Int16, Int16, Int16) = (0, 0, 0)
+    /// Battery/thermal: charge state byte, signed current (+charging),
+    /// IMU die temperature in °C.
+    var chargeState: UInt8 = 0
+    var batteryCurrent: Int16 = 0
+    var temperatureC: Double = 0
 }
 
 /// Called on the Bluetooth queue.
@@ -455,6 +460,9 @@ final class ControllerSession: NSObject, @unchecked Sendable {
         s.surfaceQuality = report.surfaceQuality
         s.liftDistance = report.liftDistance
         s.mag = report.mag
+        s.chargeState = report.chargeState
+        s.batteryCurrent = report.batteryCurrent
+        s.temperatureC = 25.0 + Double(report.temperatureRaw) / 127.0
 
         // Activity: any button change, meaningful stick deflection change,
         // or trigger change counts. (Gyro noise deliberately excluded.)

@@ -322,6 +322,10 @@ struct ControllerCard: View {
                         }
                         .padding(.top, 6)
                     }
+                    DisclosureGroup("Sensors & battery") {
+                        SensorDashboard(state: live, serial: status.serial)
+                            .padding(.top, 6)
+                    }
                     if status.model == .joyCon2Left || status.model == .joyCon2Right {
                         DisclosureGroup("Mouse mode") {
                             VStack(alignment: .leading, spacing: 8) {

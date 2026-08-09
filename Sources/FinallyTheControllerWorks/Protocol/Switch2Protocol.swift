@@ -92,6 +92,7 @@ enum Switch2 {
     enum Feature {
         static let motion: UInt8 = 0x04
         static let mouse: UInt8 = 0x10       // optical sensor, Joy-Con 2 only
+        static let battery: UInt8 = 0x20     // battery current field
         static let magnetometer: UInt8 = 0x80
         /// Base flags the console always sets alongside motion.
         static let baseline: UInt8 = 0x03
@@ -101,9 +102,9 @@ enum Switch2 {
         static func flags(for model: Model) -> UInt8 {
             switch model {
             case .joyCon2Left, .joyCon2Right:
-                return baseline | motion | mouse | magnetometer   // 0x97
+                return baseline | motion | mouse | battery | magnetometer   // 0xB7
             default:
-                return baseline | motion | magnetometer           // 0x87
+                return baseline | motion | battery | magnetometer           // 0xA7
             }
         }
     }
@@ -340,6 +341,12 @@ enum Switch2 {
         let liftDistance: UInt16
         /// Magnetometer (feature 0x80): AK09919, 0.15 µT/LSB.
         let mag: (Int16, Int16, Int16)
+        /// Charge state byte (@0x21) and battery current (@0x22, feature
+        /// 0x20; signed — positive while charging).
+        let chargeState: UInt8
+        let batteryCurrent: Int16
+        /// IMU die temperature (@0x2E): °C ≈ 25 + raw/127 (Switch2Connect).
+        let temperatureRaw: Int16
 
         init?(data: Data) {
             guard data.count >= 0x3C else { return nil }
@@ -353,6 +360,9 @@ enum Switch2 {
             liftDistance = Switch2.u16(data, 0x16)
             mag = (Switch2.s16(data, 0x19), Switch2.s16(data, 0x1B), Switch2.s16(data, 0x1D))
             batteryMillivolts = Switch2.u16(data, 0x1F)
+            chargeState = data.count > 0x21 ? data[data.startIndex + 0x21] : 0
+            batteryCurrent = Switch2.s16(data, 0x22)
+            temperatureRaw = Switch2.s16(data, 0x2E)
             gyro = (Switch2.s16(data, 0x36), Switch2.s16(data, 0x38), Switch2.s16(data, 0x3A))
             accel = (Switch2.s16(data, 0x30), Switch2.s16(data, 0x32), Switch2.s16(data, 0x34))
             leftTriggerRaw = data.count > 0x3C ? data[data.startIndex + 0x3C] : 0
