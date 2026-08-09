@@ -516,6 +516,9 @@ struct LogView: View {
     @ObservedObject private var store = LogStore.shared
     @State private var minLevel: LogLevel = .info
     @State private var autoScroll = true
+    /// User-adjustable panel height (drag the grab bar above the list).
+    @AppStorage("logPanelHeight") private var panelHeight = 220.0
+    @State private var dragStartHeight: Double?
 
     private var visibleEntries: [LogEntry] {
         store.entries.filter { $0.level.sortRank >= minLevel.sortRank }
@@ -540,6 +543,28 @@ struct LogView: View {
             .padding(.horizontal)
             .padding(.vertical, 6)
 
+            // Grab bar: drag up/down to resize the log panel.
+            RoundedRectangle(cornerRadius: 2)
+                .fill(.secondary.opacity(0.35))
+                .frame(width: 48, height: 4)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 3)
+                .contentShape(Rectangle())
+                .gesture(
+                    DragGesture(minimumDistance: 1)
+                        .onChanged { value in
+                            let start = dragStartHeight ?? panelHeight
+                            dragStartHeight = start
+                            // The panel sits at the bottom: dragging the bar
+                            // up (negative y) makes the panel taller.
+                            panelHeight = min(600, max(100, start - value.translation.height))
+                        }
+                        .onEnded { _ in dragStartHeight = nil }
+                )
+                .onHover { inside in
+                    if inside { NSCursor.resizeUpDown.push() } else { NSCursor.pop() }
+                }
+
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 1) {
@@ -556,8 +581,8 @@ struct LogView: View {
                     }
                 }
             }
+            .frame(height: panelHeight)
         }
-        .frame(minHeight: 180)
     }
 
     private func exportLog() {
