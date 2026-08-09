@@ -78,13 +78,19 @@ struct DashboardView: View {
                                pairing: pairingInfo(for: controller),
                                live: controller.player >= 0
                                    ? engine.liveStates[controller.player] : nil,
+                               findRSSI: engine.findingSerial == controller.serial
+                                   ? engine.findRSSI : nil,
                                onTestRumble: { engine.testRumble(player: controller.player) },
                                onNFCProbe: { engine.nfcProbe(serial: controller.serial) },
                                onAudioCapture: { engine.audioCapture(serial: controller.serial) },
                                onAudioTone: { engine.audioToneTest(serial: controller.serial) },
                                onAudioBaseline: { engine.audioBaseline(serial: controller.serial) },
                                onDisconnect: { engine.disconnect(serial: controller.serial) },
-                               onForget: { engine.forget(serial: controller.serial) })
+                               onForget: { engine.forget(serial: controller.serial) },
+                               onFind: { engine.findController(serial: controller.serial) },
+                               isFinding: engine.findingSerial == controller.serial,
+                               onLedChanged: { engine.refreshLEDs(serial: controller.serial) },
+                               info: engine.info(serial: controller.serial))
             }
         }
         .padding()
@@ -149,6 +155,7 @@ struct ControllerCard: View {
     let status: ControllerStatus
     var pairing: Pairing?
     var live: ControllerState?
+    var findRSSI: Int?
     var onTestRumble: () -> Void = {}
     var onNFCProbe: () -> Void = {}
     var onAudioCapture: () -> Void = {}
@@ -156,6 +163,10 @@ struct ControllerCard: View {
     var onAudioBaseline: () -> Void = {}
     var onDisconnect: () -> Void = {}
     var onForget: () -> Void = {}
+    var onFind: () -> Void = {}
+    var isFinding: Bool = false
+    var onLedChanged: () -> Void = {}
+    var info: Switch2.ControllerInfo? = nil
 
     @ObservedObject private var settings = ControllerSettings.shared
     @State private var expanded = false
@@ -211,6 +222,9 @@ struct ControllerCard: View {
                 }
                 Spacer()
                 VStack(alignment: .trailing, spacing: 4) {
+                    Button(isFinding ? "Stop finding" : "Find") { onFind() }
+                        .controlSize(.small)
+                        .help("Flash LEDs + buzz + proximity to locate this controller")
                     Button("Disconnect") { onDisconnect() }
                         .controlSize(.small)
                         .help("Disconnect now — any button press reconnects it")
@@ -240,6 +254,30 @@ struct ControllerCard: View {
                 .help("Controller options")
             }
             .padding(10)
+
+            if let rssi = findRSSI {
+                // Proximity meter: closer = stronger signal = fuller/greener bar.
+                let frac = min(1.0, max(0.0, Double(rssi + 90) / 60.0))
+                VStack(spacing: 2) {
+                    HStack {
+                        Text("🔦 Finding — follow the buzzing; bar fills as you get closer")
+                            .font(.caption)
+                        Spacer()
+                        Text("\(rssi) dBm").font(.caption).monospacedDigit().foregroundStyle(.secondary)
+                    }
+                    GeometryReader { geo in
+                        ZStack(alignment: .leading) {
+                            RoundedRectangle(cornerRadius: 4).fill(Color.secondary.opacity(0.2))
+                            RoundedRectangle(cornerRadius: 4)
+                                .fill(frac > 0.66 ? Color.green : frac > 0.33 ? Color.yellow : Color.orange)
+                                .frame(width: geo.size.width * frac)
+                        }
+                    }
+                    .frame(height: 10)
+                }
+                .padding(.horizontal, 10)
+                .padding(.bottom, 6)
+            }
 
             if expanded {
                 Divider().padding(.horizontal, 10)
@@ -325,6 +363,45 @@ struct ControllerCard: View {
                     DisclosureGroup("Sensors & battery") {
                         SensorDashboard(state: live, serial: status.serial)
                             .padding(.top, 6)
+                    }
+                    DisclosureGroup("Lights & buttons") {
+                        VStack(alignment: .leading, spacing: 10) {
+                            HStack(spacing: 12) {
+                                Text("Player LEDs")
+                                Picker("", selection: ledBinding) {
+                                    Text("Auto (player #)").tag(0)
+                                    Text("● ○ ○ ○").tag(1)
+                                    Text("● ● ○ ○").tag(3)
+                                    Text("● ● ● ○").tag(7)
+                                    Text("● ● ● ●").tag(15)
+                                }
+                                .labelsHidden()
+                                .frame(width: 160)
+                            }
+                            Toggle("Capture button takes a screenshot", isOn: boolBinding(
+                                get: { settings.captureScreenshot(forSerial: status.serial) },
+                                set: { settings.setCaptureScreenshot($0, forSerial: status.serial) }))
+                                .toggleStyle(.checkbox)
+                        }
+                        .padding(.top, 6)
+                    }
+                    DisclosureGroup("Controller info") {
+                        VStack(alignment: .leading, spacing: 4) {
+                            infoRow("Model", status.name)
+                            infoRow("Serial", status.serial)
+                            if let info {
+                                infoRow("Vendor / Product",
+                                        String(format: "%04X / %04X", info.vendorID, info.productID))
+                                HStack(spacing: 8) {
+                                    Text("Colors").frame(width: 130, alignment: .leading)
+                                        .foregroundStyle(.secondary)
+                                    colorSwatch(info.bodyColor)
+                                    colorSwatch(info.buttonColor)
+                                }
+                            }
+                        }
+                        .font(.caption)
+                        .padding(.top, 6)
                     }
                     if status.model == .joyCon2Left || status.model == .joyCon2Right {
                         DisclosureGroup("Mouse mode") {
@@ -454,6 +531,28 @@ struct ControllerCard: View {
         case .joyCon2Right: return .joyConRight
         default: return .pro
         }
+    }
+
+    private var ledBinding: Binding<Int> {
+        Binding(
+            get: { settings.ledPattern(forSerial: status.serial) },
+            set: { settings.setLedPattern($0, forSerial: status.serial); onLedChanged() }
+        )
+    }
+
+    private func infoRow(_ label: String, _ value: String) -> some View {
+        HStack(spacing: 8) {
+            Text(label).frame(width: 130, alignment: .leading).foregroundStyle(.secondary)
+            Text(value).textSelection(.enabled)
+            Spacer()
+        }
+    }
+
+    private func colorSwatch(_ rgb: (UInt8, UInt8, UInt8)) -> some View {
+        RoundedRectangle(cornerRadius: 4)
+            .fill(Color(red: Double(rgb.0) / 255, green: Double(rgb.1) / 255, blue: Double(rgb.2) / 255))
+            .frame(width: 22, height: 14)
+            .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(.secondary.opacity(0.3)))
     }
 
     private var deadzoneBinding: Binding<Double> {

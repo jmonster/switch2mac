@@ -586,6 +586,24 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
     // participant (keyed by logical id). Set by the game coordinator.
     var onParticipantPress: ((_ id: String, _ time: TimeInterval) -> Void)?
     private var lastButtonsByPlayer: [Int: Switch2.Buttons] = [:]
+    private var captureLast: [Int: Switch2.Buttons] = [:]
+
+    private static func captureScreenshotEnabled(serial: String) -> Bool {
+        let store = UserDefaults.standard.dictionary(forKey: "controllerSettings")
+        return (store?[serial] as? [String: Any])?["captureScreenshot"] as? Bool ?? false
+    }
+
+    private static func takeScreenshot() {
+        let dir = FileManager.default.urls(for: .picturesDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser
+        // Interactive-free full screen capture to a timestamped file.
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+        let name = "Controller Screenshot \(Int(Date().timeIntervalSince1970)).png"
+        task.arguments = ["-x", dir.appendingPathComponent(name).path]
+        try? task.run()
+        bridgeLog(.info, "capture", "screenshot saved to \(name)")
+    }
 
     /// Full-rate per-participant sensor stream for the challenge games
     /// (keyed by logical id). Set by the challenge coordinator.
@@ -635,6 +653,77 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
         }
     }
 
+    // MARK: - Find My Controller
+
+    /// Live RSSI-based proximity while a find is active (published to UI).
+    @Published private(set) var findingSerial: String?
+    @Published private(set) var findRSSI: Int = -100
+    private var findTimer: DispatchSourceTimer?
+
+    /// Flash LEDs, pulse rumble, and poll RSSI for ~15 s so a lost
+    /// controller can be located. Call again with the same serial to stop.
+    func findController(serial: String) {
+        btQueue.async { [weak self] in
+            guard let self else { return }
+            if self.findTimer != nil {   // already finding → stop
+                self.stopFinding()
+                return
+            }
+            guard let session = self.sessions.values.first(where: { $0.serialNumber == serial })
+            else { return }
+            DispatchQueue.main.async { self.findingSerial = serial }
+            session.onRSSI = { [weak self] rssi in
+                DispatchQueue.main.async { self?.findRSSI = rssi }
+            }
+            var step = 0
+            let timer = DispatchSource.makeTimerSource(queue: self.btQueue)
+            timer.schedule(deadline: .now(), repeating: .milliseconds(250))
+            timer.setEventHandler { [weak self] in
+                guard let self else { return }
+                // Chase the four LEDs and pulse rumble on each beat.
+                let pattern: UInt8 = 1 << UInt8(step % 4)
+                session.setRawLEDs(pattern)
+                self.setRumble(player: self.playerFor(serial: serial) ?? -1,
+                               strong: step % 2 == 0 ? 0.9 : 0.0, weak: 0)
+                session.requestRSSI()
+                step += 1
+                if step >= 60 { self.stopFinding() }   // ~15 s
+            }
+            timer.resume()
+            self.findTimer = timer
+        }
+    }
+
+    private func playerFor(serial: String) -> Int? {
+        players.first(where: { $0.value.slots.contains { sessions[$0]?.serialNumber == serial } })?.key
+    }
+
+    private func stopFinding() {
+        findTimer?.cancel(); findTimer = nil
+        if let serial = findingSerial,
+           let session = sessions.values.first(where: { $0.serialNumber == serial }) {
+            session.onRSSI = nil
+            session.setRawLEDs(nil)    // restore player LEDs
+        }
+        DispatchQueue.main.async { [weak self] in self?.findingSerial = nil }
+    }
+
+    /// Re-apply LEDs for a serial after its custom pattern changed.
+    func refreshLEDs(serial: String) {
+        btQueue.async { [weak self] in
+            self?.sessions.values.first { $0.serialNumber == serial }?.refreshLEDs()
+        }
+    }
+
+    /// Controller info (colors etc.) for the info panel.
+    func info(serial: String) -> Switch2.ControllerInfo? {
+        var result: Switch2.ControllerInfo?
+        btQueue.sync {
+            result = sessions.values.first { $0.serialNumber == serial }?.info
+        }
+        return result
+    }
+
     /// The current logical participants (id + display name), for the game UI.
     func participants() -> [(id: String, name: String)] {
         var result: [(String, String)] = []
@@ -680,6 +769,14 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
         if let onSensor = onParticipantState {
             onSensor(logical.id, out)
         }
+
+        // Capture button → macOS screenshot (opt-in per controller).
+        let prevButtons = captureLast[player] ?? []
+        if !prevButtons.contains(.capture), out.buttons.contains(.capture),
+           Self.captureScreenshotEnabled(serial: logical.id) {
+            Self.takeScreenshot()
+        }
+        captureLast[player] = out.buttons
 
         // Feed the dashboard visualizer at ~10 Hz.
         let now = CFAbsoluteTimeGetCurrent()

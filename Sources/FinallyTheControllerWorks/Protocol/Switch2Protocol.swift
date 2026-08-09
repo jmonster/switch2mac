@@ -267,6 +267,9 @@ enum Switch2 {
         let serialNumber: String
         let vendorID: UInt16
         let productID: UInt16
+        /// Body and button colors (RGB), when present in the info block.
+        let bodyColor: (UInt8, UInt8, UInt8)
+        let buttonColor: (UInt8, UInt8, UInt8)
 
         var model: Model? { Model(rawValue: productID) }
 
@@ -277,6 +280,13 @@ enum Switch2 {
                                   encoding: .utf8) ?? "?"
             vendorID = Switch2.u16(data, 18)
             productID = Switch2.u16(data, 20)
+            func rgb(_ o: Int) -> (UInt8, UInt8, UInt8) {
+                let s = data.startIndex
+                guard data.count > o + 2 else { return (128, 128, 128) }
+                return (data[s + o], data[s + o + 1], data[s + o + 2])
+            }
+            bodyColor = rgb(0x19)     // colors[0] per protocol map (25..28)
+            buttonColor = rgb(0x1C)   // colors[1] (28..31)
         }
     }
 

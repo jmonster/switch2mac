@@ -109,6 +109,32 @@ final class ControllerSettings: ObservableObject {
         persist()
     }
 
+    // MARK: LED pattern (0 = auto player number; else bits 0..3)
+
+    func ledPattern(forSerial serial: String) -> Int {
+        store[serial]?["ledPattern"] as? Int ?? 0
+    }
+
+    func setLedPattern(_ value: Int, forSerial serial: String) {
+        var entry = store[serial] ?? [:]
+        entry["ledPattern"] = value
+        store[serial] = entry
+        persist()
+    }
+
+    // MARK: Capture button → screenshot
+
+    func captureScreenshot(forSerial serial: String) -> Bool {
+        store[serial]?["captureScreenshot"] as? Bool ?? false
+    }
+
+    func setCaptureScreenshot(_ value: Bool, forSerial serial: String) {
+        var entry = store[serial] ?? [:]
+        entry["captureScreenshot"] = value
+        store[serial] = entry
+        persist()
+    }
+
     // MARK: Magnetometer calibration (hard-iron bias)
 
     func magBias(forSerial serial: String) -> (x: Double, y: Double, z: Double)? {

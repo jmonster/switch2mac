@@ -315,11 +315,44 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     }
 
     private func setPlayerLEDs(_ completion: @escaping (Bool) -> Void = { _ in }) {
-        let pattern = Switch2.ledPatterns[min(max(playerNumber - 1, 0), 7)]
+        // A user-set custom LED pattern (per serial) overrides the player LEDs.
+        let custom = UserDefaults.standard
+            .dictionary(forKey: "controllerSettings")?[serialNumber] as? [String: Any]
+        let pattern: UInt8
+        if let raw = custom?["ledPattern"] as? Int, raw > 0 {
+            pattern = UInt8(raw & 0x0F)
+        } else {
+            pattern = Switch2.ledPatterns[min(max(playerNumber - 1, 0), 7)]
+        }
         writeCommand(Switch2.Command.leds, Switch2.Subcommand.ledsSetPlayer,
                      Data([pattern, 0, 0, 0])) { resp in
             completion(resp != nil)
         }
+    }
+
+    /// Directly drive the four player LEDs (bit 0..3). For Find-My flashing;
+    /// bypasses persisted patterns. Restores normal LEDs when `nil`.
+    func setRawLEDs(_ pattern: UInt8?) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            if let pattern {
+                self.writeCommand(Switch2.Command.leds, Switch2.Subcommand.ledsSetPlayer,
+                                  Data([pattern, 0, 0, 0])) { _ in }
+            } else {
+                self.setPlayerLEDs()
+            }
+        }
+    }
+
+    /// Refresh LEDs now (e.g., after the user changes the custom pattern).
+    func refreshLEDs() {
+        queue.async { [weak self] in self?.setPlayerLEDs() }
+    }
+
+    /// Read the current RSSI; result arrives via the rssi callback.
+    var onRSSI: ((Int) -> Void)?
+    func requestRSSI() {
+        queue.async { [weak self] in self?.peripheral.readRSSI() }
     }
 
     // MARK: - Experiments (NFC probing, audio capture)
@@ -422,14 +455,6 @@ final class ControllerSession: NSObject, @unchecked Sendable {
         }
         lastReportAt = now
         reportCount &+= 1
-
-        // One-shot diagnostic: dump the mouse/magnetometer report region so
-        // sensor-enable problems are visible in the log.
-        if reportCount == 100 {
-            let region = data.subdata(in: data.startIndex + 0x10 ..< min(data.startIndex + 0x1F, data.endIndex))
-            let hex = region.map { String(format: "%02x", $0) }.joined(separator: " ")
-            log(.info, "\(displayName) report bytes 0x10-0x1E (mouse+mag): \(hex)")
-        }
 
         var s = ControllerState()
         s.buttons = report.buttons
@@ -536,6 +561,10 @@ extension ControllerSession: CBPeripheralDelegate {
             notifyCompletion?(true)
             notifyCompletion = nil
         }
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didReadRSSI RSSI: NSNumber, error: Error?) {
+        if error == nil { onRSSI?(RSSI.intValue) }
     }
 
     func peripheral(_ peripheral: CBPeripheral,
