@@ -28,13 +28,16 @@ struct FTCWApp: App {
     }
 }
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     let engine = BridgeEngine()
+    private let notifications = NotificationManager()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         bridgeLog(.info, "app", "Finally the Controller Works — starting bridge")
         engine.addSink(UDPHub())
         engine.addSink(VirtualHIDSink())
+        notifications.attach(to: engine)
     }
 }
 

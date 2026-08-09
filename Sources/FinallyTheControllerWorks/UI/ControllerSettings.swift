@@ -101,6 +101,19 @@ final class ControllerSettings: ObservableObject {
         persist()
     }
 
+    // MARK: Button layout
+
+    func xboxLayout(forSerial serial: String) -> Bool {
+        store[serial]?["xboxLayout"] as? Bool ?? false
+    }
+
+    func setXboxLayout(_ value: Bool, forSerial serial: String) {
+        var entry = store[serial] ?? [:]
+        entry["xboxLayout"] = value
+        store[serial] = entry
+        persist()
+    }
+
     /// True when every axis is inverted (the "invert all" master state).
     func invertsAll(forSerial serial: String) -> Bool {
         StickAxis.allCases.allSatisfy { invert($0, forSerial: serial) }

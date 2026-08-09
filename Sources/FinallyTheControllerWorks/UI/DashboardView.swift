@@ -21,6 +21,14 @@ struct DashboardView: View {
                 }
             }
             Divider()
+            DisclosureGroup(isExpanded: $showConfig) {
+                ConfigurationSection()
+            } label: {
+                Label("Configuration", systemImage: "gearshape")
+                    .font(.headline)
+            }
+            .padding(.horizontal)
+            .padding(.top, 8)
             DisclosureGroup(isExpanded: $showLogs) {
                 LogView()
             } label: {
@@ -31,6 +39,8 @@ struct DashboardView: View {
             .padding(.vertical, 8)
         }
     }
+
+    @AppStorage("showConfig") private var showConfig = false
 
     private var header: some View {
         HStack {
@@ -65,7 +75,9 @@ struct DashboardView: View {
         VStack(spacing: 8) {
             ForEach(engine.controllers) { controller in
                 ControllerCard(status: controller,
-                               pairing: pairingInfo(for: controller)) {
+                               pairing: pairingInfo(for: controller),
+                               live: controller.player >= 0
+                                   ? engine.liveStates[controller.player] : nil) {
                     engine.testRumble(player: controller.player)
                 }
             }
@@ -131,6 +143,7 @@ struct ControllerCard: View {
 
     let status: ControllerStatus
     var pairing: Pairing?
+    var live: ControllerState?
     var onTestRumble: () -> Void = {}
 
     @ObservedObject private var settings = ControllerSettings.shared
@@ -276,6 +289,15 @@ struct ControllerCard: View {
                         }
                         .padding(.top, 6)
                     }
+                    DisclosureGroup("Input test") {
+                        InputVisualizer(state: live)
+                            .padding(.top, 6)
+                    }
+                    Toggle("Xbox button layout (swap A↔B, X↔Y)", isOn: boolBinding(
+                        get: { settings.xboxLayout(forSerial: status.serial) },
+                        set: { settings.setXboxLayout($0, forSerial: status.serial) }))
+                        .toggleStyle(.checkbox)
+                        .help("For games showing Xbox prompts: press the button in the position the prompt means")
                     DisclosureGroup("Invert axes") {
                         VStack(alignment: .leading, spacing: 8) {
                             Toggle("Invert all axes", isOn: boolBinding(
@@ -335,6 +357,44 @@ struct ControllerCard: View {
         case 65..<90: return "battery.75percent"
         default: return "battery.100percent"
         }
+    }
+}
+
+struct ConfigurationSection: View {
+    @AppStorage(AppConfig.notifyEnabledKey) private var notifyEnabled = true
+    @AppStorage(AppConfig.notifyConnectionsKey) private var notifyConnections = true
+    @AppStorage(AppConfig.lowBatteryThresholdKey) private var lowBattery = 0.15
+    @AppStorage(AppConfig.idleSleepMinutesKey) private var idleMinutes = 15.0
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Toggle("Notifications", isOn: $notifyEnabled)
+            Toggle("Notify on connect / disconnect", isOn: $notifyConnections)
+                .disabled(!notifyEnabled)
+                .padding(.leading, 18)
+            HStack(spacing: 12) {
+                Text("Low-battery alert at")
+                Slider(value: $lowBattery, in: 0.05...0.5, step: 0.05)
+                    .disabled(!notifyEnabled)
+                Text("\(Int(lowBattery * 100))%")
+                    .monospacedDigit()
+                    .frame(width: 44, alignment: .trailing)
+                    .foregroundStyle(.secondary)
+            }
+            HStack(spacing: 12) {
+                Text("Sleep idle controllers after")
+                Slider(value: $idleMinutes, in: 0...60, step: 5)
+                Text(idleMinutes == 0 ? "Never" : "\(Int(idleMinutes)) min")
+                    .monospacedDigit()
+                    .frame(width: 56, alignment: .trailing)
+                    .foregroundStyle(.secondary)
+            }
+            Text("A sleeping controller reconnects the moment any button is pressed.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .toggleStyle(.checkbox)
+        .padding(.vertical, 8)
     }
 }
 

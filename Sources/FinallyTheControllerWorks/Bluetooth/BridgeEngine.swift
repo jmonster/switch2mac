@@ -53,6 +53,9 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
     // Main-thread state, for SwiftUI only.
     @Published private(set) var engineState: EngineState = .off
     @Published private(set) var controllers: [ControllerStatus] = []
+    /// Throttled (~10 Hz) live input per player, for the input visualizer.
+    @Published private(set) var liveStates: [Int: ControllerState] = [:]
+    private var lastVizPush: [Int: TimeInterval] = [:]   // btQueue
 
     private var central: CBCentralManager!
     private let btQueue = DispatchQueue(label: "com.petersharma.ftcw.bluetooth")
@@ -79,9 +82,18 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
     /// Remembered player numbers per logical id (stable across reshuffles).
     private var playerMemory: [String: Int] = [:]
 
+    private var idleSweepTimer: DispatchSourceTimer?
+
     override init() {
         super.init()
         central = CBCentralManager(delegate: self, queue: btQueue)
+        // Idle sweep: put controllers to sleep after the configured minutes
+        // without human input (0 = never). A button press wakes them back.
+        let timer = DispatchSource.makeTimerSource(queue: btQueue)
+        timer.schedule(deadline: .now() + 30, repeating: 30)
+        timer.setEventHandler { [weak self] in self?.sweepIdleSessions() }
+        timer.resume()
+        idleSweepTimer = timer
         // The settings store posts this when a custom name changes; push the
         // new names to sinks so games can relabel their joysticks live.
         NotificationCenter.default.addObserver(
@@ -89,6 +101,23 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
             object: nil, queue: nil) { [weak self] _ in
             guard let self else { return }
             self.btQueue.async { self.pushNames() }
+        }
+    }
+
+    /// btQueue. Disconnect sessions whose last human input is older than the
+    /// configured idle timeout.
+    private func sweepIdleSessions() {
+        let minutes = AppConfig.idleSleepMinutes
+        guard minutes > 0 else { return }
+        let cutoff = CFAbsoluteTimeGetCurrent() - minutes * 60
+        for session in sessions.values where session.lastActivityAt < cutoff {
+            let name = session.displayName
+            bridgeLog(.info, "engine",
+                      "\(name) idle for \(Int(minutes)) min — sleeping to save battery")
+            NotificationCenter.default.post(
+                name: controllerSleptNotification,
+                object: nil, userInfo: ["name": name])
+            central.cancelPeripheralConnection(session.peripheral)
         }
     }
 
@@ -288,6 +317,16 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
         }
         out = Self.applyAxisOptions(out, serial: logical.id)
         for sink in sinks { sink.controllerState(slot: player, state: out) }
+
+        // Feed the dashboard visualizer at ~10 Hz.
+        let now = CFAbsoluteTimeGetCurrent()
+        if now - (lastVizPush[player] ?? 0) >= 0.1 {
+            lastVizPush[player] = now
+            let snapshot = out
+            DispatchQueue.main.async { [weak self] in
+                self?.liveStates[player] = snapshot
+            }
+        }
     }
 
     /// Per-controller axis shaping (UserDefaults is thread-safe):
@@ -307,6 +346,18 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
         if entry["invertLY"] as? Bool ?? false { s.leftStick.y = -s.leftStick.y }
         if entry["invertRX"] as? Bool ?? false { s.rightStick.x = -s.rightStick.x }
         if entry["invertRY"] as? Bool ?? false { s.rightStick.y = -s.rightStick.y }
+        if entry["xboxLayout"] as? Bool ?? false {
+            // Positional swap for games with western prompts: A<->B, X<->Y.
+            var b = s.buttons
+            let a = b.contains(.a), bBtn = b.contains(.b)
+            let x = b.contains(.x), y = b.contains(.y)
+            b.subtract([.a, .b, .x, .y])
+            if a { b.insert(.b) }
+            if bBtn { b.insert(.a) }
+            if x { b.insert(.y) }
+            if y { b.insert(.x) }
+            s.buttons = b
+        }
         return s
     }
 

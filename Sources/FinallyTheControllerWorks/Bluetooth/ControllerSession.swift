@@ -77,6 +77,10 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     private var lastReportAt: TimeInterval = 0
     private var gapCount = 0
 
+    /// Last time the HUMAN did something (button/stick/trigger change) —
+    /// reports stream constantly, so idleness must be judged on content.
+    private(set) var lastActivityAt: TimeInterval = CFAbsoluteTimeGetCurrent()
+
     /// Sink receiving every decoded report (UDP hub / virtual HID).
     var onState: (@Sendable (Int, ControllerState) -> Void)?
 
@@ -387,6 +391,20 @@ final class ControllerSession: NSObject, @unchecked Sendable {
         s.batteryMillivolts = report.batteryMillivolts
         s.gyro = report.gyro
         s.accel = report.accel
+
+        // Activity: any button change, meaningful stick deflection change,
+        // or trigger change counts. (Gyro noise deliberately excluded.)
+        let old = state
+        if s.buttons != old.buttons
+            || abs(s.leftStick.x - old.leftStick.x) > 0.1
+            || abs(s.leftStick.y - old.leftStick.y) > 0.1
+            || abs(s.rightStick.x - old.rightStick.x) > 0.1
+            || abs(s.rightStick.y - old.rightStick.y) > 0.1
+            || s.leftTrigger != old.leftTrigger
+            || s.rightTrigger != old.rightTrigger {
+            lastActivityAt = now
+        }
+
         state = s
         onState?(slot, s)
 
