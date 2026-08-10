@@ -399,6 +399,18 @@ enum Switch2 {
             return Vibration(lfFreq: 0x0E1, lfAmp: UInt16(mag * Double(0x3FF)))
         }
 
+        /// A pure tone on the low band of the voice-coil actuator.
+        ///
+        /// The 9-bit frequency field carries direct Hz (cross-checked with
+        /// console USB captures: the idle frame E1 00 10 1E 00 encodes
+        /// 225 Hz, and live console traffic shows values like 406/499 Hz),
+        /// so the playable range is 1...511 Hz — about the two octaves
+        /// around middle C. `amp` maps 0...1 onto the 10-bit amplitude.
+        static func tone(freqHz: Int, amp: Double) -> Vibration {
+            Vibration(lfFreq: UInt16(min(511, max(1, freqHz))),
+                      lfAmp: UInt16(min(1.0, max(0, amp)) * Double(0x3FF)))
+        }
+
         func packed() -> Data {
             var v: UInt64 = 0
             v |= UInt64(lfFreq & 0x1FF)

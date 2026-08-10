@@ -134,6 +134,12 @@ final class ControllerSession: NSObject, @unchecked Sendable {
         keepAliveTimer = nil
         commandTimeout?.cancel()
         pendingCommand = nil
+        // A dead link must also stop any audio experiment: finish the
+        // stream (releasing its closures — they retain self), stop
+        // capture callbacks, and free the experiment guard.
+        finishAudioStream()
+        onAudioPacket = nil
+        audioExperimentName = nil
     }
 
     private func fail(_ reason: String) {
@@ -415,6 +421,149 @@ final class ControllerSession: NSObject, @unchecked Sendable {
         return true
     }
 
+    // MARK: Audio streaming (paced, backpressured)
+
+    /// The largest single write-without-response the current link accepts
+    /// (ATT MTU − 3). Audio frames larger than this must be split.
+    var audioWriteChunkLimit: Int {
+        peripheral.maximumWriteValueLength(for: .withoutResponse)
+    }
+
+    /// Whether the firmware exposes the audio output characteristic
+    /// (2.0+ Pro Controller only). Bluetooth queue only.
+    var hasAudioOutput: Bool {
+        dispatchPrecondition(condition: .onQueue(queue))
+        return chars[Self.audioOutputUUID] != nil
+    }
+
+    /// Delivery accounting for one audio streaming run. `chunksDropped`
+    /// counts writes shed because CoreBluetooth's outbound buffer stayed
+    /// full for longer than the queue cap — the silent failure mode the
+    /// old fire-and-forget path could never see.
+    struct AudioStreamStats {
+        var framesGenerated = 0
+        var chunksWritten = 0
+        var chunksDropped = 0
+        var stalls = 0            // times the drain hit a full buffer
+        var maxQueueDepth = 0
+        var chunkLimit = 0
+    }
+
+    private var audioStreamTimer: DispatchSourceTimer?
+    private var audioStreamQueue: [Data] = []      // pending chunks, FIFO
+    private var audioStreamStats = AudioStreamStats()
+    private var audioStreamNext: (() -> Data?)?
+    private var audioStreamDone: ((AudioStreamStats) -> Void)?
+    /// Cap on queued chunks: for live audio, late data is worse than lost
+    /// data, so beyond ~4 frames of backlog we shed the oldest.
+    private var audioStreamQueueCap = 8
+
+    /// Guard so concurrent experiments cannot interleave on one controller.
+    /// Both calls must run on the Bluetooth queue (as all experiment
+    /// bodies already do) — they are simple flag operations, not locks.
+    private(set) var audioExperimentName: String?
+    func beginAudioExperiment(_ name: String) -> Bool {
+        dispatchPrecondition(condition: .onQueue(queue))
+        guard audioExperimentName == nil else { return false }
+        audioExperimentName = name
+        return true
+    }
+    func endAudioExperiment() {
+        queue.async { [weak self] in self?.audioExperimentName = nil }
+    }
+
+    /// Stream audio frames at a fixed cadence with real backpressure.
+    ///
+    /// Algorithm (producer–consumer with loss-preferring bounded queue):
+    /// a strict timer enqueues one frame per `frameInterval` (split into
+    /// ≤ chunk-limit writes); a drain loop issues writes only while
+    /// CoreBluetooth reports `canSendWriteWithoutResponse`, resuming from
+    /// the `peripheralIsReady` callback. `next` runs on the Bluetooth
+    /// queue; returning nil ends the stream, after which `done` receives
+    /// the delivery stats.
+    ///
+    /// Precondition: at most one stream per session (enforced by restart:
+    /// starting a new stream cancels the previous one without stats).
+    func startAudioStream(frameInterval: TimeInterval,
+                          next: @escaping () -> Data?,
+                          done: @escaping (AudioStreamStats) -> Void) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.audioStreamTimer?.cancel()
+            self.audioStreamQueue.removeAll()
+            self.audioStreamStats = AudioStreamStats(chunkLimit: self.audioWriteChunkLimit)
+            self.audioStreamNext = next
+            self.audioStreamDone = done
+            // Queue cap = 4 frames' worth of chunks (min 1 chunk per frame).
+            self.audioStreamQueueCap = 8
+            let timer = DispatchSource.makeTimerSource(flags: .strict, queue: self.queue)
+            timer.schedule(deadline: .now(), repeating: frameInterval,
+                           leeway: .microseconds(500))
+            timer.setEventHandler { [weak self] in self?.audioStreamTick() }
+            timer.resume()
+            self.audioStreamTimer = timer
+        }
+    }
+
+    /// Stop an in-flight stream early (Bluetooth queue or any thread);
+    /// `done` still fires with the stats gathered so far.
+    func stopAudioStream() {
+        queue.async { [weak self] in self?.finishAudioStream() }
+    }
+
+    private func audioStreamTick() {
+        guard let next = audioStreamNext else { return }
+        guard let frame = next() else { finishAudioStream(); return }
+        audioStreamStats.framesGenerated += 1
+        let limit = max(20, audioWriteChunkLimit)
+        var offset = 0
+        while offset < frame.count {
+            let end = min(offset + limit, frame.count)
+            audioStreamQueue.append(frame.subdata(in: offset..<end))
+            offset = end
+        }
+        audioStreamStats.maxQueueDepth = max(audioStreamStats.maxQueueDepth,
+                                             audioStreamQueue.count)
+        while audioStreamQueue.count > audioStreamQueueCap {
+            audioStreamQueue.removeFirst()
+            audioStreamStats.chunksDropped += 1
+        }
+        drainAudioStream()
+    }
+
+    /// Write queued chunks until the stack refuses; `peripheralIsReady`
+    /// re-enters. Runs on the Bluetooth queue only.
+    fileprivate func drainAudioStream() {
+        guard audioStreamNext != nil, let ch = chars[Self.audioOutputUUID] else { return }
+        while !audioStreamQueue.isEmpty {
+            guard peripheral.canSendWriteWithoutResponse else {
+                audioStreamStats.stalls += 1
+                return
+            }
+            peripheral.writeValue(audioStreamQueue.removeFirst(),
+                                  for: ch, type: .withoutResponse)
+            audioStreamStats.chunksWritten += 1
+            lastWriteAt = CFAbsoluteTimeGetCurrent()
+        }
+    }
+
+    private func finishAudioStream() {
+        audioStreamTimer?.cancel()
+        audioStreamTimer = nil
+        audioStreamQueue.removeAll()
+        audioStreamNext = nil
+        let done = audioStreamDone
+        audioStreamDone = nil
+        done?(audioStreamStats)
+    }
+
+    /// One HD-rumble write on demand (haptic tones/melodies drive this at
+    /// their own cadence; the packet sequence nibble increments per write —
+    /// the controller de-duplicates packets with a stale sequence).
+    func writeHapticSample(_ vib: Switch2.Vibration) {
+        queue.async { [weak self] in self?.writeMotor(vib) }
+    }
+
     /// Called per audio notification when capture is active.
     var onAudioPacket: ((Data) -> Void)?
 
@@ -602,6 +751,11 @@ extension ControllerSession: CBPeripheralDelegate {
 
     func peripheral(_ peripheral: CBPeripheral, didReadRSSI RSSI: NSNumber, error: Error?) {
         if error == nil { onRSSI?(RSSI.intValue) }
+    }
+
+    /// Outbound buffer has space again — resume a stalled audio stream.
+    func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
+        drainAudioStream()
     }
 
     func peripheral(_ peripheral: CBPeripheral,
