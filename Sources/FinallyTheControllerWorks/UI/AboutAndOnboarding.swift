@@ -13,9 +13,26 @@ enum AppInfo {
         Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "0"
     }
 
+    /// Built-in update feed. When non-empty, the updater works out of the box
+    /// and the Configuration field becomes an override for testing. Fill this
+    /// in once release hosting exists (e.g. a GitHub Releases appcast URL).
+    static let defaultUpdateFeedURL = ""
+
+    /// Deep links into System Settings panes.
+    static func openBluetoothSettings() {
+        open(settingsURL: "x-apple.systempreferences:com.apple.BluetoothSettings")
+    }
+    static func openPrivacySettings(anchor: String) {
+        open(settingsURL: "x-apple.systempreferences:com.apple.preference.security?\(anchor)")
+    }
+    private static func open(settingsURL: String) {
+        guard let url = URL(string: settingsURL) else { return }
+        NSWorkspace.shared.open(url)
+    }
+
     /// Buy Me a Coffee page. Opened in Safari so supporters get the web
     /// Apple Pay option (Apple Pay on the web is Safari-only).
-    static let buyMeACoffeeURL = "https://buymeacoffee.com/YOUR_HANDLE"
+    static let buyMeACoffeeURL = "https://buymeacoffee.com/peterksharma"
 
     static func openBuyMeACoffee() {
         guard let url = URL(string: buyMeACoffeeURL) else { return }
@@ -108,6 +125,10 @@ struct OnboardingView: View {
         }
         .padding(28)
         .frame(width: 460, height: 380)
+        .onAppear { NSApp.activate() }
+        // Closing the window by ANY means counts as having seen the tour —
+        // otherwise a red-button close would re-present it every launch.
+        .onDisappear { seen = true }
     }
 
     private func finish() {

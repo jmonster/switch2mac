@@ -101,21 +101,27 @@ final class ChallengeCoordinator: ObservableObject {
     }
 
     private func tickCountdown() {
-        guard countdownValue > 0 else {
-            beginMeasuring()
-            return
-        }
         let w = DispatchWorkItem { [weak self] in
-            guard let self else { return }
+            guard let self, self.phase == .countdown else { return }
             self.countdownValue -= 1
-            if self.countdownValue == 0 { self.engine?.buzzAll(strong: 0.6, durationMs: 120) }
-            self.tickCountdown()
+            if self.countdownValue == 0 {
+                // Let the big "GO!" frame actually render before measurement
+                // starts — flipping phases in the same pass would skip it and
+                // leave the start signal haptic-only.
+                self.engine?.buzzAll(strong: 0.6, durationMs: 120)
+                let go = DispatchWorkItem { [weak self] in self?.beginMeasuring() }
+                self.work.append(go)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: go)
+            } else {
+                self.tickCountdown()
+            }
         }
         work.append(w)
         DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: w)
     }
 
     private func beginMeasuring() {
+        guard phase == .countdown else { return }
         phase = .measuring
         timeLeft = challenge.seconds
         let end = DispatchWorkItem { [weak self] in self?.finish() }
@@ -239,6 +245,9 @@ struct ChallengeView: View {
         .frame(minWidth: 480, minHeight: 460)
         .onChange(of: engine.controllers.count) { _, _ in coordinator.refreshLobby() }
         .onAppear { coordinator.attach(engine); coordinator.openLobby() }
+        // Closing the window mid-round must end the round — otherwise it
+        // finishes invisibly and buzzes a "winner" with no window on screen.
+        .onDisappear { coordinator.cancel() }
     }
 
     private var lobby: some View {
@@ -278,6 +287,8 @@ struct ChallengeView: View {
                 .font(.system(size: 80, weight: .heavy, design: .rounded))
                 .foregroundStyle(.tint)
             Text(coordinator.challenge.blurb).foregroundStyle(.secondary)
+            Button("Cancel") { coordinator.cancel() }
+                .keyboardShortcut(.cancelAction)
         }
     }
 
@@ -288,6 +299,8 @@ struct ChallengeView: View {
             ProgressView(value: coordinator.timeLeft, total: coordinator.challenge.seconds)
                 .frame(width: 260)
             Text(coordinator.challenge.blurb).foregroundStyle(.secondary)
+            Button("Cancel") { coordinator.cancel() }
+                .keyboardShortcut(.cancelAction)
         }
     }
 

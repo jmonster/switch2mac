@@ -31,9 +31,15 @@ final class ReactionGame: ObservableObject {
     @Published private(set) var results: [Result] = []
     @Published private(set) var countdownHint = ""
 
+    /// How long after the buzz the round waits for stragglers before ranking
+    /// whatever it has. Without this, one player putting the controller down
+    /// (or everyone false-starting) would leave "PRESS!" on screen forever.
+    private static let goTimeoutSeconds = 4.0
+
     private weak var engine: BridgeEngine?
     private var buzzTime: TimeInterval = 0
     private var armWork: DispatchWorkItem?
+    private var goWork: DispatchWorkItem?
     private var order: [String] = []            // finish order as they press
 
     func attach(_ engine: BridgeEngine) {
@@ -74,6 +80,20 @@ final class ReactionGame: ObservableObject {
             self.buzzTime = engine.buzzAll()
             self.phase = .go
             self.countdownHint = "PRESS!"
+            // If every player already false-started there is nothing left to
+            // wait for; otherwise cap the round so it can't hang on a player
+            // who never presses.
+            if self.everyoneDone {
+                self.finish()
+            } else {
+                let timeout = DispatchWorkItem { [weak self] in
+                    guard let self, self.phase == .go else { return }
+                    self.finish()
+                }
+                self.goWork = timeout
+                DispatchQueue.main.asyncAfter(
+                    deadline: .now() + Self.goTimeoutSeconds, execute: timeout)
+            }
         }
         armWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
@@ -105,6 +125,7 @@ final class ReactionGame: ObservableObject {
 
     func finish() {
         armWork?.cancel()
+        goWork?.cancel()
         engine?.onParticipantPress = nil
 
         // Rank: valid reactions fastest-first, then false starts at the back.
@@ -128,6 +149,7 @@ final class ReactionGame: ObservableObject {
 
     func cancel() {
         armWork?.cancel()
+        goWork?.cancel()
         engine?.onParticipantPress = nil
         phase = .lobby
         refreshLobby()
@@ -159,6 +181,9 @@ struct ReactionGameView: View {
         .frame(minWidth: 460, minHeight: 420)
         .onChange(of: engine.controllers.count) { _, _ in game.refreshLobby() }
         .onAppear { game.attach(engine); game.openLobby() }
+        // Closing the window mid-round must end the round — otherwise the
+        // buzz fires and presses are collected with no window on screen.
+        .onDisappear { game.cancel() }
     }
 
     private var subtitle: String {
@@ -248,6 +273,8 @@ private struct ResultRow: View {
                 Text("false start").foregroundStyle(.red)
             } else if let ms = result.reactionMs {
                 Text("\(Int(ms)) ms").monospacedDigit()
+            } else {
+                Text("no press").foregroundStyle(.secondary)
             }
         }
         .padding(8)

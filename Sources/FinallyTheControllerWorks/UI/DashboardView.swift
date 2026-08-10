@@ -56,16 +56,43 @@ struct DashboardView: View {
         .padding()
     }
 
+    /// The empty state must reflect WHY nothing is connected: pairing
+    /// instructions are useless (and misleading) while Bluetooth is off or
+    /// the app was denied Bluetooth access.
+    @ViewBuilder
     private var emptyState: some View {
         VStack(spacing: 8) {
-            Text("No controllers connected")
-                .font(.title3)
-            Text("Press any button on a paired controller to wake it, or hold "
-                 + "the Sync button (next to the USB-C port) until the player "
-                 + "LEDs sweep to pair a new one.")
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 420)
+            switch engine.engineState {
+            case .off:
+                Text("Bluetooth is off")
+                    .font(.title3)
+                Text("Turn on Bluetooth to connect your controllers.")
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 420)
+                Button("Open Bluetooth Settings…") { AppInfo.openBluetoothSettings() }
+            case .unauthorized:
+                Text("Bluetooth permission needed")
+                    .font(.title3)
+                Text("This app talks to controllers over Bluetooth, but access "
+                     + "was denied. Allow it under Privacy & Security > Bluetooth.")
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 420)
+                Button("Open Privacy Settings…") {
+                    AppInfo.openPrivacySettings(anchor: "Privacy_Bluetooth")
+                }
+            default:
+                Text("No controllers connected")
+                    .font(.title3)
+                Text("Press any button on a paired controller to wake it, or hold "
+                     + "the Sync button (next to the USB-C port) until the player "
+                     + "LEDs sweep to pair a new one.")
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 420)
+                Button("Open Bluetooth Settings…") { AppInfo.openBluetoothSettings() }
+            }
         }
         .frame(maxWidth: .infinity, minHeight: 120)
         .padding()
@@ -178,6 +205,12 @@ struct ControllerCard: View {
     @State private var expanded = false
     @State private var editingName = false
     @State private var nameDraft = ""
+    @State private var confirmForget = false
+    /// Starts optimistic (caption hidden); the real preflight runs when the
+    /// Lights & buttons group appears and when the toggle changes — a TCC
+    /// call in the @State initializer would re-run on every 10 Hz card
+    /// re-render just to be discarded.
+    @State private var screenRecordingOK = true
 
     private func saveName() {
         settings.setCustomName(nameDraft, forSerial: status.serial)
@@ -234,12 +267,30 @@ struct ControllerCard: View {
                     Button("Disconnect") { onDisconnect() }
                         .controlSize(.small)
                         .help("Disconnect now — any button press reconnects it")
-                    Button("Forget") { onForget() }
+                    Button("Forget…") { confirmForget = true }
                         .controlSize(.small)
                         .help("Disconnect and erase this controller's name, mappings, and settings")
+                        .confirmationDialog(
+                            "Forget \(settings.displayName(forSerial: status.serial, modelName: status.name))?",
+                            isPresented: $confirmForget, titleVisibility: .visible
+                        ) {
+                            Button("Forget Controller", role: .destructive) { onForget() }
+                        } message: {
+                            Text("Its custom name, button and keyboard mappings, and "
+                                 + "calibration will be erased. It can reconnect any "
+                                 + "time, but starts fresh.")
+                        }
                 }
                 VStack(alignment: .trailing, spacing: 4) {
-                    Label("\(status.batteryPercent)%", systemImage: batteryIcon)
+                    // No phantom "0%": the percentage is only meaningful once
+                    // a real voltage reading has arrived.
+                    if status.batteryMillivolts > 0 {
+                        Label("\(status.batteryPercent)%", systemImage: batteryIcon)
+                    } else {
+                        Label("—", systemImage: "battery.50percent")
+                            .foregroundStyle(.secondary)
+                            .help("Waiting for the first battery reading")
+                    }
                     HStack(spacing: 5) {
                         Circle()
                             .fill(.green)
@@ -338,44 +389,6 @@ struct ControllerCard: View {
                         Button("Test") { onTestRumble() }
                             .help("Play a short rumble pulse at this controller's strength")
                     }
-                    DisclosureGroup("Deadzone") {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("The deadzone is the area around the stick's "
-                                 + "center where input is ignored. If a character "
-                                 + "or camera drifts on its own, raise this until "
-                                 + "the drift stops — the stick's full range is "
-                                 + "rescaled so you still reach maximum tilt.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-                            HStack(spacing: 12) {
-                                Slider(value: deadzoneBinding, in: 0...0.25, step: 0.01)
-                                Text("\(Int(settings.deadzone(forSerial: status.serial) * 100))%")
-                                    .monospacedDigit()
-                                    .frame(width: 44, alignment: .trailing)
-                                    .foregroundStyle(.secondary)
-                            }
-                            Divider()
-                            HStack {
-                                Text("Stick drift").frame(width: 90, alignment: .leading)
-                                Button("Recenter sticks now") { recenterSticks() }
-                                    .help("Let go of the sticks, then click — captures the resting position as the new center")
-                                Button("Reset") {
-                                    settings.setStickCenterOffset(l: (0, 0), r: (0, 0),
-                                                                  forSerial: status.serial)
-                                }
-                            }
-                            HStack(spacing: 12) {
-                                Text("Trigger threshold").frame(width: 120, alignment: .leading)
-                                Slider(value: triggerBinding, in: 0...0.9, step: 0.05)
-                                    .help("How far ZL/ZR must travel before registering (analog triggers)")
-                                Text("\(Int(settings.triggerThreshold(forSerial: status.serial) * 100))%")
-                                    .monospacedDigit().frame(width: 44, alignment: .trailing)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                        .padding(.top, 6)
-                    }
                     DisclosureGroup("Keyboard mapping") {
                         KeyboardMappingView(serial: status.serial)
                     }
@@ -407,28 +420,37 @@ struct ControllerCard: View {
                             }
                             Toggle("Capture button takes a screenshot", isOn: boolBinding(
                                 get: { settings.captureScreenshot(forSerial: status.serial) },
-                                set: { settings.setCaptureScreenshot($0, forSerial: status.serial) }))
+                                set: { on in
+                                    settings.setCaptureScreenshot(on, forSerial: status.serial)
+                                    // Without Screen Recording permission the
+                                    // captures are silently blank — ask now,
+                                    // while the user's intent is clear.
+                                    if on && !CGPreflightScreenCaptureAccess() {
+                                        CGRequestScreenCaptureAccess()
+                                    }
+                                    screenRecordingOK = CGPreflightScreenCaptureAccess()
+                                }))
                                 .toggleStyle(.checkbox)
-                        }
-                        .padding(.top, 6)
-                    }
-                    DisclosureGroup("Controller info") {
-                        VStack(alignment: .leading, spacing: 4) {
-                            infoRow("Model", status.name)
-                            infoRow("Serial", status.serial)
-                            if let info {
-                                infoRow("Vendor / Product",
-                                        String(format: "%04X / %04X", info.vendorID, info.productID))
-                                HStack(spacing: 8) {
-                                    Text("Colors").frame(width: 130, alignment: .leading)
-                                        .foregroundStyle(.secondary)
-                                    colorSwatch(info.bodyColor)
-                                    colorSwatch(info.buttonColor)
+                            if settings.captureScreenshot(forSerial: status.serial)
+                                && !screenRecordingOK {
+                                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                    Label("Screenshots need Screen Recording permission "
+                                          + "— they'll be blank without it.",
+                                          systemImage: "exclamationmark.triangle.fill")
+                                        .font(.caption)
+                                        .foregroundStyle(.orange)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                    Button("Open System Settings") {
+                                        AppInfo.openPrivacySettings(anchor: "Privacy_ScreenCapture")
+                                    }
+                                    .controlSize(.small)
                                 }
                             }
                         }
-                        .font(.caption)
                         .padding(.top, 6)
+                        .onAppear {
+                            screenRecordingOK = CGPreflightScreenCaptureAccess()
+                        }
                     }
                     if status.model == .joyCon2Left || status.model == .joyCon2Right {
                         DisclosureGroup("Mouse mode") {
@@ -455,26 +477,6 @@ struct ControllerCard: View {
                                         .monospacedDigit()
                                         .frame(width: 40, alignment: .trailing)
                                         .foregroundStyle(.secondary)
-                                }
-                            }
-                            .padding(.top, 6)
-                        }
-                    }
-                    if status.model == .proController2 && !status.isJoyConPair {
-                        DisclosureGroup("Experiments") {
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text("Frontier features — results appear in the Logs "
-                                     + "section below.")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                HStack(spacing: 10) {
-                                    Button("Read NFC tag") { onNFCProbe() }
-                                        .help("Detects an amiibo or NTAG on the touchpoint and dumps it; NDEF text is decoded")
-                                    Button("Capture audio 30 s") { onAudioCapture() }
-                                    Button("Audio baseline") { onAudioBaseline() }
-                                        .help("Safe check: 3 s sine, original config only")
-                                    Button("Audio probe (6 phases)") { onAudioTone() }
-                                        .help("Experimental lane + config probe — may wedge audio until the controller power-cycles")
                                 }
                             }
                             .padding(.top, 6)
@@ -518,19 +520,102 @@ struct ControllerCard: View {
                         }
                         .padding(.top, 6)
                     }
-                    DisclosureGroup("Invert axes") {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Toggle("Invert all axes", isOn: boolBinding(
-                                get: { settings.invertsAll(forSerial: status.serial) },
-                                set: { settings.setInvertAll($0, forSerial: status.serial) }))
-                            Divider()
-                            ForEach(ControllerSettings.StickAxis.allCases, id: \.rawValue) { axis in
-                                Toggle("Invert \(axis.label.lowercased())", isOn: boolBinding(
-                                    get: { settings.invert(axis, forSerial: status.serial) },
-                                    set: { settings.setInvert(axis, $0, forSerial: status.serial) }))
+                    // Deep, rarely-touched settings live one level down so the
+                    // everyday card stays approachable.
+                    DisclosureGroup("Advanced") {
+                        VStack(spacing: 10) {
+                            DisclosureGroup("Deadzone") {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Text("The deadzone is the area around the stick's "
+                                         + "center where input is ignored. If a character "
+                                         + "or camera drifts on its own, raise this until "
+                                         + "the drift stops — the stick's full range is "
+                                         + "rescaled so you still reach maximum tilt.")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                    HStack(spacing: 12) {
+                                        Slider(value: deadzoneBinding, in: 0...0.25, step: 0.01)
+                                        Text("\(Int(settings.deadzone(forSerial: status.serial) * 100))%")
+                                            .monospacedDigit()
+                                            .frame(width: 44, alignment: .trailing)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Divider()
+                                    HStack {
+                                        Text("Stick drift").frame(width: 90, alignment: .leading)
+                                        Button("Recenter sticks now") { recenterSticks() }
+                                            .help("Let go of the sticks, then click — captures the resting position as the new center")
+                                        Button("Reset") {
+                                            settings.setStickCenterOffset(l: (0, 0), r: (0, 0),
+                                                                          forSerial: status.serial)
+                                        }
+                                    }
+                                    HStack(spacing: 12) {
+                                        Text("Trigger threshold").frame(width: 120, alignment: .leading)
+                                        Slider(value: triggerBinding, in: 0...0.9, step: 0.05)
+                                            .help("How far ZL/ZR must travel before registering (analog triggers)")
+                                        Text("\(Int(settings.triggerThreshold(forSerial: status.serial) * 100))%")
+                                            .monospacedDigit().frame(width: 44, alignment: .trailing)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                                .padding(.top, 6)
+                            }
+                            DisclosureGroup("Invert axes") {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Toggle("Invert all axes", isOn: boolBinding(
+                                        get: { settings.invertsAll(forSerial: status.serial) },
+                                        set: { settings.setInvertAll($0, forSerial: status.serial) }))
+                                    Divider()
+                                    ForEach(ControllerSettings.StickAxis.allCases, id: \.rawValue) { axis in
+                                        Toggle("Invert \(axis.label.lowercased())", isOn: boolBinding(
+                                            get: { settings.invert(axis, forSerial: status.serial) },
+                                            set: { settings.setInvert(axis, $0, forSerial: status.serial) }))
+                                    }
+                                }
+                                .toggleStyle(.checkbox)
+                                .padding(.top, 6)
+                            }
+                            DisclosureGroup("Controller info") {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    infoRow("Model", status.name)
+                                    infoRow("Serial", status.serial)
+                                    if let info {
+                                        infoRow("Vendor / Product",
+                                                String(format: "%04X / %04X", info.vendorID, info.productID))
+                                        HStack(spacing: 8) {
+                                            Text("Colors").frame(width: 130, alignment: .leading)
+                                                .foregroundStyle(.secondary)
+                                            colorSwatch(info.bodyColor)
+                                            colorSwatch(info.buttonColor)
+                                        }
+                                    }
+                                }
+                                .font(.caption)
+                                .padding(.top, 6)
+                            }
+                            if status.model == .proController2 && !status.isJoyConPair {
+                                DisclosureGroup("Experiments") {
+                                    VStack(alignment: .leading, spacing: 8) {
+                                        Text("Frontier features — results appear in the Logs "
+                                             + "section below.")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                        HStack(spacing: 10) {
+                                            Button("Read NFC tag") { onNFCProbe() }
+                                                .help("Detects an amiibo or NTAG on the touchpoint and dumps it; NDEF text is decoded")
+                                            Button("Capture audio 30 s") { onAudioCapture() }
+                                            Button("Audio baseline") { onAudioBaseline() }
+                                                .help("Safe check: 3 s sine, original config only")
+                                            Button("Audio probe (6 phases)") { onAudioTone() }
+                                                .help("Experimental lane + config probe — may wedge audio until the controller power-cycles")
+                                        }
+                                    }
+                                    .padding(.top, 6)
+                                }
                             }
                         }
-                        .toggleStyle(.checkbox)
                         .padding(.top, 6)
                     }
                 }

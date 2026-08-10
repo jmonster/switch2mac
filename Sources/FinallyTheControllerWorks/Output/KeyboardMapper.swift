@@ -40,6 +40,7 @@ final class KeyboardMapper: @unchecked Sendable {
     private var lastButtons: [Int: Switch2.Buttons] = [:]    // per player
     private var permissionOK = false
     private var permissionChecked = false
+    private var lastPreflightAt: CFAbsoluteTime = 0
 
     init() {
         frontApp = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? ""
@@ -72,7 +73,13 @@ final class KeyboardMapper: @unchecked Sendable {
             lastButtons[player] = buttons
             return false
         }
-        guard ensurePermission() else { return true }
+        // No Accessibility permission → no keystrokes can be posted. Return
+        // false so the engine does NOT suppress the mapped buttons: they
+        // degrade to ordinary gamepad presses instead of going dead.
+        guard ensurePermission() else {
+            lastButtons[player] = buttons
+            return false
+        }
 
         let prev = lastButtons[player] ?? []
         for (name, spec) in map {
@@ -114,14 +121,33 @@ final class KeyboardMapper: @unchecked Sendable {
         event.post(tap: .cghidEventTap)
     }
 
+    /// True when we may post CGEvents. The system prompt is requested at most
+    /// once, but a denial must NOT latch: the user can grant permission in
+    /// System Settings mid-session, and re-preflighting is cheap — a one-time
+    /// check would leave the feature dead until relaunch.
     private func ensurePermission() -> Bool {
-        if permissionChecked { return permissionOK }
-        permissionChecked = true
-        permissionOK = CGPreflightPostEventAccess() || CGRequestPostEventAccess()
-        if !permissionOK {
-            bridgeLog(.warning, "keymap",
-                      "Accessibility permission needed for keyboard mapping — "
-                      + "grant it in System Settings > Privacy & Security > Accessibility")
+        if permissionOK { return true }
+        if !permissionChecked {
+            permissionChecked = true
+            permissionOK = CGPreflightPostEventAccess() || CGRequestPostEventAccess()
+            if !permissionOK {
+                bridgeLog(.warning, "keymap",
+                          "Accessibility permission needed for keyboard mapping — "
+                          + "grant it in System Settings > Privacy & Security > Accessibility")
+            }
+        } else {
+            // process() runs per input report (~66 Hz) on the Bluetooth
+            // queue — a TCC round trip at that rate would add jitter to the
+            // whole input path, so re-preflight at most every 2 seconds.
+            let now = CFAbsoluteTimeGetCurrent()
+            if now - lastPreflightAt >= 2 {
+                lastPreflightAt = now
+                permissionOK = CGPreflightPostEventAccess()
+                if permissionOK {
+                    bridgeLog(.info, "keymap",
+                              "Accessibility permission granted — keyboard mapping active")
+                }
+            }
         }
         return permissionOK
     }

@@ -38,7 +38,7 @@ struct ControllerStatus: Identifiable, Sendable {
 enum EngineState: String, Sendable {
     case off = "Bluetooth off"
     case unauthorized = "Bluetooth permission denied"
-    case scanning = "Switch 2 Controller Connection Manager"
+    case scanning = "Scanning for controllers…"
     case connecting = "Connecting…"
     case idle = "All controller slots full"
 }
@@ -116,7 +116,8 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
                       "\(name) idle for \(Int(minutes)) min — sleeping to save battery")
             NotificationCenter.default.post(
                 name: controllerSleptNotification,
-                object: nil, userInfo: ["name": name])
+                object: nil,
+                userInfo: ["name": name, "serial": session.serialNumber])
             central.cancelPeripheralConnection(session.peripheral)
         }
     }

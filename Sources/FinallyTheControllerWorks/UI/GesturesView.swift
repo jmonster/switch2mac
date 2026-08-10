@@ -12,6 +12,7 @@ struct GesturesView: View {
     @AppStorage("gestureTriggerButton") private var trigger = "GL"
     @State private var recording = false
     @State private var newName = ""
+    @StateObject private var capture = KeyCaptureSession()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -20,6 +21,13 @@ struct GesturesView: View {
                  + "Matched gestures run their action.")
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+
+            if engine.controllers.isEmpty {
+                Label("No controllers connected — press any button on a paired "
+                      + "controller to wake one.",
+                      systemImage: "gamecontroller")
+                    .foregroundStyle(.secondary)
+            }
 
             HStack {
                 Text("Trigger button")
@@ -33,11 +41,18 @@ struct GesturesView: View {
             // Record a new gesture.
             HStack {
                 TextField("New gesture name", text: $newName).frame(width: 180)
-                Button(recording ? "Now draw & release…" : "Record") {
-                    startRecording()
+                if recording {
+                    Button("Cancel") { cancelRecording() }
+                        .keyboardShortcut(.cancelAction)
+                } else {
+                    Button("Record") { startRecording() }
+                        .disabled(newName.isEmpty || engine.controllers.isEmpty)
                 }
-                .disabled(newName.isEmpty || recording)
-                .foregroundStyle(recording ? .orange : .primary)
+            }
+            if recording {
+                Text("Hold \(trigger), draw the shape in the air, then release.")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
             }
 
             // Existing gestures.
@@ -46,6 +61,8 @@ struct GesturesView: View {
             } else {
                 ForEach(gestures) { g in
                     GestureRow(gesture: g,
+                               capturing: capture.capturingID == g.id.uuidString,
+                               onCaptureTap: { toggleCapture(for: g) },
                                onAction: { updateAction(g.id, $0) },
                                onDelete: { delete(g.id) })
                 }
@@ -55,6 +72,12 @@ struct GesturesView: View {
         .padding(24)
         .frame(minWidth: 480, minHeight: 460)
         .onAppear { gestures = load() }
+        .onDisappear {
+            // Leave nothing armed: an orphaned recording would silently turn
+            // the next trigger-hold into a saved gesture.
+            cancelRecording()
+            capture.cancel()
+        }
     }
 
     private func startRecording() {
@@ -70,6 +93,23 @@ struct GesturesView: View {
             }
         }
         engine.gestureRecognizer.recordingName = newName
+    }
+
+    private func cancelRecording() {
+        engine.gestureRecognizer.recordingName = nil
+        engine.gestureRecognizer.onRecorded = nil
+        recording = false
+    }
+
+    private func toggleCapture(for gesture: AirGesture) {
+        let id = gesture.id.uuidString
+        if capture.capturingID == id {
+            capture.cancel()
+        } else {
+            capture.begin(id: id) { spec in
+                updateAction(gesture.id) { $0.key = spec; $0.builtin = nil }
+            }
+        }
     }
 
     private func updateAction(_ id: UUID, _ update: (inout AirGesture) -> Void) {
@@ -95,6 +135,8 @@ struct GesturesView: View {
 
 private struct GestureRow: View {
     let gesture: AirGesture
+    let capturing: Bool
+    let onCaptureTap: () -> Void
     let onAction: (@escaping (inout AirGesture) -> Void) -> Void
     let onDelete: () -> Void
 
@@ -119,13 +161,13 @@ private struct GestureRow: View {
             if gesture.builtin == nil {
                 KeyCaptureButton(
                     label: gesture.key?.label ?? "Set key",
-                    capturing: false,
-                    onStart: {},
-                    onCapture: { spec in onAction { $0.key = spec; $0.builtin = nil } })
+                    capturing: capturing,
+                    onTap: onCaptureTap)
             }
             Spacer()
             Button { onDelete() } label: { Image(systemName: "trash") }
                 .buttonStyle(.plain).foregroundStyle(.secondary)
+                .accessibilityLabel("Delete \(gesture.name)")
         }
         .padding(6)
         .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.08)))

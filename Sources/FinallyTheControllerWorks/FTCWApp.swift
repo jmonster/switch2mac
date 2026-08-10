@@ -14,10 +14,9 @@ struct FTCWApp: App {
 
     var body: some Scene {
         MenuBarExtra {
-            MenuContent(engine: appDelegate.engine)
+            MenuContent(engine: appDelegate.engine, updater: appDelegate.updater)
         } label: {
-            Image(systemName: appDelegate.engine.controllers.isEmpty
-                  ? "gamecontroller" : "gamecontroller.fill")
+            MenuBarIcon(engine: appDelegate.engine)
         }
 
         Window("Finally the Controller Works", id: "dashboard") {
@@ -46,6 +45,30 @@ struct FTCWApp: App {
 
         Window("Software Update", id: "update") { UpdaterView(updater: appDelegate.updater) }
             .windowResizability(.contentSize)
+
+        // First-run welcome tour. A scene (not a hand-built NSWindow) so the
+        // dismiss environment action works and the menu can reopen it later.
+        // Presented automatically only until the user has seen it once.
+        Window("Welcome", id: "welcome") { OnboardingView() }
+            .windowResizability(.contentSize)
+            .defaultLaunchBehavior(
+                UserDefaults.standard.bool(forKey: "onboardingSeen")
+                ? .suppressed : .presented)
+    }
+}
+
+/// The always-visible menu-bar glyph. A separate view so @ObservedObject
+/// keeps it in sync with connects/disconnects — reading the engine directly
+/// in the MenuBarExtra label closure would never be invalidated.
+struct MenuBarIcon: View {
+    @ObservedObject var engine: BridgeEngine
+
+    var body: some View {
+        Image(systemName: engine.controllers.isEmpty
+              ? "gamecontroller" : "gamecontroller.fill")
+            .accessibilityLabel(engine.controllers.isEmpty
+                ? "Finally the Controller Works — no controllers connected"
+                : "Finally the Controller Works — \(engine.controllers.count) connected")
     }
 }
 
@@ -62,88 +85,83 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         engine.addSink(UDPHub())
         engine.addSink(VirtualHIDSink())
         notifications.attach(to: engine)
-
-        // First-run onboarding.
-        if !UserDefaults.standard.bool(forKey: "onboardingSeen") {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                self?.showOnboarding()
-            }
-        }
-        // Daily auto-update check (only if a feed URL is configured).
+        // Daily auto-update check (only if a feed URL is configured); results
+        // surface as an "Update Available" item in the menu-bar dropdown.
         updater.checkOnLaunchIfDue()
-    }
-
-    private var onboardingWindow: NSWindow?
-
-    func showOnboarding() {
-        if let w = onboardingWindow { w.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
-        let hosting = NSHostingController(rootView: OnboardingView())
-        let window = NSWindow(contentViewController: hosting)
-        window.title = "Welcome"
-        window.styleMask = [.titled, .closable]
-        window.isReleasedWhenClosed = false
-        window.center()
-        onboardingWindow = window
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
     }
 }
 
 struct MenuContent: View {
     @ObservedObject var engine: BridgeEngine
+    @ObservedObject var updater: Updater
     @ObservedObject private var settings = ControllerSettings.shared
     @Environment(\.openWindow) private var openWindow
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
+
+    /// Open a window scene and bring the app forward — a menu-bar app's
+    /// windows otherwise open behind whatever app is frontmost.
+    private func show(_ id: String) {
+        openWindow(id: id)
+        NSApp.activate()
+    }
 
     var body: some View {
         Text(engine.engineState.rawValue)
 
         if engine.controllers.isEmpty {
-            Text("Press any button on a paired controller,")
-            Text("or hold Sync (next to USB-C) to pair a new one.")
+            switch engine.engineState {
+            case .off:
+                Text("Turn on Bluetooth to connect controllers.")
+                Button("Open Bluetooth Settings…") { AppInfo.openBluetoothSettings() }
+            case .unauthorized:
+                Text("Bluetooth permission was denied.")
+                Button("Open Privacy Settings…") {
+                    AppInfo.openPrivacySettings(anchor: "Privacy_Bluetooth")
+                }
+            default:
+                Text("Press any button on a paired controller,\n"
+                     + "or hold Sync (next to USB-C) to pair a new one.")
+            }
         } else {
             ForEach(engine.controllers) { c in
-                Text("\(c.player >= 0 ? "P\(c.player + 1)" : "—")  \(settings.displayName(forSerial: c.serial, modelName: c.name)) — \(c.batteryPercent)%")
+                // Battery is only trustworthy once a real voltage reading has
+                // arrived — omit it rather than show a phantom "0%".
+                let battery = c.batteryMillivolts > 0 ? " — \(c.batteryPercent)%" : ""
+                Text("\(c.player >= 0 ? "P\(c.player + 1)" : "—")  \(settings.displayName(forSerial: c.serial, modelName: c.name))\(battery)")
             }
         }
 
-        Divider()
-
-        Button("Open Dashboard") {
-            openWindow(id: "dashboard")
-            NSApp.activate(ignoringOtherApps: true)
-        }
-
-        Button("Reaction Draft (party game)") {
-            openWindow(id: "reaction-game")
-            NSApp.activate(ignoringOtherApps: true)
-        }
-
-        Button("Sensor Challenges") {
-            openWindow(id: "challenges")
-            NSApp.activate(ignoringOtherApps: true)
-        }
-
-        Button("Air Gestures") {
-            openWindow(id: "gestures")
-            NSApp.activate(ignoringOtherApps: true)
+        // A found (or already-downloaded) update stays one click away even
+        // after the update window is closed.
+        if case .available(let entry) = updater.state {
+            Divider()
+            Button("Update Available: v\(entry.version)…") { show("update") }
+        } else if case .readyToInstall(let entry) = updater.state {
+            Divider()
+            Button("Update Ready to Install: v\(entry.version)…") { show("update") }
         }
 
         Divider()
 
-        Button("Check for Updates…") {
-            openWindow(id: "update")
-            NSApp.activate(ignoringOtherApps: true)
-        }
+        Button("Open Dashboard") { show("dashboard") }
+
+        Button("Reaction Draft (party game)") { show("reaction-game") }
+
+        Button("Sensor Challenges") { show("challenges") }
+
+        Button("Air Gestures") { show("gestures") }
+
+        Divider()
+
+        Button("Check for Updates…") { show("update") }
 
         Button("Buy me a coffee ☕") {
             AppInfo.openBuyMeACoffee()
         }
 
-        Button("About") {
-            openWindow(id: "about")
-            NSApp.activate(ignoringOtherApps: true)
-        }
+        Button("Welcome Guide") { show("welcome") }
+
+        Button("About") { show("about") }
 
         Toggle("Launch at Login", isOn: $launchAtLogin)
             .onChange(of: launchAtLogin) { _, enable in
