@@ -7,7 +7,7 @@
 #   2. An app-specific password from https://account.apple.com
 #      (Sign-In & Security → App-Specific Passwords), stored in the keychain:
 #         xcrun notarytool store-credentials ftcw-notary \
-#             --apple-id "peterksharma1@gmail.com" \
+#             --apple-id "peterksharma@gmail.com" \
 #             --team-id 4BA4S6WKX7 \
 #             --password "<app-specific-password>"
 #
