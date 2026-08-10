@@ -9,10 +9,12 @@ layout, motion/environmental sensors, rumble, LEDs, and pairing. It focuses on
 what has been verified in practice, and calls out the platform quirks that
 matter on macOS in particular.
 
-> **Scope note.** NFC/amiibo and controller audio are intentionally omitted
-> here — that work is still in progress and will be published separately once
-> it is fully worked out. Everything below is implemented and observed on real
-> hardware.
+> **Scope note.** NFC/amiibo is intentionally omitted here — that work is
+> still in progress and will be published separately once it is fully worked
+> out. Controller audio is covered in §10 to the extent it is currently
+> understood (the wire framing is verified on real hardware; the codec is
+> not yet identified). Everything else below is implemented and observed on
+> real hardware.
 
 Prior community reverse-engineering that this builds on is credited at the
 end. Byte offsets are into the decrypted input report / command payloads.
@@ -270,6 +272,76 @@ A secondary macOS note: CoreBluetooth negotiates the connection interval
 itself and gives the host no control over it, which caps the inbound report
 rate near ~66 Hz (versus higher rates reachable on platforms that can request
 tighter parameters).
+
+---
+
+## 10. Headset audio (Pro Controller 2, firmware 2.0+)
+
+The Pro Controller 2's 3.5 mm jack is reachable over BLE through a dedicated
+pair of characteristics — **separate from the rumble lane** (writing audio
+does not officially drive the actuators, and rumble packets do not carry
+audio):
+
+| Direction | Characteristic | Properties |
+|---|---|---|
+| Host → jack (playback) | `CC483F51-9258-427D-A939-630C31F72B06` | write-no-response |
+| Jack mic → host (capture) | `7492866C-EC3E-4619-8258-32755FFCC0F9` | read, notify |
+
+Streaming is preceded by command `0x17/0x02` with payload
+`80 BB 00 00 02 F0 00` = **48000 Hz (u32 LE), `0x02` (channels/mode), 240
+samples per frame (u16 LE)** — i.e. nominal 5 ms frames. The controller ACKs
+with an empty payload.
+
+### Input notifications (verified on hardware)
+
+Enabling notifications on the input characteristic yields 112-byte packets at
+~28–33 Hz, each a miniature input report plus two embedded, length-prefixed
+regions:
+
+```
+offset  content
+ 0      u8 sequence (+1 per packet — gaps are real losses)
+ 1      0x20 (report type)
+ 2–4    buttons (bitmask, as §5)
+ 5–10   left + right stick, packed 12-bit pairs
+13      jack state: 0x00 nothing, 0x05 headphones, 0x07 headset (mic);
+        bit 3 = this report carries an audio frame (alternates)
+14      audio frame length (observed 0x32 = 50)
+15–64   the audio frame; when idle: f8 ff fe + 47 zero bytes
+65      telemetry length (observed 0x28 = 40, rarely 0x04)
+66–105  packed motion/telemetry records: a 12-bit tick counter
+        (1.25 ms units) + repeated ~88-bit records of slow sensor
+        channels — NOT audio (a common mis-read: it is high-entropy)
+```
+
+**The codec of live audio frames is the open question.** 50-byte frames
+against the configured 240-sample/5 ms PCM rate imply ~10:1 compression;
+raw PCM, µ-law, IMA/DSP-ADPCM, Opus, and LC3 have all been ruled out
+empirically against real captures. The DSP firmware blob in controller flash
+(`MT3616A0`, MediaTek) suggests a vendor codec.
+
+Two practical warnings, both verified: while input-characteristic capture is
+enabled the controller **stops sending regular input reports** (buttons and
+sticks freeze for the whole window), and the mic lane only produces non-idle
+frames when a headset with a microphone is actually present.
+
+### The USB shortcut
+
+Over USB-C the same controller enumerates as a plain **USB Audio Class 1.0**
+device — 48 kHz 16-bit stereo out to the jack, mono mic in, with standard
+mute/volume controls — driverless on every OS. For "play audio through the
+controller" as a feature (rather than as protocol research), USB is the
+paved road; it also provides reference recordings for cracking the BLE codec
+by known-plaintext comparison.
+
+### Rumble addendum (cross-verified against console USB captures)
+
+The §7 packet layout holds; two details worth recording: the 9-bit frequency
+fields carry **direct Hz** (idle frame `E1 00 10 1E 00` = 225 Hz low band),
+and the sequence nibble in the `0x50|seq` header must increment per packet —
+the controller silently de-duplicates packets whose sequence has not
+advanced. The console re-sends at ~5 ms; ~20–50 ms suffices to sustain a
+steady tone.
 
 ---
 

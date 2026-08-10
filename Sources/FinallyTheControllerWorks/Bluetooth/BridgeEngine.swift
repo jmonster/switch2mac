@@ -340,182 +340,372 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
         return out
     }
 
-    /// Audio experiment: subscribe the fw-2.0+ audio characteristic, send
-    /// the sniffed 48 kHz config command, and dump packets to a file for
-    /// offline codec analysis.
+    // MARK: - Audio lab
+    //
+    // Ground truth so far (our captures + ndeadly/switch2_controller_research):
+    //  * Audio and rumble are SEPARATE lanes: rumble on ...2b05, headset
+    //    audio on ...2b06 (out) / 7492866c... (in). No documented
+    //    audio-driven-haptics mode.
+    //  * The 112-byte input notification is: [seq][0x20][buttons][sticks]
+    //    [jack-state @13][audio-len @14][audio frame @15, 50 B]
+    //    [zeros][telemetry-len @65][packed motion telemetry @66][zeros].
+    //    Jack state: 0x00 nothing, 0x05 headphones, 0x07 headset(mic);
+    //    bit 3 = "this report carries an audio frame" (alternates).
+    //  * Idle audio frames are f8 ff fe + 47 zero bytes. The codec for
+    //    live frames is publicly unknown (~10:1 vs the configured
+    //    240-sample/5 ms PCM rate).
+    //  * Capture starves regular input reports for its whole window.
+
+    /// The audio-state byte's human reading (provisional decode).
+    private static func jackStateName(_ b: UInt8) -> String {
+        switch b & ~0x08 {
+        case 0x00: return "nothing plugged"
+        case 0x05: return "headphones (no mic)"
+        case 0x07: return "headset (mic present)"
+        default:   return "unknown"
+        }
+    }
+
+    /// Audio capture v2: subscribe the headset-audio characteristic and
+    /// record timestamped notifications, decoding the report layout live.
+    /// Writes two files to ~/Documents (names carry a run timestamp):
+    /// the full packets, and just the 50-byte audio-region frames for
+    /// offline codec work. File format: "FTCWAUD2" magic, then records of
+    /// [f64 LE seconds since start][u32 LE length][bytes].
     func audioCapture(serial: String, seconds: Double = 30) {
         btQueue.async { [weak self] in
             guard let self,
                   let session = self.sessions.values.first(where: { $0.serialNumber == serial })
             else { return }
+            guard session.beginAudioExperiment("capture") else {
+                bridgeLog(.warning, "audio", "another audio experiment is running — wait for it to finish")
+                return
+            }
             session.setAudioCapture(true) { ok in
                 guard ok else {
+                    session.endAudioExperiment()
                     bridgeLog(.warning, "audio",
                               "audio characteristic not found — controller firmware "
                               + "may be older than 2.0 (update it via a Switch 2 console)")
                     return
                 }
-                let url = FileManager.default.urls(for: .documentDirectory,
-                                                   in: .userDomainMask)[0]
-                    .appendingPathComponent("FTCW-audio-capture.bin")
-                FileManager.default.createFile(atPath: url.path, contents: nil)
-                guard let handle = try? FileHandle(forWritingTo: url) else { return }
-                var packets = 0
-                var sizes: Set<Int> = []
+                let stamp: String = {
+                    let f = DateFormatter()
+                    f.dateFormat = "yyyyMMdd-HHmmss"
+                    return f.string(from: Date())
+                }()
+                // The serial suffix keeps simultaneous captures on two
+                // controllers from colliding on one path.
+                let suffix = String(serial.suffix(4)).replacingOccurrences(
+                    of: "[^A-Za-z0-9]", with: "", options: .regularExpression)
+                let docs = FileManager.default.urls(for: .documentDirectory,
+                                                    in: .userDomainMask)[0]
+                let fullURL = docs.appendingPathComponent("FTCW-audio-\(stamp)-\(suffix).bin")
+                let regionURL = docs.appendingPathComponent("FTCW-audio-\(stamp)-\(suffix)-frames.bin")
+                let magic = Data("FTCWAUD2".utf8)
+                FileManager.default.createFile(atPath: fullURL.path, contents: magic)
+                FileManager.default.createFile(atPath: regionURL.path, contents: magic)
+                guard let fullFile = try? FileHandle(forWritingTo: fullURL),
+                      let regionFile = try? FileHandle(forWritingTo: regionURL) else {
+                    // Notifications are already on — turn them back off or
+                    // the controller's input reports stay frozen forever.
+                    session.setAudioCapture(false) { _ in }
+                    session.endAudioExperiment()
+                    bridgeLog(.error, "audio",
+                              "cannot open capture files in ~/Documents — capture aborted")
+                    return
+                }
+                _ = try? fullFile.seekToEnd(); _ = try? regionFile.seekToEnd()
+
+                let start = CFAbsoluteTimeGetCurrent()
+                func record(_ data: Data, to handle: FileHandle) {
+                    var rec = Data()
+                    withUnsafeBytes(of: (CFAbsoluteTimeGetCurrent() - start)) {
+                        rec.append(contentsOf: $0)
+                    }
+                    withUnsafeBytes(of: UInt32(data.count).littleEndian) {
+                        rec.append(contentsOf: $0)
+                    }
+                    rec.append(data)
+                    try? handle.write(contentsOf: rec)
+                }
+
+                var packets = 0, audioFrames = 0, dataFrames = 0
+                var lastState: UInt8 = 0xFF
+                var lastMeter = start
                 session.onAudioPacket = { data in
                     packets += 1
-                    sizes.insert(data.count)
-                    var record = Data()
-                    withUnsafeBytes(of: UInt32(data.count).littleEndian) {
-                        record.append(contentsOf: $0)
+                    record(data, to: fullFile)
+                    if data.count >= 65 {
+                        let state = data[13]
+                        if state & ~0x08 != lastState & ~0x08 {
+                            bridgeLog(.info, "audio",
+                                      String(format: "jack state 0x%02x: %@", state,
+                                             Self.jackStateName(state)))
+                            lastState = state
+                        }
+                        let len = Int(data[14])
+                        if state & 0x08 != 0, len > 0, 15 + len <= data.count {
+                            let frame = data.subdata(in: 15..<(15 + len))
+                            audioFrames += 1
+                            // Silent idle frames are f8 ff fe + zeros; any
+                            // other content counts as real data.
+                            let body = frame.starts(with: [0xF8, 0xFF, 0xFE])
+                                ? frame.dropFirst(3) : frame[...]
+                            if body.contains(where: { $0 != 0 }) { dataFrames += 1 }
+                            record(frame, to: regionFile)
+                        }
                     }
-                    record.append(data)
-                    try? handle.write(contentsOf: record)
+                    let now = CFAbsoluteTimeGetCurrent()
+                    if now - lastMeter >= 5 {
+                        lastMeter = now
+                        bridgeLog(.info, "audio",
+                                  "…\(packets) reports, \(audioFrames) audio frames "
+                                  + "(\(dataFrames) with data)")
+                    }
                 }
                 bridgeLog(.info, "audio",
-                          "capturing audio packets for \(Int(seconds)) s — plug "
-                          + "headphones into the controller if you have them")
+                          "capture v2: \(Int(seconds)) s — buttons/sticks will freeze "
+                          + "during capture (firmware quirk). To capture REAL audio, "
+                          + "plug in a HEADSET WITH A MIC and speak into it")
                 let config = Data([0x80, 0xBB, 0x00, 0x00, 0x02, 0xF0, 0x00])
                 session.experimentalCommand(0x17, 0x02, payload: config) { resp in
                     bridgeLog(.info, "audio",
-                              "audio config (48 kHz) response: \(resp.map(Self.hex) ?? "TIMEOUT")")
+                              "audio config (48 kHz) response: \(resp.map(Self.hex) ?? "none")")
                 }
                 self.btQueue.asyncAfter(deadline: .now() + seconds) {
                     session.onAudioPacket = nil
                     session.setAudioCapture(false) { _ in }
-                    try? handle.close()
+                    try? fullFile.close(); try? regionFile.close()
+                    session.endAudioExperiment()
+                    let verdict = dataFrames > 0
+                        ? "\(dataFrames) frames with real payload — codec material!"
+                        : "all frames silent — no mic signal reached the controller "
+                          + "(state was \(Self.jackStateName(lastState)))"
                     bridgeLog(.info, "audio",
-                              "capture done: \(packets) packets, sizes \(sizes.sorted()) → \(url.path)")
+                              "capture done: \(packets) reports, \(audioFrames) audio "
+                              + "frames; \(verdict)")
+                    bridgeLog(.info, "audio", "files: \(fullURL.lastPathComponent), "
+                              + "\(regionURL.lastPathComponent) in ~/Documents")
                 }
             }
         }
     }
 
-    /// Safe recovery check: 3 s of full-frame sine with the original
-    /// config only — verifies the audio DSP is alive after a power cycle
-    /// without touching any experimental config variants.
-    func audioBaseline(serial: String) {
+    /// Build one PCM sine frame: `samples` × s16 LE mono, advancing the
+    /// caller's phase for a true `freq` Hz tone at `sampleRate`.
+    private static func sineFrame(samples: Int, freq: Double,
+                                  sampleRate: Double, phase: inout Double) -> Data {
+        var payload = Data(capacity: samples * 2)
+        for _ in 0..<samples {
+            let sample = Int16(sin(phase) * 20000)
+            phase += 2 * .pi * freq / sampleRate
+            withUnsafeBytes(of: sample.littleEndian) { payload.append(contentsOf: $0) }
+        }
+        if phase > 2 * .pi { phase -= (2 * .pi) * (phase / (2 * .pi)).rounded(.down) }
+        return payload
+    }
+
+    /// Play a 440 Hz tone for 4 s at the FULL configured rate: 240 s16
+    /// samples per 5 ms frame (48 kHz real time — 9.6× the data the old
+    /// probe sent), with MTU splitting and true backpressure. If the
+    /// format is right, this is the first honest test of where the audio
+    /// goes: listen at the actuator AND with headphones plugged in.
+    func audioPlayTone(serial: String) {
         btQueue.async { [weak self] in
             guard let self,
                   let session = self.sessions.values.first(where: { $0.serialNumber == serial })
             else { return }
+            guard session.hasAudioOutput else {
+                bridgeLog(.warning, "audio",
+                          "audio characteristic not found — controller firmware "
+                          + "may be older than 2.0 (update it via a Switch 2 console)")
+                return
+            }
+            guard session.beginAudioExperiment("tone") else {
+                bridgeLog(.warning, "audio", "another audio experiment is running — wait for it to finish")
+                return
+            }
+            bridgeLog(.info, "audio",
+                      "real-time tone: 4 s of 440 Hz, 480 B/5 ms; link accepts "
+                      + "\(session.audioWriteChunkLimit) B per write. A clean A4 tone "
+                      + "= PCM format confirmed; a garble = wrong encoding; silence "
+                      + "= wrong lane/config")
             let config = Data([0x80, 0xBB, 0x00, 0x00, 0x02, 0xF0, 0x00])
             session.experimentalCommand(0x17, 0x02, payload: config) { resp in
                 bridgeLog(.info, "audio",
-                          "baseline config → \(resp.map(Self.hex) ?? "TIMEOUT"); playing 3 s sine")
+                          "config → \(resp.map(Self.hex) ?? "none"); streaming")
             }
-            var sinePhase = 0.0
-            var frame = 0
-            let timer = DispatchSource.makeTimerSource(queue: self.btQueue)
-            timer.schedule(deadline: .now(), repeating: .milliseconds(5))
-            timer.setEventHandler {
-                var payload = Data(capacity: 50)
-                for _ in 0..<25 {
-                    let sample = Int16(sin(sinePhase) * 20000)
-                    sinePhase += 2 * .pi * 440 / 48000
-                    withUnsafeBytes(of: sample.littleEndian) { payload.append(contentsOf: $0) }
-                }
-                session.writeAudioFrame(payload)
-                frame += 1
-                if frame >= 600 {
-                    timer.cancel()
-                    bridgeLog(.info, "audio", "baseline done — did the actuator make noise?")
-                }
+            var phase = 0.0
+            var frames = 0
+            session.startAudioStream(frameInterval: 0.005) {
+                guard frames < 800 else { return nil }
+                frames += 1
+                return Self.sineFrame(samples: 240, freq: 440,
+                                      sampleRate: 48000, phase: &phase)
+            } done: { stats in
+                session.endAudioExperiment()
+                bridgeLog(.info, "audio",
+                          "tone done: \(stats.framesGenerated) frames, "
+                          + "\(stats.chunksWritten) writes, \(stats.chunksDropped) dropped, "
+                          + "\(stats.stalls) stalls, peak queue \(stats.maxQueueDepth) "
+                          + "— what did you hear, and where (actuator vs headphones)?")
             }
-            timer.resume()
         }
     }
 
-    /// Audio OUTPUT experiment: stream three candidate encodings at the
-    /// playback characteristic — the user's ears are the codec detector.
-    /// Phase 1: 440 Hz sine as raw 16-bit LE PCM (if the codec is raw PCM
-    /// at some rate, this yields a tone at SOME pitch). Phase 2: white
-    /// noise (any linear codec yields static). Phase 3: max-amplitude
-    /// square wave (loud clicks/buzz under almost any linear encoding).
+    /// Audio OUTPUT format probe — four phases, ears as the detector.
+    /// Run it twice: once with nothing plugged in (listen at the
+    /// controller body) and once with headphones in (listen there).
+    ///
+    /// Phase 1  raw PCM at the full configured rate (480 B / 5 ms):
+    ///          a clean 440 Hz tone anywhere = PCM confirmed.
+    /// Phase 2  the legacy 50 B / 5 ms frames, but with the sine generated
+    ///          for the effective 5 kHz rate (the old probe generated
+    ///          48 kHz samples at this rate, so its "440 Hz" actually came
+    ///          out near 46 Hz — sub-bass, felt as haptics).
+    /// Phase 3  the input lane's own idle-frame shape: f8 ff fe header +
+    ///          47 B — tests "output frames mirror input framing".
+    /// Phase 4  exponential sweep 100→3000 Hz at full rate: the actuator
+    ///          physically rolls off above ~1 kHz, headphones don't, so
+    ///          where the sound dies reveals which transducer plays it.
     func audioToneTest(serial: String) {
         btQueue.async { [weak self] in
             guard let self,
                   let session = self.sessions.values.first(where: { $0.serialNumber == serial })
             else { return }
-            // Power up the audio path first (same config as capture).
+            guard session.hasAudioOutput else {
+                bridgeLog(.warning, "audio",
+                          "audio characteristic not found — controller firmware "
+                          + "may be older than 2.0 (update it via a Switch 2 console)")
+                return
+            }
+            guard session.beginAudioExperiment("format probe") else {
+                bridgeLog(.warning, "audio", "another audio experiment is running — wait for it to finish")
+                return
+            }
             let config = Data([0x80, 0xBB, 0x00, 0x00, 0x02, 0xF0, 0x00])
             session.experimentalCommand(0x17, 0x02, payload: config) { resp in
                 bridgeLog(.info, "audio",
-                          "config response: \(resp.map(Self.hex) ?? "TIMEOUT") — starting output phases")
+                          "config → \(resp.map(Self.hex) ?? "none") — starting phases")
             }
-
-            // Discovery so far: raw PCM frames made the HAPTIC ACTUATOR
-            // sing — the stream is linear and likely carries haptic +
-            // headphone lanes (DualSense-style). These phases localize
-            // which bytes go where, and probe config routing bytes.
-            let frameBytes = 50
-            let framesPerPhase = 600          // 3 s per phase at 5 ms pacing
-            var phase = 0
-            var frame = 0
-            var sinePhase = 0.0
-            let phaseNames = [
-                "sine across FULL frame (baseline — expect actuator noise)",
-                "sine in FIRST 25 bytes only",
-                "sine in LAST 25 bytes only",
-                "full sine + config variant 01 (channel byte)",
-                "full sine + config variant 03",
-                "full sine + config flags f0→ff",
-            ]
-            let configs: [Int: Data] = [
-                3: Data([0x80, 0xBB, 0x00, 0x00, 0x01, 0xF0, 0x00]),
-                4: Data([0x80, 0xBB, 0x00, 0x00, 0x03, 0xF0, 0x00]),
-                5: Data([0x80, 0xBB, 0x00, 0x00, 0x02, 0xFF, 0x00]),
-            ]
             bridgeLog(.info, "audio",
-                      "OUTPUT PROBE v2 — six 3-second phases. Note for each: "
-                      + "actuator noise, headphone sound, or silence!")
+                      "FORMAT PROBE — four phases. For each, note: clean tone / "
+                      + "garble / silence, and from WHERE (controller body vs headphones)")
 
-            func sineBytes(_ count: Int) -> Data {
-                var d = Data(capacity: count)
-                for _ in 0..<(count / 2) {
-                    let sample = Int16(sin(sinePhase) * 20000)
-                    sinePhase += 2 * .pi * 440 / 48000
-                    withUnsafeBytes(of: sample.littleEndian) { d.append(contentsOf: $0) }
-                }
-                return d
+            struct Phase {
+                let name: String
+                let frames: Int
+                let make: (Int, inout Double) -> Data
             }
+            let phases: [Phase] = [
+                Phase(name: "1/4 raw PCM, full rate (expect 440 Hz if PCM)",
+                      frames: 600) { _, ph in
+                    Self.sineFrame(samples: 240, freq: 440, sampleRate: 48000, phase: &ph)
+                },
+                Phase(name: "2/4 legacy 50 B frames at true pitch (the old buzz, corrected)",
+                      frames: 600) { _, ph in
+                    Self.sineFrame(samples: 25, freq: 440, sampleRate: 5000, phase: &ph)
+                },
+                Phase(name: "3/4 idle-frame mimic: f8 ff fe + 47 B",
+                      frames: 600) { _, ph in
+                    var d = Data([0xF8, 0xFF, 0xFE])
+                    d.append(Self.sineFrame(samples: 23, freq: 440, sampleRate: 4600, phase: &ph))
+                    d.append(0)
+                    return d
+                },
+                Phase(name: "4/4 sweep 100→3000 Hz (where does it die?)",
+                      frames: 1200) { i, ph in
+                    let freq = 100 * pow(30, Double(i) / 1200)   // exponential sweep
+                    if i % 200 == 0 {
+                        bridgeLog(.info, "audio", "  sweep at \(Int(freq)) Hz")
+                    }
+                    return Self.sineFrame(samples: 240, freq: freq, sampleRate: 48000, phase: &ph)
+                },
+            ]
+            var phaseIndex = 0, frameInPhase = 0
+            var sinePhase = 0.0
+            session.startAudioStream(frameInterval: 0.005) {
+                guard phaseIndex < phases.count else { return nil }
+                if frameInPhase == 0 {
+                    bridgeLog(.info, "audio", "phase \(phases[phaseIndex].name)")
+                    sinePhase = 0
+                }
+                let data = phases[phaseIndex].make(frameInPhase, &sinePhase)
+                frameInPhase += 1
+                if frameInPhase >= phases[phaseIndex].frames {
+                    frameInPhase = 0
+                    phaseIndex += 1
+                }
+                return data
+            } done: { stats in
+                session.endAudioExperiment()
+                bridgeLog(.info, "audio",
+                          "probe done: \(stats.chunksWritten) writes, "
+                          + "\(stats.chunksDropped) dropped, \(stats.stalls) stalls — "
+                          + "which phases made sound, and where?")
+            }
+        }
+    }
 
-            let timer = DispatchSource.makeTimerSource(queue: self.btQueue)
-            timer.schedule(deadline: .now(), repeating: .milliseconds(5))
-            timer.setEventHandler {
-                if frame == 0 {
-                    bridgeLog(.info, "audio", "phase \(phase + 1)/6: \(phaseNames[phase])")
-                    if let cfg = configs[phase] {
-                        session.experimentalCommand(0x17, 0x02, payload: cfg) { resp in
-                            bridgeLog(.info, "audio",
-                                      "  config \(cfg.map { String(format: "%02x", $0) }.joined()) → \(resp.map(Self.hex) ?? "TIMEOUT")")
-                        }
-                    }
+    /// Actuator melody on the DOCUMENTED rumble lane (no audio mystery
+    /// involved): frequency-controlled HD-rumble tones, resent every
+    /// 25 ms with an incrementing sequence nibble. If this plays a clean
+    /// little tune, the actuators are fully under our control.
+    func hapticMelody(serial: String) {
+        btQueue.async { [weak self] in
+            guard let self,
+                  let session = self.sessions.values.first(where: { $0.serialNumber == serial })
+            else { return }
+            guard session.beginAudioExperiment("haptic melody") else {
+                bridgeLog(.warning, "audio", "another audio experiment is running — wait for it to finish")
+                return
+            }
+            // C major arpeggio up and back — all within the actuator's
+            // 1...511 Hz field. (freq, beats); a beat is 90 ms.
+            let notes: [(freq: Int, beats: Int)] = [
+                (262, 2), (330, 2), (392, 2), (494, 2), (392, 2), (330, 2),
+                (262, 4), (0, 1), (392, 1), (0, 1), (392, 2), (262, 4),
+            ]
+            let beat = 0.090
+            let tick = 0.025
+            var elapsed = 0.0
+            let total = Double(notes.reduce(0) { $0 + $1.beats }) * beat
+            bridgeLog(.info, "audio", "haptic melody: \(String(format: "%.1f", total)) s "
+                      + "on the rumble lane — should be clean notes, not buzz")
+            let timer = DispatchSource.makeTimerSource(flags: .strict, queue: self.btQueue)
+            timer.schedule(deadline: .now(), repeating: tick, leeway: .milliseconds(2))
+            timer.setEventHandler { [weak self] in
+                // Stop silently if the controller vanished mid-tune —
+                // writing to a disconnected peripheral is API misuse.
+                guard let self, self.sessions.values.contains(where: { $0 === session }) else {
+                    timer.cancel()
+                    return
                 }
-                var payload: Data
-                switch phase {
-                case 1:
-                    payload = sineBytes(25 + 1)
-                    payload = payload.prefix(25) + Data(repeating: 0, count: 25)
-                case 2:
-                    payload = Data(repeating: 0, count: 25) + sineBytes(25 + 1).prefix(25)
-                default:
-                    payload = sineBytes(frameBytes)
+                guard elapsed < total else {
+                    timer.cancel()
+                    session.writeHapticSample(Switch2.Vibration.tone(freqHz: 200, amp: 0))
+                    session.endAudioExperiment()
+                    bridgeLog(.info, "audio", "melody done — clean notes = actuator control verified")
+                    return
                 }
-                session.writeAudioFrame(payload)
-                frame += 1
-                if frame >= framesPerPhase {
-                    frame = 0
-                    phase += 1
-                    if phase >= phaseNames.count {
-                        timer.cancel()
-                        // Restore original config.
-                        let original = Data([0x80, 0xBB, 0x00, 0x00, 0x02, 0xF0, 0x00])
-                        session.experimentalCommand(0x17, 0x02, payload: original) { _ in }
-                        bridgeLog(.info, "audio",
-                                  "probe done — which phases made actuator noise, and did ANY reach the headphones?")
-                    }
+                // Locate the current note and its age (for the envelope).
+                var t = elapsed
+                var current: (freq: Int, beats: Int) = (0, 1)
+                for n in notes {
+                    let dur = Double(n.beats) * beat
+                    if t < dur { current = n; break }
+                    t -= dur
                 }
+                if current.freq > 0 {
+                    // Exponential decay envelope makes notes articulate
+                    // instead of running together.
+                    let amp = 0.95 * exp(-t * 6)
+                    session.writeHapticSample(.tone(freqHz: current.freq, amp: amp))
+                } else {
+                    session.writeHapticSample(.tone(freqHz: 200, amp: 0))
+                }
+                elapsed += tick
             }
             timer.resume()
         }
