@@ -391,8 +391,10 @@ struct ControllerCard: View {
                         Button("Test") { onTestRumble() }
                             .help("Play a short rumble pulse at this controller's strength")
                     }
-                    DisclosureGroup("Keyboard mapping") {
-                        KeyboardMappingView(serial: status.serial)
+                    if AppInfo.showPreReleaseFeatures {
+                        DisclosureGroup("Keyboard mapping") {
+                            KeyboardMappingView(serial: status.serial)
+                        }
                     }
                     DisclosureGroup("Input test") {
                         VStack(spacing: 10) {
@@ -597,7 +599,8 @@ struct ControllerCard: View {
                                 .font(.caption)
                                 .padding(.top, 6)
                             }
-                            if status.model == .proController2 && !status.isJoyConPair {
+                            if AppInfo.showPreReleaseFeatures,
+                               status.model == .proController2, !status.isJoyConPair {
                                 DisclosureGroup("Experiments") {
                                     VStack(alignment: .leading, spacing: 8) {
                                         Text("Frontier features — results appear in the Logs "

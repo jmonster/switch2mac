@@ -145,11 +145,15 @@ struct MenuContent: View {
 
         Button("Open Dashboard") { show("dashboard") }
 
-        Button("Reaction Draft (party game)") { show("reaction-game") }
+        // Hidden for the beta (AppInfo.showPreReleaseFeatures documents
+        // the defaults key that brings them back).
+        if AppInfo.showPreReleaseFeatures {
+            Button("Reaction Draft (party game)") { show("reaction-game") }
 
-        Button("Sensor Challenges") { show("challenges") }
+            Button("Sensor Challenges") { show("challenges") }
 
-        Button("Air Gestures") { show("gestures") }
+            Button("Air Gestures") { show("gestures") }
+        }
 
         Divider()
 

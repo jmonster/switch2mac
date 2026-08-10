@@ -4,3 +4,6 @@ signing/devid_private.key
 signing/*.cer
 .DS_Store
 .claude/worktrees/
+signing/
+test.nfc
+*.nfc

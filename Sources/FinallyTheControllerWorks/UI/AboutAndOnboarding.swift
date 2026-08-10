@@ -13,10 +13,21 @@ enum AppInfo {
         Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "0"
     }
 
-    /// Built-in update feed. When non-empty, the updater works out of the box
-    /// and the Configuration field becomes an override for testing. Fill this
-    /// in once release hosting exists (e.g. a GitHub Releases appcast URL).
-    static let defaultUpdateFeedURL = ""
+    /// Built-in update feed: every GitHub release of this repo uploads
+    /// appcast.json as an asset, and releases/latest always points at the
+    /// newest one. The Configuration field remains an override for testing.
+    static let defaultUpdateFeedURL =
+        "https://github.com/Peterksharma/switch2mac/releases/latest/download/appcast.json"
+
+    /// Pre-release features hidden from the beta UI: the party-game and
+    /// gesture menu items, keyboard mapping, and the Experiments cluster.
+    /// Deliberately a runtime flag rather than a build flag so a beta build
+    /// can be un-hidden for development without recompiling:
+    ///   defaults write com.petersharma.finallythecontrollerworks showPreReleaseFeatures -bool YES
+    /// (then relaunch; delete the key to hide again).
+    static var showPreReleaseFeatures: Bool {
+        UserDefaults.standard.bool(forKey: "showPreReleaseFeatures")
+    }
 
     /// Deep links into System Settings panes.
     static func openBluetoothSettings() {
