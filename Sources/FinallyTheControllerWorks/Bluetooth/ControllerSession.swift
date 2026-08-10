@@ -300,8 +300,12 @@ final class ControllerSession: NSObject, @unchecked Sendable {
         if pending.id == 0x01 {
             log(.debug, "nfc raw frame: \(data.map { String(format: "%02x", $0) }.joined(separator: " "))")
         }
+        // Byte 1 is the response class: 0x01 = success, 0x02 observed as a
+        // status/error reply (same shape, payload starts with a status code).
+        // Both correlate to our command — pass the payload up and let the
+        // caller interpret the status byte.
         guard data.count >= 8, data[data.startIndex] == pending.id,
-              data[data.startIndex + 1] == 0x01 else {
+              data[data.startIndex + 1] == 0x01 || data[data.startIndex + 1] == 0x02 else {
             pending.completion(nil)
             return
         }
@@ -373,6 +377,26 @@ final class ControllerSession: NSObject, @unchecked Sendable {
             guard let self else { completion(nil); return }
             self.writeCommand(command, subcommand, payload, flag: flag,
                               completion: completion)
+        }
+    }
+
+    /// NFC experiments: subscribe every notify-capable characteristic we are
+    /// not already listening to and log whatever arrives — hunting for
+    /// out-of-band bulk-data channels (the NFC tag payload may not travel on
+    /// the main command-response characteristic).
+    private(set) var promiscuousNotify = false
+    func setPromiscuousNotify(_ enabled: Bool) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.promiscuousNotify = enabled
+            let known: Set<UUID> = [Switch2.GATT.inputReport,
+                                    Switch2.GATT.commandResponse,
+                                    Self.audioInputUUID]
+            for (uuid, ch) in self.chars
+            where ch.properties.contains(.notify) && !known.contains(uuid) {
+                self.log(.debug, "promiscuous notify \(enabled ? "ON" : "off"): \(uuid.uuidString)")
+                self.peripheral.setNotifyValue(enabled, for: ch)
+            }
         }
     }
 
@@ -557,11 +581,17 @@ extension ControllerSession: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral,
                     didUpdateNotificationStateFor characteristic: CBCharacteristic,
                     error: Error?) {
+        let uuid = UUID(uuidString: characteristic.uuid.uuidString)
         if let error {
-            fail("notify state: \(error.localizedDescription)")
+            // Only the essential channels are fatal — an experimental
+            // (promiscuous) subscribe may legitimately be refused.
+            if uuid == Switch2.GATT.commandResponse || uuid == Switch2.GATT.inputReport {
+                fail("notify state: \(error.localizedDescription)")
+            } else {
+                log(.debug, "notify refused on \(characteristic.uuid.uuidString): \(error.localizedDescription)")
+            }
             return
         }
-        let uuid = UUID(uuidString: characteristic.uuid.uuidString)
         if uuid == Switch2.GATT.commandResponse {
             runHandshake()
         } else if uuid == Switch2.GATT.inputReport {
@@ -585,6 +615,10 @@ extension ControllerSession: CBPeripheralDelegate {
             handleCommandResponse(data)
         } else if uuid == Self.audioInputUUID {
             onAudioPacket?(data)
+        } else if promiscuousNotify {
+            // Experiment channel: surface out-of-band data loudly.
+            log(.info, "OOB data on \(characteristic.uuid.uuidString): "
+                + data.map { String(format: "%02x", $0) }.joined(separator: " "))
         }
     }
 }

@@ -203,8 +203,10 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
                   let session = self.sessions.values.first(where: { $0.serialNumber == serial })
             else { return }
             bridgeLog(.info, "nfc",
-                      "starting NFC discovery — place an amiibo flat on the "
-                      + "controller's NFC touchpoint (right stick area)")
+                      "starting NFC discovery — place the tag on the touchpoint "
+                      + "BEFORE clicking, or hold it on during the 30 s window")
+            // Hunt for out-of-band data channels while the probe runs.
+            session.setPromiscuousNotify(true)
             let startPayload = Data([0x00, 0xE8, 0x03, 0x2C, 0x01])
             session.experimentalCommand(0x01, 0x03, payload: startPayload) { resp in
                 bridgeLog(.info, "nfc",
@@ -219,6 +221,17 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
             bridgeLog(.warning, "nfc", "no tag detected after 30 s — probe over")
             self.nfcStopDiscovery(session: session)
             return
+        }
+        // Empirical: detection only ever succeeded when the tag was already
+        // on the antenna at discovery start — the start command appears to
+        // fire a short poll burst, and state 07 41 means "burst over, idle".
+        // Re-kick discovery every ~3 s so a tag placed late is still caught.
+        if attempt > 0, attempt % 6 == 0 {
+            session.experimentalCommand(0x01, 0x03,
+                                        payload: Data([0x00, 0xE8, 0x03, 0x2C, 0x01])) { resp in
+                bridgeLog(.debug, "nfc",
+                          "discovery re-kick: \(resp.map(Self.hex) ?? "TIMEOUT")")
+            }
         }
         btQueue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             guard let self else { return }
@@ -268,99 +281,144 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
     /// other NFC command for 1.2 s (a status poll mid-read may abort the RF
     /// transaction), then log one status + the console's 0x0C "result info"
     /// before pulling the buffer.
+    /// One stage of the read-unlock hunt: send each command in `sequence` in
+    /// order, wait `delay`, then try up to `readTries` chunk reads before
+    /// moving on to the next stage.
+    private struct NFCStage {
+        let label: String
+        let sequence: [(subcommand: UInt8, payload: Data)]
+        let delay: Double
+        let readTries: Int
+    }
+
     private func nfcReadTag(session: ControllerSession, uid: Data) {
-        bridgeLog(.info, "nfc", "reading tag into buffer (0x01/0x06)…")
-        session.experimentalCommand(0x01, 0x06, payload: Self.nfcReadDevicePayload) { [weak self] resp in
+        // Top hypothesis: an NFC reader must STOP POLLING before it can
+        // transact with the selected tag — 0x04 (previously assumed to be
+        // plain "stop discovery") is likely that halt, and belongs BETWEEN
+        // detection and read-device. Fall back to the UID-in-payload variant
+        // and a fresh-restart control if the halt alone doesn't unlock it.
+        // Suspected "authenticate as amiibo" flag at payload index 9 — try
+        // the read with it cleared, in case the firmware aborts full-tag
+        // reads of non-amiibo NTAGs (state 07 48) on failed validation.
+        var noAuth = Self.nfcReadDevicePayload
+        noAuth[noAuth.startIndex + 9] = 0x00
+        let stages = [
+            NFCStage(label: "read-device, byte9=00 (no amiibo auth?)",
+                     sequence: [(0x06, noAuth)],
+                     delay: 0.8, readTries: 4),
+            NFCStage(label: "read-device standard, patient 10 s poll",
+                     sequence: [(0x06, Self.nfcReadDevicePayload)],
+                     delay: 1.0, readTries: 40),   // 40 × 0.25 s = 10 s
+        ]
+        // Read-only probe: map which feature-mask bits exist beyond the
+        // documented byte 0 — candidate NFC-enable bits for the next round.
+        session.experimentalCommand(0x0C, 0x01, payload: Data([0xFF, 0xFF, 0xFF, 0xFF])) { resp in
+            bridgeLog(.info, "nfc", "feature info (mask FFFFFFFF): \(resp.map(Self.hex) ?? "TIMEOUT")")
+        }
+        nfcRunStage(session: session, uid: uid, stages: stages, index: 0)
+    }
+
+    private func nfcRunStage(session: ControllerSession, uid: Data,
+                             stages: [NFCStage], index: Int) {
+        guard index < stages.count else {
+            bridgeLog(.warning, "nfc", "all read strategies exhausted — dumping final status")
+            session.experimentalCommand(0x01, 0x05, payload: Data()) { [weak self] resp in
+                guard let self else { return }
+                bridgeLog(.info, "nfc", "final status: \(resp.map(Self.hex) ?? "TIMEOUT")")
+                self.nfcFinish(session: session, assembled: Data(), uid: uid)
+            }
+            return
+        }
+        let stage = stages[index]
+        bridgeLog(.info, "nfc", "stage \(index + 1)/\(stages.count): \(stage.label)")
+        nfcSendSequence(session: session, stage.sequence, at: 0) { [weak self] in
             guard let self else { return }
-            bridgeLog(.info, "nfc", "read-device response: \(resp.map(Self.hex) ?? "TIMEOUT")")
-            self.btQueue.asyncAfter(deadline: .now() + 1.2) {
-                session.experimentalCommand(0x01, 0x05, payload: Data()) { resp in
-                    bridgeLog(.info, "nfc", "status after read: \(resp.map(Self.hex) ?? "TIMEOUT")")
-                    // Console traffic shows 0x0C in the BT amiibo flow; its
-                    // 4-byte reply may be a result token that unlocks 0x15.
-                    session.experimentalCommand(0x01, 0x0C, payload: Data()) { resp in
-                        bridgeLog(.info, "nfc", "result info (0x0C): \(resp.map(Self.hex) ?? "TIMEOUT")")
-                        self.nfcReadBuffer(session: session, offset: 0, assembled: Data(),
-                                           attempts: 0, retries: 0, uid: uid,
-                                           onNoDataAtStart: { self.nfcTryVariants(session: session, uid: uid) })
-                    }
-                }
+            self.btQueue.asyncAfter(deadline: .now() + stage.delay) {
+                self.nfcReadBuffer(session: session, assembled: Data(),
+                                   chunks: 0, retries: 0,
+                                   maxRetries: stage.readTries, uid: uid,
+                                   onNoData: {
+                    self.nfcRunStage(session: session, uid: uid,
+                                     stages: stages, index: index + 1)
+                })
             }
         }
     }
 
-    /// One step of the buffer dump. `attempts` counts successful chunk reads
-    /// (loop bound: 12 × ≥112-byte chunks > 540 bytes); `retries` counts
-    /// consecutive empty/timed-out reads at the CURRENT offset — the buffer
-    /// may simply not be filled yet, so empty ≠ end-of-data until it has
-    /// persisted across several spaced retries. If the FIRST offset yields
-    /// nothing at all, `onNoDataAtStart` (when set) runs instead of
-    /// finishing, so a fallback strategy can take over.
-    private func nfcReadBuffer(session: ControllerSession, offset: Int,
-                               assembled: Data, attempts: Int, retries: Int,
-                               uid: Data,
-                               onNoDataAtStart: (() -> Void)? = nil) {
-        guard offset < 540, attempts < 12 else {
+    /// Send a stage's commands strictly in order (each waits for the
+    /// previous response), logging every reply, then call `done`.
+    private func nfcSendSequence(session: ControllerSession,
+                                 _ sequence: [(subcommand: UInt8, payload: Data)],
+                                 at index: Int, done: @escaping () -> Void) {
+        guard index < sequence.count else { done(); return }
+        let (sub, payload) = sequence[index]
+        session.experimentalCommand(0x01, sub, payload: payload) { [weak self] resp in
+            bridgeLog(.info, "nfc",
+                      "  0x\(String(format: "%02x", sub)) → \(resp.map(Self.hex) ?? "TIMEOUT")")
+            self?.nfcSendSequence(session: session, sequence, at: index + 1, done: done)
+        }
+    }
+
+    /// One step of the buffer dump.
+    ///
+    /// Wire format (reverse-engineered from the console's traffic + our own
+    /// probes): 0x01/0x15 is a CURSOR-based stream read, not offset-based.
+    /// Request payload = requested byte count as LE u16 (console always asks
+    /// for 0x46 = 70). Response payload = [status][valid-count LE u16][data];
+    /// status 0x00 = OK, non-zero (with response class 0x02) = not ready /
+    /// nothing to read. Identical requests return SUCCESSIVE chunks.
+    ///
+    /// `chunks` bounds the loop (12 × 70 > 540); `retries` counts consecutive
+    /// not-ready replies at the current cursor — the RF read may still be
+    /// filling the buffer, so an error only ends the dump once we have data
+    /// or patience runs out.
+    private func nfcReadBuffer(session: ControllerSession,
+                               assembled: Data, chunks: Int, retries: Int,
+                               maxRetries: Int = 6, uid: Data,
+                               onNoData: (() -> Void)? = nil) {
+        guard assembled.count < 540, chunks < 12 else {
             self.nfcFinish(session: session, assembled: assembled, uid: uid)
             return
         }
-        var payload = Data()
-        withUnsafeBytes(of: UInt16(offset).littleEndian) { payload.append(contentsOf: $0) }
-        session.experimentalCommand(0x01, 0x15, payload: payload) { [weak self] resp in
+        let request = Data([0x46, 0x00])   // next 70 bytes, as the console asks
+        session.experimentalCommand(0x01, 0x15, payload: request) { [weak self] resp in
             guard let self else { return }
-            // Response: 00 <offset LE> <data...>; skip the 3-byte header.
-            guard let resp, resp.count > 3 else {
-                if retries < 4 {
+            let status: UInt8? = resp.flatMap { $0.isEmpty ? nil : $0[$0.startIndex] }
+            guard let resp, let status, status == 0, resp.count > 3 else {
+                if retries < maxRetries {
                     bridgeLog(.debug, "nfc",
-                              "buffer @\(offset) empty (try \(retries + 1)/4) — buffer may still be filling")
-                    self.btQueue.asyncAfter(deadline: .now() + 0.3) {
-                        self.nfcReadBuffer(session: session, offset: offset,
-                                           assembled: assembled, attempts: attempts,
-                                           retries: retries + 1, uid: uid,
-                                           onNoDataAtStart: onNoDataAtStart)
+                              "chunk \(chunks) not ready (status \(status.map(String.init) ?? "none"), try \(retries + 1)/\(maxRetries))")
+                    self.btQueue.asyncAfter(deadline: .now() + 0.25) {
+                        self.nfcReadBuffer(session: session, assembled: assembled,
+                                           chunks: chunks, retries: retries + 1,
+                                           maxRetries: maxRetries, uid: uid,
+                                           onNoData: onNoData)
                     }
-                } else if assembled.isEmpty, let fallback = onNoDataAtStart {
-                    bridgeLog(.info, "nfc", "no data at offset 0 — probing protocol variants")
-                    fallback()
+                } else if assembled.isEmpty, let onNoData {
+                    onNoData()
                 } else {
-                    bridgeLog(.info, "nfc", "buffer read @\(offset) returned nothing; stopping")
+                    bridgeLog(.info, "nfc",
+                              "buffer stream ended at \(assembled.count) bytes (status \(status.map(String.init) ?? "none"))")
                     self.nfcFinish(session: session, assembled: assembled, uid: uid)
                 }
                 return
             }
-            let chunk = resp.subdata(in: resp.startIndex + 3 ..< resp.endIndex)
-            bridgeLog(.debug, "nfc", "buffer @\(offset): \(Self.hex(resp))")
+            // [status][valid-count LE][data...] — trust valid-count, capped
+            // by what actually arrived.
+            let declared = Int(resp[resp.startIndex + 1]) | Int(resp[resp.startIndex + 2]) << 8
+            let available = resp.count - 3
+            let take = min(declared, available)
+            guard take > 0 else {
+                bridgeLog(.info, "nfc", "zero-length chunk — stream complete at \(assembled.count) bytes")
+                self.nfcFinish(session: session, assembled: assembled, uid: uid)
+                return
+            }
+            let chunk = resp.subdata(in: resp.startIndex + 3 ..< resp.startIndex + 3 + take)
+            bridgeLog(.debug, "nfc", "chunk \(chunks) (\(take)B): \(Self.hex(chunk))")
             var acc = assembled
             acc.append(chunk)
-            self.nfcReadBuffer(session: session, offset: offset + chunk.count,
-                               assembled: acc, attempts: attempts + 1,
-                               retries: 0, uid: uid)
-        }
-    }
-
-    /// Fallback experiments when offset 0 stays empty, each replicating a
-    /// detail of the sniffed console traffic that the main path does not:
-    /// 1. read at the console's observed offset 0x46;
-    /// 2. re-issue read-device with frame flag byte 0x00 (as captured over
-    ///    USB) and read offset 0 again.
-    /// Every response is logged raw by the session, so whichever variant
-    /// answers tells us the missing protocol rule. Keep the tag ON the
-    /// controller while this runs (~5 s).
-    private func nfcTryVariants(session: ControllerSession, uid: Data) {
-        var payload = Data()
-        withUnsafeBytes(of: UInt16(0x46).littleEndian) { payload.append(contentsOf: $0) }
-        session.experimentalCommand(0x01, 0x15, payload: payload) { [weak self] resp in
-            guard let self else { return }
-            bridgeLog(.info, "nfc", "variant read @0x46: \(resp.map(Self.hex) ?? "TIMEOUT")")
-            bridgeLog(.info, "nfc", "variant: read-device with frame flag 00…")
-            session.experimentalCommand(0x01, 0x06, payload: Self.nfcReadDevicePayload,
-                                        flag: 0x00) { resp in
-                bridgeLog(.info, "nfc", "read-device(flag 00) response: \(resp.map(Self.hex) ?? "TIMEOUT")")
-                self.btQueue.asyncAfter(deadline: .now() + 1.5) {
-                    self.nfcReadBuffer(session: session, offset: 0, assembled: Data(),
-                                       attempts: 0, retries: 0, uid: uid)
-                }
-            }
+            self.nfcReadBuffer(session: session, assembled: acc,
+                               chunks: chunks + 1, retries: 0, uid: uid)
         }
     }
 
@@ -393,6 +451,7 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
     /// End discovery (0x01/0x04 per the sniffed console traffic — sent with
     /// an empty payload once the console is done with the tag).
     private func nfcStopDiscovery(session: ControllerSession) {
+        session.setPromiscuousNotify(false)
         session.experimentalCommand(0x01, 0x04, payload: Data()) { resp in
             bridgeLog(.debug, "nfc", "discovery stop response: \(resp.map(Self.hex) ?? "TIMEOUT")")
         }
