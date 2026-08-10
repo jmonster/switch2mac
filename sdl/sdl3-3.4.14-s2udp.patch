@@ -1,0 +1,821 @@
+diff --git a/src/hidapi/SDL_hidapi.c b/src/hidapi/SDL_hidapi.c
+index abb8567..58dc4e5 100644
+--- a/src/hidapi/SDL_hidapi.c
++++ b/src/hidapi/SDL_hidapi.c
+@@ -857,10 +857,16 @@ static const struct {
+     Uint16 product;
+ } SDL_libusb_required[] = {
+     { USB_VENDOR_NINTENDO, USB_PRODUCT_NINTENDO_GAMECUBE_ADAPTER },
++#ifndef SDL_PLATFORM_MACOS
++    /* On macOS the OS HID driver owns the HID interface and libusb cannot
++     * detach it, so the libusb backend can never open these. The platform
++     * backend reads input instead, and the Switch2 driver opens its own
++     * libusb handle for the (unclaimed) vendor interface. */
+     { USB_VENDOR_NINTENDO, USB_PRODUCT_NINTENDO_SWITCH2_GAMECUBE_CONTROLLER },
+     { USB_VENDOR_NINTENDO, USB_PRODUCT_NINTENDO_SWITCH2_JOYCON_LEFT },
+     { USB_VENDOR_NINTENDO, USB_PRODUCT_NINTENDO_SWITCH2_JOYCON_RIGHT },
+     { USB_VENDOR_NINTENDO, USB_PRODUCT_NINTENDO_SWITCH2_PRO },
++#endif
+ };
+ 
+ static bool RequiresLibUSB(Uint16 vendor, Uint16 product, bool libusb_xbox)
+diff --git a/src/joystick/SDL_joystick.c b/src/joystick/SDL_joystick.c
+index 77539c9..f0f1b72 100644
+--- a/src/joystick/SDL_joystick.c
++++ b/src/joystick/SDL_joystick.c
+@@ -52,6 +52,9 @@ static SDL_JoystickDriver *SDL_joystick_drivers[] = {
+ #ifdef SDL_JOYSTICK_HIDAPI // Highest priority driver for supported devices
+     &SDL_HIDAPI_JoystickDriver,
+ #endif
++#if defined(SDL_PLATFORM_MACOS) && !defined(SDL_JOYSTICK_DISABLED) // s2bridge UDP-fed Switch 2 pad
++    &SDL_S2UDP_JoystickDriver,
++#endif
+ #ifdef SDL_JOYSTICK_PRIVATE
+     &SDL_PRIVATE_JoystickDriver,
+ #endif
+diff --git a/src/joystick/SDL_sysjoystick.h b/src/joystick/SDL_sysjoystick.h
+index 47ce42c..9a3e24b 100644
+--- a/src/joystick/SDL_sysjoystick.h
++++ b/src/joystick/SDL_sysjoystick.h
+@@ -247,6 +247,7 @@ extern SDL_JoystickDriver SDL_PRIVATE_JoystickDriver;
+ extern SDL_JoystickDriver SDL_ANDROID_JoystickDriver;
+ extern SDL_JoystickDriver SDL_BSD_JoystickDriver;
+ extern SDL_JoystickDriver SDL_DARWIN_JoystickDriver;
++extern SDL_JoystickDriver SDL_S2UDP_JoystickDriver;
+ extern SDL_JoystickDriver SDL_DUMMY_JoystickDriver;
+ extern SDL_JoystickDriver SDL_EMSCRIPTEN_JoystickDriver;
+ extern SDL_JoystickDriver SDL_HAIKU_JoystickDriver;
+diff --git a/src/joystick/hidapi/SDL_hidapi_switch2.c b/src/joystick/hidapi/SDL_hidapi_switch2.c
+index 773405c..93b294c 100644
+--- a/src/joystick/hidapi/SDL_hidapi_switch2.c
++++ b/src/joystick/hidapi/SDL_hidapi_switch2.c
+@@ -98,6 +98,12 @@ typedef struct
+     Uint8 interface_number;
+     Uint8 out_endpoint;
+     Uint8 in_endpoint;
++#ifdef SDL_PLATFORM_MACOS
++    /* On macOS device->dev is the platform (IOHIDManager) backend and no
++     * libusb handle property exists, so we open our own. */
++    libusb_context *usb_context;
++    bool own_device_handle;
++#endif
+ 
+     Uint64 rumble_timestamp;
+     Uint32 rumble_seq;
+@@ -133,6 +139,14 @@ typedef struct
+     Uint8 last_state[USB_PACKET_LENGTH];
+ } SDL_DriverSwitch2_Context;
+ 
++/* On macOS the vendor interface is claimed only for the duration of each
++ * command exchange, so multiple processes (e.g. a launcher GUI and the
++ * game it spawns) can all use the controller; input reports flow through
++ * the shared platform HID backend regardless. On other platforms the
++ * handle is persistent and these are a check/no-op respectively. */
++static bool AcquireVendorInterface(SDL_DriverSwitch2_Context *ctx);
++static void ReleaseVendorInterface(SDL_DriverSwitch2_Context *ctx);
++
+ static void ParseStickCalibration(Switch2_StickCalibration *stick_data, const Uint8 *data)
+ {
+     stick_data->x.neutral = data[0];
+@@ -242,11 +256,18 @@ static bool UpdateSlotLED(SDL_DriverSwitch2_Context *ctx)
+     if (ctx->player_lights && ctx->player_index >= 0) {
+         set_led_data[8] = player_pattern[ctx->player_index % 8];
+     }
++    if (!AcquireVendorInterface(ctx)) {
++        return false;
++    }
+     int res = SendBulkData(ctx, set_led_data, sizeof(set_led_data));
++    bool led_set = false;
+     if (res < 0) {
+-        return SDL_SetError("Couldn't set LED data: %d\n", res);
++        SDL_SetError("Couldn't set LED data: %d\n", res);
++    } else {
++        led_set = (RecvBulkData(ctx, reply, sizeof(reply)) > 0);
+     }
+-    return (RecvBulkData(ctx, reply, sizeof(reply)) > 0);
++    ReleaseVendorInterface(ctx);
++    return led_set;
+ }
+ 
+ static int ReadFlashBlock(SDL_DriverSwitch2_Context *ctx, Uint32 address, Uint8 *out)
+@@ -365,6 +386,78 @@ static bool FindBulkEndpoints(SDL_LibUSBContext *libusb, libusb_device_handle *h
+     return false;
+ }
+ 
++static void ReleaseVendorInterface(SDL_DriverSwitch2_Context *ctx)
++{
++#ifdef SDL_PLATFORM_MACOS
++    if (ctx->interface_claimed) {
++        ctx->libusb->release_interface(ctx->device_handle, ctx->interface_number);
++        ctx->interface_claimed = false;
++    }
++    if (ctx->own_device_handle && ctx->device_handle) {
++        ctx->libusb->close(ctx->device_handle);
++    }
++    ctx->device_handle = NULL;
++    ctx->own_device_handle = false;
++    if (ctx->usb_context) {
++        ctx->libusb->exit(ctx->usb_context);
++        ctx->usb_context = NULL;
++    }
++#else
++    (void)ctx;
++#endif
++}
++
++static bool AcquireVendorInterface(SDL_DriverSwitch2_Context *ctx)
++{
++#ifdef SDL_PLATFORM_MACOS
++    if (ctx->device_handle) {
++        return true;
++    }
++    if (!ctx->libusb) {
++        return false;
++    }
++    if (ctx->libusb->init(&ctx->usb_context) != 0) {
++        ctx->usb_context = NULL;
++        return false;
++    }
++    {
++        libusb_device **usb_list = NULL;
++        ssize_t usb_count = ctx->libusb->get_device_list(ctx->usb_context, &usb_list);
++        for (ssize_t di = 0; di < usb_count; di++) {
++            struct libusb_device_descriptor desc;
++            if (ctx->libusb->get_device_descriptor(usb_list[di], &desc) == 0 &&
++                desc.idVendor == ctx->device->vendor_id &&
++                desc.idProduct == ctx->device->product_id) {
++                if (ctx->libusb->open(usb_list[di], &ctx->device_handle) == 0) {
++                    ctx->own_device_handle = true;
++                    break;
++                }
++            }
++        }
++        if (usb_list) {
++            ctx->libusb->free_device_list(usb_list, 1);
++        }
++    }
++    if (!ctx->device_handle) {
++        ctx->libusb->exit(ctx->usb_context);
++        ctx->usb_context = NULL;
++        return false;
++    }
++    if (!FindBulkEndpoints(ctx->libusb, ctx->device_handle, &ctx->interface_number, &ctx->out_endpoint, &ctx->in_endpoint)) {
++        ReleaseVendorInterface(ctx);
++        return false;
++    }
++    if (ctx->libusb->claim_interface(ctx->device_handle, ctx->interface_number) < 0) {
++        ReleaseVendorInterface(ctx);
++        return false;
++    }
++    ctx->interface_claimed = true;
++    return true;
++#else
++    return ctx->device_handle != NULL;
++#endif
++}
++
+ static bool HIDAPI_DriverSwitch2_InitUSB(SDL_HIDAPI_Device *device)
+ {
+     SDL_DriverSwitch2_Context *ctx = (SDL_DriverSwitch2_Context *)device->context;
+@@ -373,6 +466,27 @@ static bool HIDAPI_DriverSwitch2_InitUSB(SDL_HIDAPI_Device *device)
+         return false;
+     }
+ 
++#ifdef SDL_PLATFORM_MACOS
++    /* The OS HID driver owns the HID interface and libusb cannot detach it
++     * on macOS, so the hidapi libusb backend never opens this device and no
++     * handle property exists. Instead, open our own handle and use only the
++     * vendor bulk interface, which no kernel driver claims. Input reports
++     * still arrive through device->dev via the platform HID backend. */
++    /* Another process may hold the vendor interface for its own init at
++     * this exact moment (it releases within a few hundred ms), so retry
++     * briefly before giving up. */
++    int res;
++    int claim_attempts;
++    for (claim_attempts = 0; claim_attempts < 5; claim_attempts++) {
++        if (AcquireVendorInterface(ctx)) {
++            break;
++        }
++        SDL_Delay(100);
++    }
++    if (claim_attempts == 5) {
++        return SDL_SetError("Couldn't open Switch 2 vendor interface");
++    }
++#else
+     ctx->device_handle = (libusb_device_handle *)SDL_GetPointerProperty(SDL_hid_get_properties(device->dev), SDL_PROP_HIDAPI_LIBUSB_DEVICE_HANDLE_POINTER, NULL);
+     if (!ctx->device_handle) {
+         return SDL_SetError("Couldn't get libusb device handle");
+@@ -388,6 +502,7 @@ static bool HIDAPI_DriverSwitch2_InitUSB(SDL_HIDAPI_Device *device)
+         return SDL_SetError("Couldn't claim interface %d: %d\n", ctx->interface_number, res);
+     }
+     ctx->interface_claimed = true;
++#endif
+ 
+     const Uint8 *init_sequence[] = {
+         (Uint8[]) { // Unknown purpose
+@@ -498,11 +613,13 @@ static bool HIDAPI_DriverSwitch2_InitUSB(SDL_HIDAPI_Device *device)
+     for (int i = 0; init_sequence[i]; i++) {
+         res = SendBulkData(ctx, init_sequence[i], init_sequence[i][5] + 8);
+         if (res < 0) {
++            ReleaseVendorInterface(ctx);
+             return SDL_SetError("Couldn't send initialization data: %d\n", res);
+         }
+         RecvBulkData(ctx, calibration_data, 0x40);
+     }
+ 
++    ReleaseVendorInterface(ctx);
+     return true;
+ }
+ 
+@@ -671,11 +788,16 @@ static bool HIDAPI_DriverSwitch2_SetJoystickSensorsEnabled(SDL_HIDAPI_Device *de
+         if (enabled) {
+             data[8] |= 4;
+         }
++        if (!AcquireVendorInterface(ctx)) {
++            return SDL_SetError("Couldn't acquire vendor interface for sensors");
++        }
+         int res = SendBulkData(ctx, data, sizeof(data));
+         if (res < 0) {
++            ReleaseVendorInterface(ctx);
+             return SDL_SetError("Couldn't set sensors enabled: %d\n", res);
+         }
+         RecvBulkData(ctx, reply, sizeof(reply));
++        ReleaseVendorInterface(ctx);
+     }
+     ctx->sensors_enabled = true;
+     return true;
+@@ -1176,8 +1298,11 @@ static void HIDAPI_DriverSwitch2_HandleStatePacket(SDL_HIDAPI_Device *device, SD
+                 };
+                 unsigned char reply[12] = {0};
+ 
+-                SendBulkData(ctx, set_features, sizeof(set_features));
+-                RecvBulkData(ctx, reply, sizeof(reply));
++                if (AcquireVendorInterface(ctx)) {
++                    SendBulkData(ctx, set_features, sizeof(set_features));
++                    RecvBulkData(ctx, reply, sizeof(reply));
++                    ReleaseVendorInterface(ctx);
++                }
+             }
+         }
+     }
+@@ -1301,6 +1426,17 @@ static void HIDAPI_DriverSwitch2_FreeDevice(SDL_HIDAPI_Device *device)
+             ctx->libusb->release_interface(ctx->device_handle, ctx->interface_number);
+             ctx->interface_claimed = false;
+         }
++#ifdef SDL_PLATFORM_MACOS
++        if (ctx->own_device_handle && ctx->device_handle) {
++            ctx->libusb->close(ctx->device_handle);
++            ctx->device_handle = NULL;
++            ctx->own_device_handle = false;
++        }
++        if (ctx->usb_context) {
++            ctx->libusb->exit(ctx->usb_context);
++            ctx->usb_context = NULL;
++        }
++#endif
+         if (ctx->libusb) {
+             SDL_QuitLibUSB();
+             ctx->libusb = NULL;
+diff --git a/src/misc/SDL_libusb.c b/src/misc/SDL_libusb.c
+index 2a5aff4..b7a831e 100644
+--- a/src/misc/SDL_libusb.c
++++ b/src/misc/SDL_libusb.c
+@@ -43,6 +43,17 @@ bool SDL_InitLibUSB(SDL_LibUSBContext **ctx)
+     if (SDL_AtomicIncRef(&SDL_libusb_refcount) == 0) {
+ #ifdef SDL_LIBUSB_DYNAMIC
+         SDL_libusb_handle = SDL_LoadObject(SDL_LIBUSB_DYNAMIC);
++#ifdef SDL_PLATFORM_MACOS
++        /* The bare dylib name is not on dyld's default search path when
++         * libusb comes from a package manager, so fall back to the
++         * conventional install locations. */
++        if (!SDL_libusb_handle) {
++            SDL_libusb_handle = SDL_LoadObject("/opt/homebrew/lib/libusb-1.0.dylib");
++        }
++        if (!SDL_libusb_handle) {
++            SDL_libusb_handle = SDL_LoadObject("/usr/local/lib/libusb-1.0.dylib");
++        }
++#endif
+         if (SDL_libusb_handle)
+ #endif
+         {
+diff --git a/src/joystick/darwin/SDL_s2udpjoystick.c b/src/joystick/darwin/SDL_s2udpjoystick.c
+new file mode 100644
+index 0000000..5ba01a2
+--- /dev/null
++++ b/src/joystick/darwin/SDL_s2udpjoystick.c
+@@ -0,0 +1,515 @@
++/*
++  SDL_s2udpjoystick.c — joystick backend fed by the s2bridge UDP streams.
++
++  A Nintendo Switch 2 Pro Controller cannot be reached directly from this
++  process over Bluetooth on macOS (its BLE protocol needs a CoreBluetooth
++  client and a keep-alive regimen; see the companion bridge). Instead, a
++  user-space bridge process decodes each controller and re-broadcasts state
++  datagrams on localhost UDP; this driver turns those streams back into SDL
++  joysticks with rumble.
++
++  Multi-controller model: the bridge serves slot k on port BASE_PORT + k
++  (k in 0..MAX_SLOTS-1). The port number IS the controller identity — this
++  driver keeps one socket per slot, and each streaming slot appears as its
++  own joystick. Rumble written to a slot's socket reaches exactly that
++  controller.
++
++  Wire protocol (all little-endian, must match bridge.py):
++    State  (bridge -> us, 44 bytes):
++      "S2B1" | u32 seq | u32 buttons | f32 lx,ly,rx,ry | u8 lt,rt
++             | u16 battery_mv | i16 gyro[3] | i16 accel[3]
++    Rumble (us -> bridge, 6 bytes): "S2R1" | u8 strong | u8 weak
++    Any datagram we send also registers us as a subscriber (30 s TTL),
++    so a "hello" is sent every HELLO_INTERVAL_MS per slot.
++
++  Presence: a slot's joystick exists while its state datagrams are fresher
++  than PRESENCE_TIMEOUT_MS; SDL hotplug events fire on both edges. Because
++  apps may enumerate immediately after SDL_Init (gopher64's input wizard
++  does), Init synchronously waits up to ~300 ms for already-streaming slots.
++
++  Exposed layout per joystick (fixed):
++    buttons: 0=B 1=A 2=Y 3=X 4=MINUS 5=HOME 6=PLUS 7=LSTICK 8=RSTICK
++             9=L 10=R 11=DPAD_UP 12=DPAD_DOWN 13=DPAD_LEFT 14=DPAD_RIGHT
++             15=CAPTURE 16=GR 17=GL 18=C
++    axes:    0=LX 1=LY 2=RX 3=RY 4=ZL 5=ZR  (Y inverted to SDL's
++             down-positive convention; triggers span the full Sint16 range)
++*/
++
++#include "SDL_internal.h"
++
++#ifdef SDL_PLATFORM_MACOS
++
++#include "../SDL_sysjoystick.h"
++#include "../SDL_joystick_c.h"
++
++#include <arpa/inet.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <netinet/in.h>
++#include <sys/select.h>
++#include <sys/socket.h>
++#include <unistd.h>
++
++#define S2UDP_BASE_PORT       24800
++#define S2UDP_MAX_SLOTS       4
++#define S2UDP_STATE_SIZE      44
++#define PRESENCE_TIMEOUT_MS   2000
++#define HELLO_INTERVAL_MS     5000
++#define RUMBLE_RESEND_MS      200
++
++// Switch button bitmask (subset we map), matching the BLE report layout.
++#define S2_BTN_Y       0x00000001u
++#define S2_BTN_X       0x00000002u
++#define S2_BTN_B       0x00000004u
++#define S2_BTN_A       0x00000008u
++#define S2_BTN_R       0x00000040u
++#define S2_BTN_MINUS   0x00000100u
++#define S2_BTN_PLUS    0x00000200u
++#define S2_BTN_RSTICK  0x00000400u
++#define S2_BTN_LSTICK  0x00000800u
++#define S2_BTN_HOME    0x00001000u
++#define S2_BTN_CAPTURE 0x00002000u
++#define S2_BTN_C       0x00004000u
++#define S2_BTN_DOWN    0x00010000u
++#define S2_BTN_UP      0x00020000u
++#define S2_BTN_RIGHT   0x00040000u
++#define S2_BTN_LEFT    0x00080000u
++#define S2_BTN_L       0x00400000u
++#define S2_BTN_GR      0x01000000u
++#define S2_BTN_GL      0x02000000u
++
++typedef struct
++{
++    int sock;                    // -1 when unavailable
++    bool present;
++    SDL_JoystickID instance_id;
++    Uint32 buttons;
++    float lx, ly, rx, ry;
++    Uint8 lt, rt;
++    Uint64 last_state_ms;
++    Uint64 last_hello_ms;
++    Uint16 rumble_strong, rumble_weak;
++    Uint64 last_rumble_ms;
++    char name[64];               // bridge-provided ("S2N1"); may be custom
++} S2UDP_Slot;
++
++static S2UDP_Slot s_slots[S2UDP_MAX_SLOTS];
++static bool s_initialized = false;
++
++static Uint32 read_u32(const Uint8 *p) { return (Uint32)(p[0] | (p[1] << 8) | (p[2] << 16) | ((Uint32)p[3] << 24)); }
++static float read_f32(const Uint8 *p)
++{
++    Uint32 bits = read_u32(p);
++    float value;
++    SDL_memcpy(&value, &bits, sizeof value);
++    return value;
++}
++
++static void S2UDP_SendHello(S2UDP_Slot *slot)
++{
++    if (slot->sock >= 0) {
++        (void)send(slot->sock, "", 0, 0);
++        slot->last_hello_ms = SDL_GetTicks();
++    }
++}
++
++static void S2UDP_SendRumble(S2UDP_Slot *slot)
++{
++    if (slot->sock >= 0) {
++        Uint8 pkt[6] = { 'S', '2', 'R', '1',
++                         (Uint8)(slot->rumble_strong >> 8),
++                         (Uint8)(slot->rumble_weak >> 8) };
++        (void)send(slot->sock, pkt, sizeof pkt, 0);
++        slot->last_rumble_ms = SDL_GetTicks();
++    }
++}
++
++/* Drain one slot's queued datagrams, keep the newest state, and run its
++ * presence state machine (hotplug on both edges). */
++static void S2UDP_PumpSlot(S2UDP_Slot *slot)
++{
++    Uint8 buf[128];
++    Uint64 now = SDL_GetTicks();
++
++    if (slot->sock < 0) {
++        return;
++    }
++    for (;;) {
++        ssize_t n = recv(slot->sock, buf, sizeof buf, 0);
++        if (n < 0) {
++            break; // EWOULDBLOCK: queue drained (or transient error; retry next pump)
++        }
++        if (n == S2UDP_STATE_SIZE && SDL_memcmp(buf, "S2B1", 4) == 0) {
++            slot->buttons = read_u32(buf + 8);
++            slot->lx = read_f32(buf + 12);
++            slot->ly = read_f32(buf + 16);
++            slot->rx = read_f32(buf + 20);
++            slot->ry = read_f32(buf + 24);
++            slot->lt = buf[28];
++            slot->rt = buf[29];
++            slot->last_state_ms = now;
++        } else if (n > 4 && n < 4 + (ssize_t)sizeof(slot->name) &&
++                   SDL_memcmp(buf, "S2N1", 4) == 0) {
++            // Bridge-provided display name (may be a user rename). A live
++            // rename hotplug-cycles the device so apps pick up the new name.
++            char incoming[sizeof(slot->name)];
++            SDL_memcpy(incoming, buf + 4, n - 4);
++            incoming[n - 4] = '\0';
++            if (SDL_strcmp(incoming, slot->name) != 0) {
++                SDL_strlcpy(slot->name, incoming, sizeof(slot->name));
++                if (slot->present) {
++                    slot->present = false;
++                    slot->last_state_ms = 0;   // re-add on next state packet
++                    SDL_PrivateJoystickRemoved(slot->instance_id);
++                }
++            }
++        }
++    }
++
++    if (now - slot->last_hello_ms >= HELLO_INTERVAL_MS) {
++        S2UDP_SendHello(slot);
++    }
++
++    if (!slot->present && slot->last_state_ms &&
++        now - slot->last_state_ms < PRESENCE_TIMEOUT_MS) {
++        slot->present = true;
++        slot->instance_id = SDL_GetNextObjectID();
++        SDL_PrivateJoystickAdded(slot->instance_id);
++    } else if (slot->present && now - slot->last_state_ms >= PRESENCE_TIMEOUT_MS) {
++        slot->present = false;
++        SDL_PrivateJoystickRemoved(slot->instance_id);
++    }
++}
++
++static void S2UDP_PumpAll(void)
++{
++    int k;
++    for (k = 0; k < S2UDP_MAX_SLOTS; ++k) {
++        S2UDP_PumpSlot(&s_slots[k]);
++    }
++}
++
++/* device_index counts only present slots; return that slot (or NULL). */
++static S2UDP_Slot *S2UDP_SlotForIndex(int device_index)
++{
++    int k;
++    for (k = 0; k < S2UDP_MAX_SLOTS; ++k) {
++        if (s_slots[k].present && device_index-- == 0) {
++            return &s_slots[k];
++        }
++    }
++    return NULL;
++}
++
++static int S2UDP_SlotNumber(const S2UDP_Slot *slot)
++{
++    return (int)(slot - s_slots);
++}
++
++static bool S2UDP_JoystickInit(void)
++{
++    int k;
++
++    for (k = 0; k < S2UDP_MAX_SLOTS; ++k) {
++        s_slots[k].sock = -1;
++    }
++    if (SDL_getenv("SDL_S2UDP_DISABLE")) {
++        return true; // stay registered but inert
++    }
++    for (k = 0; k < S2UDP_MAX_SLOTS; ++k) {
++        struct sockaddr_in addr;
++        int sock = socket(AF_INET, SOCK_DGRAM, 0);
++        if (sock < 0) {
++            continue;
++        }
++        fcntl(sock, F_SETFL, O_NONBLOCK);
++        SDL_zero(addr);
++        addr.sin_family = AF_INET;
++        addr.sin_port = htons(S2UDP_BASE_PORT + k);
++        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++        if (connect(sock, (struct sockaddr *)&addr, sizeof addr) < 0) {
++            close(sock);
++            continue;
++        }
++        s_slots[k].sock = sock;
++        S2UDP_SendHello(&s_slots[k]);
++    }
++    s_initialized = true;
++
++    /* Presence must be established synchronously for already-streaming
++     * controllers: apps (e.g. gopher64's input wizard) enumerate joysticks
++     * immediately after SDL_Init, before any Detect() pump has run. Wait
++     * briefly; when nothing at all is readable the bridge is idle or absent
++     * and we fall back to normal hotplug. */
++    {
++        Uint64 deadline = SDL_GetTicks() + 300;
++        while (SDL_GetTicks() < deadline) {
++            fd_set readfds;
++            struct timeval tv = { 0, 50 * 1000 };
++            int maxfd = -1;
++            FD_ZERO(&readfds);
++            for (k = 0; k < S2UDP_MAX_SLOTS; ++k) {
++                if (s_slots[k].sock >= 0) {
++                    FD_SET(s_slots[k].sock, &readfds);
++                    if (s_slots[k].sock > maxfd) {
++                        maxfd = s_slots[k].sock;
++                    }
++                }
++            }
++            if (maxfd < 0 || select(maxfd + 1, &readfds, NULL, NULL, &tv) <= 0) {
++                break; // timeout with nothing readable: bridge idle or absent
++            }
++            S2UDP_PumpAll();
++        }
++    }
++    return true;
++}
++
++static int S2UDP_JoystickGetCount(void)
++{
++    int k, count = 0;
++    for (k = 0; k < S2UDP_MAX_SLOTS; ++k) {
++        if (s_slots[k].present) {
++            ++count;
++        }
++    }
++    return count;
++}
++
++static void S2UDP_JoystickDetect(void)
++{
++    S2UDP_PumpAll();
++}
++
++static bool S2UDP_JoystickIsDevicePresent(Uint16 vendor_id, Uint16 product_id, Uint16 version, const char *name)
++{
++    return S2UDP_JoystickGetCount() > 0 && vendor_id == 0x057E && product_id == 0x2069;
++}
++
++static const char *S2UDP_JoystickGetDeviceName(int device_index)
++{
++    static const char *names[S2UDP_MAX_SLOTS] = {
++        "Switch 2 Controller (Bluetooth)",
++        "Switch 2 Controller (Bluetooth 2)",
++        "Switch 2 Controller (Bluetooth 3)",
++        "Switch 2 Controller (Bluetooth 4)",
++    };
++    S2UDP_Slot *slot = S2UDP_SlotForIndex(device_index);
++    if (slot && slot->name[0]) {
++        return slot->name;
++    }
++    return names[slot ? S2UDP_SlotNumber(slot) : 0];
++}
++
++static const char *S2UDP_JoystickGetDevicePath(int device_index)
++{
++    static const char *paths[S2UDP_MAX_SLOTS] = {
++        "udp://127.0.0.1:24800", "udp://127.0.0.1:24801",
++        "udp://127.0.0.1:24802", "udp://127.0.0.1:24803",
++    };
++    S2UDP_Slot *slot = S2UDP_SlotForIndex(device_index);
++    return paths[slot ? S2UDP_SlotNumber(slot) : 0];
++}
++
++static int S2UDP_JoystickGetDeviceSteamVirtualGamepadSlot(int device_index)
++{
++    return -1;
++}
++
++static int S2UDP_JoystickGetDevicePlayerIndex(int device_index)
++{
++    return -1;
++}
++
++static void S2UDP_JoystickSetDevicePlayerIndex(int device_index, int player_index)
++{
++}
++
++static SDL_GUID S2UDP_JoystickGetDeviceGUID(int device_index)
++{
++    /* Distinct driver signature 'u' keeps these GUIDs from colliding with
++     * mapping-database entries for the USB/HIDAPI flavors of this pad;
++     * driver_data carries the slot so each controller's GUID is unique. */
++    S2UDP_Slot *slot = S2UDP_SlotForIndex(device_index);
++    return SDL_CreateJoystickGUID(SDL_HARDWARE_BUS_BLUETOOTH, 0x057E, 0x2069, 0,
++                                  "Nintendo", "Switch 2 Pro Controller", 'u',
++                                  slot ? (Uint8)S2UDP_SlotNumber(slot) : 0);
++}
++
++static SDL_JoystickID S2UDP_JoystickGetDeviceInstanceID(int device_index)
++{
++    S2UDP_Slot *slot = S2UDP_SlotForIndex(device_index);
++    return slot ? slot->instance_id : 0;
++}
++
++static bool S2UDP_JoystickOpen(SDL_Joystick *joystick, int device_index)
++{
++    S2UDP_Slot *slot = S2UDP_SlotForIndex(device_index);
++    if (!slot) {
++        return SDL_SetError("S2UDP joystick %d not present", device_index);
++    }
++    joystick->nbuttons = 19;
++    joystick->naxes = 6;
++    joystick->nhats = 0;
++    joystick->hwdata = (struct joystick_hwdata *)slot;
++    return true;
++}
++
++static bool S2UDP_JoystickRumble(SDL_Joystick *joystick, Uint16 low_frequency_rumble, Uint16 high_frequency_rumble)
++{
++    S2UDP_Slot *slot = (S2UDP_Slot *)joystick->hwdata;
++    if (!slot) {
++        return SDL_Unsupported();
++    }
++    slot->rumble_strong = low_frequency_rumble;
++    slot->rumble_weak = high_frequency_rumble;
++    S2UDP_SendRumble(slot);
++    return true;
++}
++
++static bool S2UDP_JoystickRumbleTriggers(SDL_Joystick *joystick, Uint16 left_rumble, Uint16 right_rumble)
++{
++    return SDL_Unsupported();
++}
++
++static bool S2UDP_JoystickSetLED(SDL_Joystick *joystick, Uint8 red, Uint8 green, Uint8 blue)
++{
++    return SDL_Unsupported();
++}
++
++static bool S2UDP_JoystickSendEffect(SDL_Joystick *joystick, const void *data, int size)
++{
++    return SDL_Unsupported();
++}
++
++static bool S2UDP_JoystickSetSensorsEnabled(SDL_Joystick *joystick, bool enabled)
++{
++    return SDL_Unsupported();
++}
++
++static Sint16 S2UDP_AxisFromFloat(float value)
++{
++    if (value < -1.0f) value = -1.0f;
++    if (value > 1.0f) value = 1.0f;
++    return (Sint16)(value * 32767.0f);
++}
++
++static Sint16 S2UDP_AxisFromTrigger(Uint8 value)
++{
++    // 0..255 -> SDL_JOYSTICK_AXIS_MIN..MAX (rest = fully negative)
++    return (Sint16)(((int)value * 65535 / 255) - 32768);
++}
++
++static void S2UDP_JoystickUpdate(SDL_Joystick *joystick)
++{
++    static const struct { Uint8 index; Uint32 mask; } button_map[] = {
++        { 0, S2_BTN_B }, { 1, S2_BTN_A }, { 2, S2_BTN_Y }, { 3, S2_BTN_X },
++        { 4, S2_BTN_MINUS }, { 5, S2_BTN_HOME }, { 6, S2_BTN_PLUS },
++        { 7, S2_BTN_LSTICK }, { 8, S2_BTN_RSTICK },
++        { 9, S2_BTN_L }, { 10, S2_BTN_R },
++        { 11, S2_BTN_UP }, { 12, S2_BTN_DOWN }, { 13, S2_BTN_LEFT }, { 14, S2_BTN_RIGHT },
++        { 15, S2_BTN_CAPTURE }, { 16, S2_BTN_GR }, { 17, S2_BTN_GL }, { 18, S2_BTN_C },
++    };
++    S2UDP_Slot *slot = (S2UDP_Slot *)joystick->hwdata;
++    Uint64 timestamp = SDL_GetTicksNS();
++    int i;
++
++    S2UDP_PumpAll();
++    if (!slot || !slot->present) {
++        return;
++    }
++
++    for (i = 0; i < (int)SDL_arraysize(button_map); ++i) {
++        SDL_SendJoystickButton(timestamp, joystick, button_map[i].index,
++                               (slot->buttons & button_map[i].mask) != 0);
++    }
++    SDL_SendJoystickAxis(timestamp, joystick, 0, S2UDP_AxisFromFloat(slot->lx));
++    SDL_SendJoystickAxis(timestamp, joystick, 1, S2UDP_AxisFromFloat(-slot->ly));
++    SDL_SendJoystickAxis(timestamp, joystick, 2, S2UDP_AxisFromFloat(slot->rx));
++    SDL_SendJoystickAxis(timestamp, joystick, 3, S2UDP_AxisFromFloat(-slot->ry));
++    SDL_SendJoystickAxis(timestamp, joystick, 4, S2UDP_AxisFromTrigger(slot->lt));
++    SDL_SendJoystickAxis(timestamp, joystick, 5, S2UDP_AxisFromTrigger(slot->rt));
++
++    // Sustain active rumble: the bridge expires intents after 500 ms so a
++    // crashed consumer can never leave the motor running.
++    if ((slot->rumble_strong || slot->rumble_weak) &&
++        SDL_GetTicks() - slot->last_rumble_ms >= RUMBLE_RESEND_MS) {
++        S2UDP_SendRumble(slot);
++    }
++}
++
++static void S2UDP_JoystickClose(SDL_Joystick *joystick)
++{
++    joystick->hwdata = NULL;
++}
++
++static void S2UDP_JoystickQuit(void)
++{
++    int k;
++    for (k = 0; k < S2UDP_MAX_SLOTS; ++k) {
++        if (s_slots[k].sock >= 0) {
++            close(s_slots[k].sock);
++        }
++        SDL_zero(s_slots[k]);
++        s_slots[k].sock = -1;
++    }
++    s_initialized = false;
++}
++
++static bool S2UDP_JoystickGetGamepadMapping(int device_index, SDL_GamepadMapping *out)
++{
++    SDL_zerop(out);
++
++    out->a.kind = EMappingKind_Button;             out->a.target = 1;  // east = A
++    out->b.kind = EMappingKind_Button;             out->b.target = 0;  // south = B
++    out->x.kind = EMappingKind_Button;             out->x.target = 3;  // north = X
++    out->y.kind = EMappingKind_Button;             out->y.target = 2;  // west = Y
++    out->back.kind = EMappingKind_Button;          out->back.target = 4;
++    out->guide.kind = EMappingKind_Button;         out->guide.target = 5;
++    out->start.kind = EMappingKind_Button;         out->start.target = 6;
++    out->leftstick.kind = EMappingKind_Button;     out->leftstick.target = 7;
++    out->rightstick.kind = EMappingKind_Button;    out->rightstick.target = 8;
++    out->leftshoulder.kind = EMappingKind_Button;  out->leftshoulder.target = 9;
++    out->rightshoulder.kind = EMappingKind_Button; out->rightshoulder.target = 10;
++    out->dpup.kind = EMappingKind_Button;          out->dpup.target = 11;
++    out->dpdown.kind = EMappingKind_Button;        out->dpdown.target = 12;
++    out->dpleft.kind = EMappingKind_Button;        out->dpleft.target = 13;
++    out->dpright.kind = EMappingKind_Button;       out->dpright.target = 14;
++    out->misc1.kind = EMappingKind_Button;         out->misc1.target = 15;
++    out->right_paddle1.kind = EMappingKind_Button; out->right_paddle1.target = 16;
++    out->left_paddle1.kind = EMappingKind_Button;  out->left_paddle1.target = 17;
++    out->misc2.kind = EMappingKind_Button;         out->misc2.target = 18;
++    out->leftx.kind = EMappingKind_Axis;           out->leftx.target = 0;
++    out->lefty.kind = EMappingKind_Axis;           out->lefty.target = 1;
++    out->rightx.kind = EMappingKind_Axis;          out->rightx.target = 2;
++    out->righty.kind = EMappingKind_Axis;          out->righty.target = 3;
++    out->lefttrigger.kind = EMappingKind_Axis;     out->lefttrigger.target = 4;
++    out->righttrigger.kind = EMappingKind_Axis;    out->righttrigger.target = 5;
++    return true;
++}
++
++SDL_JoystickDriver SDL_S2UDP_JoystickDriver = {
++    S2UDP_JoystickInit,
++    S2UDP_JoystickGetCount,
++    S2UDP_JoystickDetect,
++    S2UDP_JoystickIsDevicePresent,
++    S2UDP_JoystickGetDeviceName,
++    S2UDP_JoystickGetDevicePath,
++    S2UDP_JoystickGetDeviceSteamVirtualGamepadSlot,
++    S2UDP_JoystickGetDevicePlayerIndex,
++    S2UDP_JoystickSetDevicePlayerIndex,
++    S2UDP_JoystickGetDeviceGUID,
++    S2UDP_JoystickGetDeviceInstanceID,
++    S2UDP_JoystickOpen,
++    S2UDP_JoystickRumble,
++    S2UDP_JoystickRumbleTriggers,
++    S2UDP_JoystickSetLED,
++    S2UDP_JoystickSendEffect,
++    S2UDP_JoystickSetSensorsEnabled,
++    S2UDP_JoystickUpdate,
++    S2UDP_JoystickClose,
++    S2UDP_JoystickQuit,
++    S2UDP_JoystickGetGamepadMapping,
++};
++
++#endif // SDL_PLATFORM_MACOS
