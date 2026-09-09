@@ -41,10 +41,18 @@ int main(void)
     unsigned char hello[64];
     socklen_t size = sizeof peer;
     CHECK(recvfrom(fd, hello, sizeof hello, 0, (struct sockaddr *)&peer, &size) >= 0);
-    packet(fd, &peer, 0, 0);
-    SDL_UpdateJoysticks();
     int count = 0;
-    SDL_JoystickID *ids = SDL_GetJoysticks(&count);
+    SDL_JoystickID *ids = NULL;
+    // SDL throttles device discovery independently of packet delivery.
+    // Wait for registration, not for the input edges tested below.
+    Uint64 deadline = SDL_GetTicks() + 1500;
+    do {
+        packet(fd, &peer, 0, 0);
+        SDL_Delay(10);
+        SDL_UpdateJoysticks();
+        SDL_free(ids);
+        ids = SDL_GetJoysticks(&count);
+    } while (count == 0 && SDL_GetTicks() < deadline);
     CHECK(count == 1 && ids);
     SDL_Joystick *joy = SDL_OpenJoystick(ids[0]);
     SDL_JoystickID id = ids[0];
