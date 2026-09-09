@@ -47,6 +47,16 @@ enum UDPTests {
         precondition(n >= 0, "Expected UDP packet was not delivered")
         return Data(bytes.prefix(n))
     }
+    static func sendAndDrain(_ hub: UDPHub, slot: Int, fd: Int32, bytes: [UInt8]) {
+        // Hold the hub's serial queue so its dispatch source cannot consume
+        // the packet between poll() and the explicit production drain call.
+        hub.queue.sync {
+            sendBytes(fd, bytes)
+            var ready = pollfd(fd: hub.slots[slot]!.fd, events: Int16(POLLIN), revents: 0)
+            precondition(poll(&ready, 1, 1000) == 1, "Loopback packet did not arrive")
+            hub.drainSocket(slot: slot)
+        }
+    }
     static func main() {
         let selected = CommandLine.arguments.last!
         let hub = UDPHub()
@@ -72,9 +82,8 @@ enum UDPTests {
         }
         if selected == "all" || selected == "malformed" {
             let c = client(24802); defer { close(c) }
-            sendBytes(c, [1, 2, 3])
+            sendAndDrain(hub, slot: 2, fd: c, bytes: [1, 2, 3])
             hub.queue.sync {
-                hub.drainSocket(slot: 2)
                 precondition(hub.slots[2]!.peers.isEmpty, "Malformed packets must not allocate subscribers")
             }
             print("PASS malformed subscription rejection")
@@ -87,16 +96,14 @@ enum UDPTests {
                 }
             }
             let c = client(24803); defer { close(c) }
-            sendBytes(c, [])
+            sendAndDrain(hub, slot: 3, fd: c, bytes: [])
             hub.queue.sync {
-                hub.drainSocket(slot: 3)
                 precondition(hub.slots[3]!.peers.count == 64, "Peer table must stay bounded")
             }
             // Expired peers must not block a new subscriber even without state traffic.
             hub.queue.sync { hub.slots[3]!.peers = hub.slots[3]!.peers.mapValues { _ in -100 } }
-            sendBytes(c, [])
+            sendAndDrain(hub, slot: 3, fd: c, bytes: [])
             hub.queue.sync {
-                hub.drainSocket(slot: 3)
                 precondition(hub.slots[3]!.peers.count == 1)
             }
             print("PASS peer cap and expiry without input")
