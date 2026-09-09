@@ -153,9 +153,9 @@ final class WebSocketHub: ControllerOutputSink, @unchecked Sendable {
               let type = object["t"] as? String else { return }
         if type == "rumble" {
             guard let slot = object["slot"] as? Int, (0..<4).contains(slot), connected[slot]?.rumble == true,
-                  let strong = object["strong"] as? Double, strong.isFinite,
-                  let weak = object["weak"] as? Double, weak.isFinite else { return }
-            let strong = min(1, max(0, strong)), weak = min(1, max(0, weak))
+                  let rawStrong = object["strong"] as? Double, rawStrong.isFinite,
+                  let rawWeak = object["weak"] as? Double, rawWeak.isFinite else { return }
+            let strong = min(1, max(0, rawStrong)), weak = min(1, max(0, rawWeak))
             if strong == 0 && weak == 0 {
                 guard rumbleOwners[slot] == id else { return }
                 rumbleOwners.removeValue(forKey: slot)
