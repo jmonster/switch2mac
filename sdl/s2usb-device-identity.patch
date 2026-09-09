@@ -1,0 +1,85 @@
+--- a/src/joystick/hidapi/SDL_hidapi_switch2.c
++++ b/src/joystick/hidapi/SDL_hidapi_switch2.c
+@@ -417,10 +417,55 @@
++#ifdef SDL_PLATFORM_MACOS
++#include <IOKit/IOKitLib.h>
++
++/* Match the opened HID service's USB ancestor, never just its model. */
++static bool S2USB_GetIdentity(const char *path, Uint8 *bus, Uint8 *address)
++{
++    unsigned long long identifier = 0;
++    char trailing;
++    if (!path || SDL_sscanf(path, "DevSrvsID:%llu%c", &identifier, &trailing) != 1) {
++        return false;
++    }
++    io_registry_entry_t entry = IOServiceGetMatchingService(kIOMainPortDefault,
++                                                            IORegistryEntryIDMatching(identifier));
++    while (entry && !IOObjectConformsTo(entry, "IOUSBHostDevice") &&
++           !IOObjectConformsTo(entry, "IOUSBDevice")) {
++        io_registry_entry_t parent = IO_OBJECT_NULL;
++        kern_return_t result = IORegistryEntryGetParentEntry(entry, kIOServicePlane, &parent);
++        IOObjectRelease(entry);
++        if (result != KERN_SUCCESS) return false;
++        entry = parent;
++    }
++    if (!entry) return false;
++    CFTypeRef location = IORegistryEntryCreateCFProperty(entry, CFSTR("locationID"), kCFAllocatorDefault, 0);
++    CFTypeRef device_address = IORegistryEntryCreateCFProperty(entry, CFSTR("USB Address"), kCFAllocatorDefault, 0);
++    if (!device_address) {
++        device_address = IORegistryEntryCreateCFProperty(entry, CFSTR("USBDeviceAddress"), kCFAllocatorDefault, 0);
++    }
++    Sint64 loc = -1, addr = -1;
++    bool valid = location && device_address &&
++        CFGetTypeID(location) == CFNumberGetTypeID() &&
++        CFGetTypeID(device_address) == CFNumberGetTypeID() &&
++        CFNumberGetValue((CFNumberRef)location, kCFNumberSInt64Type, &loc) &&
++        CFNumberGetValue((CFNumberRef)device_address, kCFNumberSInt64Type, &addr) &&
++        loc >= 0 && loc <= 0xffffffffLL && addr > 0 && addr <= 127;
++    if (location) CFRelease(location);
++    if (device_address) CFRelease(device_address);
++    IOObjectRelease(entry);
++    if (!valid) return false;
++    *bus = (Uint8)((Uint32)loc >> 24);
++    *address = (Uint8)addr;
++    return true;
++}
++#endif
++
+ static bool AcquireVendorInterface(SDL_DriverSwitch2_Context *ctx)
+ {
+ #ifdef SDL_PLATFORM_MACOS
+     if (ctx->device_handle) {
+         return true;
+     }
+-    if (!ctx->libusb) {
++    Uint8 bus = 0, address = 0;
++    if (!ctx->libusb || !S2USB_GetIdentity(ctx->device->path, &bus, &address)) {
+         return false;
+     }
+     if (ctx->libusb->init(&ctx->usb_context) != 0) {
+@@ -430,16 +475,20 @@
+     {
+         libusb_device **usb_list = NULL;
+         ssize_t usb_count = ctx->libusb->get_device_list(ctx->usb_context, &usb_list);
++        libusb_device *matched = NULL;
+         for (ssize_t di = 0; di < usb_count; di++) {
+             struct libusb_device_descriptor desc;
+             if (ctx->libusb->get_device_descriptor(usb_list[di], &desc) == 0 &&
+                 desc.idVendor == ctx->device->vendor_id &&
+-                desc.idProduct == ctx->device->product_id) {
+-                if (ctx->libusb->open(usb_list[di], &ctx->device_handle) == 0) {
+-                    ctx->own_device_handle = true;
+-                    break;
+-                }
++                desc.idProduct == ctx->device->product_id &&
++                ctx->libusb->get_bus_number(usb_list[di]) == bus &&
++                ctx->libusb->get_device_address(usb_list[di]) == address) {
++                if (matched) { matched = NULL; break; } // ambiguous: no command
++                matched = usb_list[di];
+             }
++        }
++        if (matched && ctx->libusb->open(matched, &ctx->device_handle) == 0) {
++            ctx->own_device_handle = true;
+         }
+         if (usb_list) {
+             ctx->libusb->free_device_list(usb_list, 1);
