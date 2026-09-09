@@ -21,7 +21,7 @@ static void packet(int fd, const struct sockaddr_in *to, unsigned buttons,
 static void drain_events(void)
 {
     SDL_Event event;
-    while (SDL_PollEvent(&event)) {}
+    while (SDL_PeepEvents(&event, 1, SDL_GETEVENT, SDL_EVENT_FIRST, SDL_EVENT_LAST) > 0) {}
 }
 
 int main(void)
@@ -38,6 +38,7 @@ int main(void)
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI, "0");
     CHECK(SDL_Init(SDL_INIT_JOYSTICK));
+    SDL_SetJoystickEventsEnabled(true);
     unsigned char hello[64];
     socklen_t size = sizeof peer;
     CHECK(recvfrom(fd, hello, sizeof hello, 0, (struct sockaddr *)&peer, &size) >= 0);
@@ -58,16 +59,23 @@ int main(void)
     SDL_JoystickID id = ids[0];
     SDL_free(ids);
     CHECK(joy);
-    SDL_UpdateJoysticks();
+    // Establish both resting axis value and real activity before the edge
+    // test; SDL suppresses initial analog jitter until an axis first moves.
+    packet(fd, &peer, 8, 128);
+    SDL_Delay(10); SDL_UpdateJoysticks();
+    CHECK(SDL_GetJoystickButton(joy, 1));
+    packet(fd, &peer, 0, 0);
+    SDL_Delay(10); SDL_UpdateJoysticks();
+    CHECK(!SDL_GetJoystickButton(joy, 1));
     drain_events();
 
     // A complete tap and a full trigger excursion queued before one update.
     packet(fd, &peer, 8, 255);   // Nintendo A -> existing joystick button 1
     packet(fd, &peer, 0, 0);
-    SDL_UpdateJoysticks();
+    SDL_Delay(10); SDL_UpdateJoysticks();
     int downs = 0, ups = 0, trigger_down = 0, trigger_up = 0;
     SDL_Event event;
-    while (SDL_PollEvent(&event)) {
+    while (SDL_PeepEvents(&event, 1, SDL_GETEVENT, SDL_EVENT_FIRST, SDL_EVENT_LAST) > 0) {
         if (event.type == SDL_EVENT_JOYSTICK_BUTTON_DOWN && event.jbutton.which == id && event.jbutton.button == 1) {
             CHECK(ups == 0); ++downs;
         }
@@ -90,9 +98,9 @@ int main(void)
     // Two taps in one pump, including a simultaneous shoulder button.
     packet(fd, &peer, 8 | 0x400000, 0); packet(fd, &peer, 0, 0);
     packet(fd, &peer, 8, 0); packet(fd, &peer, 0, 0);
-    SDL_UpdateJoysticks();
+    SDL_Delay(10); SDL_UpdateJoysticks();
     downs = ups = 0;
-    while (SDL_PollEvent(&event)) {
+    while (SDL_PeepEvents(&event, 1, SDL_GETEVENT, SDL_EVENT_FIRST, SDL_EVENT_LAST) > 0) {
         if (event.type == SDL_EVENT_JOYSTICK_BUTTON_DOWN && event.jbutton.button == 1) ++downs;
         if (event.type == SDL_EVENT_JOYSTICK_BUTTON_UP && event.jbutton.button == 1) ++ups;
     }
@@ -100,11 +108,11 @@ int main(void)
 
     // Close/reopen must not leave a dangling pointer used by packet delivery.
     SDL_CloseJoystick(joy);
-    packet(fd, &peer, 8, 0); SDL_UpdateJoysticks();
+    packet(fd, &peer, 8, 0); SDL_Delay(10); SDL_UpdateJoysticks();
     joy = SDL_OpenJoystick(id); CHECK(joy);
     SDL_UpdateJoysticks();
     CHECK(SDL_GetJoystickButton(joy, 1));
-    packet(fd, &peer, 0, 0); SDL_UpdateJoysticks();
+    packet(fd, &peer, 0, 0); SDL_Delay(10); SDL_UpdateJoysticks();
     CHECK(!SDL_GetJoystickButton(joy, 1));
     SDL_CloseJoystick(joy); SDL_Quit(); close(fd);
     puts("SDL queued-edge, analog-trigger and reopen regressions passed.");
