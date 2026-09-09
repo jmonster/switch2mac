@@ -298,7 +298,10 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     }
 
     private func handleCommandResponse(_ data: Data) {
-        guard let pending = pendingCommand else { return }
+        // An unrelated notification must not consume the command or its timer.
+        guard let pending = pendingCommand, data.count >= 8,
+              data[data.startIndex] == pending.id,
+              data[data.startIndex + 1] == 0x01 || data[data.startIndex + 1] == 0x02 else { return }
         commandTimeout?.cancel()
         pendingCommand = nil
         // NFC experiments: log the COMPLETE frame (header included) — the
@@ -310,11 +313,6 @@ final class ControllerSession: NSObject, @unchecked Sendable {
         // status/error reply (same shape, payload starts with a status code).
         // Both correlate to our command — pass the payload up and let the
         // caller interpret the status byte.
-        guard data.count >= 8, data[data.startIndex] == pending.id,
-              data[data.startIndex + 1] == 0x01 || data[data.startIndex + 1] == 0x02 else {
-            pending.completion(nil)
-            return
-        }
         pending.completion(data.subdata(in: data.startIndex + 8 ..< data.endIndex))
     }
 
@@ -323,7 +321,8 @@ final class ControllerSession: NSObject, @unchecked Sendable {
         let payload = Switch2.memoryReadPayload(length: length, address: address)
         writeCommand(Switch2.Command.memory, Switch2.Subcommand.memoryRead, payload) { resp in
             guard let resp, resp.count >= 8 + Int(length),
-                  resp[resp.startIndex] == length else {
+                  resp[resp.startIndex] == length,
+                  Switch2.u32(resp, 4) == address else {
                 completion(nil); return
             }
             completion(resp.subdata(in: resp.startIndex + 8 ..< resp.endIndex))
@@ -572,8 +571,7 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     func setAudioCapture(_ enabled: Bool, completion: @escaping (Bool) -> Void) {
         queue.async { [weak self] in
             guard let self, let ch = self.chars[Self.audioInputUUID] else {
-                completion(false); return
-            }
+                completion(false); return }
             self.peripheral.setNotifyValue(enabled, for: ch)
             completion(true)
         }
@@ -604,7 +602,9 @@ final class ControllerSession: NSObject, @unchecked Sendable {
         // can never leave the motor running.
         if now - rumbleSetAt > 0.5 { strong = 0; weakMag = 0 }
 
-        if strong > 0.001 || weakMag > 0.001 || rumbleActive {
+        // The GameCube model explicitly lacks this motor protocol. Do not
+        // suppress its LED keep-alive when an unsupported rumble is requested.
+        if model.hasHDRumble && (strong > 0.001 || weakMag > 0.001 || rumbleActive) {
             let active = strong > 0.001 || weakMag > 0.001
             writeMotor(Switch2.Vibration.waveform(strong: strong, weak: weakMag))
             rumbleActive = active
@@ -617,7 +617,8 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     }
 
     private func writeMotor(_ vib: Switch2.Vibration) {
-        guard let motor = chars[Switch2.GATT.vibration(for: model)] else { return }
+        guard model.hasHDRumble,
+              let motor = chars[Switch2.GATT.vibration(for: model)] else { return }
         let packet = Switch2.motorPacket(vib, packetID: vibrationPacketID, model: model)
         vibrationPacketID &+= 1
         peripheral.writeValue(packet, for: motor, type: .withoutResponse)
@@ -625,6 +626,16 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     }
 
     // MARK: - Input reports
+
+    /// Nominal 12-bit range only when factory/user calibration is unavailable.
+    /// This is degraded, uncalibrated input, not a claim of factory accuracy.
+    private static func uncalibratedStick(_ raw: (UInt16, UInt16)) -> (Double, Double) {
+        func axis(_ value: UInt16) -> Double {
+            let offset = Double(value) - 2048
+            return max(-1, min(1, offset / (offset >= 0 ? 2047 : 2048)))
+        }
+        return (axis(raw.0), axis(raw.1))
+    }
 
     private func handleInputReport(_ data: Data) {
         guard let report = Switch2.InputReport(data: data) else { return }
@@ -641,14 +652,14 @@ final class ControllerSession: NSObject, @unchecked Sendable {
         switch model {
         case .joyCon2Left:
             // One stick, reporting in the first field, calibrated by slot 1.
-            s.leftStick = leftCal?.apply(report.leftStickRaw) ?? (0, 0)
+            s.leftStick = leftCal?.apply(report.leftStickRaw) ?? Self.uncalibratedStick(report.leftStickRaw)
         case .joyCon2Right:
             // One stick, reporting in the SECOND field — but calibrated by
             // the unit's slot-1 data (a Joy-Con has no slot-2 calibration).
-            s.rightStick = leftCal?.apply(report.rightStickRaw) ?? (0, 0)
+            s.rightStick = leftCal?.apply(report.rightStickRaw) ?? Self.uncalibratedStick(report.rightStickRaw)
         default:
-            s.leftStick = leftCal?.apply(report.leftStickRaw) ?? (0, 0)
-            s.rightStick = rightCal?.apply(report.rightStickRaw) ?? (0, 0)
+            s.leftStick = leftCal?.apply(report.leftStickRaw) ?? Self.uncalibratedStick(report.leftStickRaw)
+            s.rightStick = rightCal?.apply(report.rightStickRaw) ?? Self.uncalibratedStick(report.rightStickRaw)
         }
         if model.hasAnalogTriggers {
             s.leftTrigger = report.leftTriggerRaw
