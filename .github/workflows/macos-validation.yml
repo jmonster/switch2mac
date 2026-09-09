@@ -23,7 +23,7 @@ jobs:
           swift --version
           xcodebuild -version
           git archive HEAD -o "$RUNNER_TEMP/source.zip"
-      - name: Run controller protocol regressions (no radio required)
+      - name: Run controller protocol and output regressions (no radio required)
         run: bash tests/run.sh
       - name: Build the actual app bundle (ad-hoc signing only)
         run: |
