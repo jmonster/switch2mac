@@ -1,7 +1,8 @@
 --- a/src/joystick/hidapi/SDL_hidapi_switch2.c
 +++ b/src/joystick/hidapi/SDL_hidapi_switch2.c
-@@ -417,10 +417,55 @@
+@@ -417,10 +417,56 @@
 +#ifdef SDL_PLATFORM_MACOS
++#include <CoreFoundation/CFNumber.h>
 +#include <IOKit/IOKitLib.h>
 +
 +/* Match the opened HID service's USB ancestor, never just its model. */
@@ -57,7 +58,7 @@
          return false;
      }
      if (ctx->libusb->init(&ctx->usb_context) != 0) {
-@@ -430,16 +475,20 @@
+@@ -430,16 +476,20 @@
      {
          libusb_device **usb_list = NULL;
          ssize_t usb_count = ctx->libusb->get_device_list(ctx->usb_context, &usb_list);
