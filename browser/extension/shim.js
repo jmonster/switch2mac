@@ -282,6 +282,17 @@
     const real = Array.from(nativeGetGamepads.call(this));
     if (pads.size === 0) return real;
     getCalls++;
+    // A native device can occupy an index after a virtual pad was announced.
+    // Relocate only the collision; never silently hide a still-connected pad.
+    for (const pad of pads.values()) {
+      if (real[pad.index] != null) {
+        const previous = snapshot(pad);
+        previous.connected = false;
+        assignIndex(pad);
+        fire('gamepaddisconnected', previous);
+        fire('gamepadconnected', pad);
+      }
+    }
     for (const pad of pads.values()) {
       while (real.length <= pad.index) real.push(null);
       if (real[pad.index] === null || real[pad.index] === undefined) real[pad.index] = snapshot(pad);

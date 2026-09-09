@@ -5,15 +5,15 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 function fixture() {
-  let now = 0, next = 0; const timers = new Map(), listeners = new Map(), commands = [];
+  let now = 0, next = 0; const timers = new Map(), listeners = new Map(), commands = [], events = [], nativePads = [];
   class Event {constructor(type, options={}) {this.type=type; Object.assign(this,options);}}
-  class Navigator {getGamepads() {return [];}}
+  class Navigator {getGamepads() {return nativePads;}}
   const navigator = new Navigator();
   const document = {hidden:false,
     addEventListener(type, fn) {listeners.set(type,fn);},
     dispatchEvent(ev) {if(ev.type==='ftcw-up') commands.push(JSON.parse(ev.detail)); else listeners.get(ev.type)?.(ev);},
   };
-  const context = {navigator, Navigator, document, window:{dispatchEvent(){}}, Event, CustomEvent:Event,
+  const context = {navigator, Navigator, document, window:{dispatchEvent(event){events.push(event);}}, Event, CustomEvent:Event,
     localStorage:{getItem(){return null;}}, location:{host:'hardwaretester.com'}, performance:{now:()=>now},
     setTimeout(fn, ms=0) {timers.set(++next,{fn,at:now+ms});return next;},
     clearTimeout(id){timers.delete(id);},
@@ -35,7 +35,7 @@ function fixture() {
   }
   const pad=()=>navigator.getGamepads().find(Boolean);
   emit({t:'bridge',up:true}); emit({t:'connected',slot:0,model:'Pro Controller 2',name:'pad'});
-  return {emit,advance,commands,pad,navigator};
+  return {emit,advance,commands,pad,navigator,events,nativePads};
 }
 
 test('long rumble refreshes within the native half-second intent expiry', async()=>{
@@ -79,4 +79,27 @@ test('input snapshots remain independent and trigger/axis mappings are preserved
   assert.equal(before.buttons[0].pressed,true); assert.equal(after.buttons[0].pressed,false);
   assert.equal(before.axes[1],-0.5); assert.equal(before.buttons[6].value,128/255);
   assert.equal(before.buttons[7].value,1);
+});
+
+
+test('native hotplug cannot hide a bridged pad or move unrelated virtual indices',()=>{
+  const f=fixture();
+  f.emit({t:'connected',slot:1,model:'Pro Controller 2',name:'second'});
+  f.emit({t:'state',slot:0,b:4,lx:0.25,ly:0,rx:0,ry:0,lt:0,rt:0});
+  const old=f.navigator.getGamepads()[0];
+  f.nativePads[0]={id:'native',index:0,connected:true};
+  const pads=f.navigator.getGamepads();
+  assert.equal(pads[0].id,'native');
+  assert.equal(pads[1].__ftcwSlot,1);
+  assert.equal(pads[2]?.__ftcwSlot,0,'Native hotplug hid the bridged controller');
+  assert.equal(pads[2].buttons[0].pressed,true);
+  assert.equal(old.index,0,'Existing snapshots must not be mutated');
+  const removal=f.events.findLast(e=>e.type==='gamepaddisconnected');
+  assert.equal(removal.gamepad.index,0);
+  assert.equal(removal.gamepad.connected,false);
+  assert.equal(f.events.at(-1).type,'gamepadconnected');
+  assert.equal(f.events.at(-1).gamepad.index,2);
+  const count=f.events.length;
+  f.navigator.getGamepads();
+  assert.equal(f.events.length,count,'Stable indices must not fire duplicate hotplug events');
 });
