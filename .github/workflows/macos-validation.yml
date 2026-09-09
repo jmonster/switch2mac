@@ -28,8 +28,8 @@ jobs:
       - name: Build the actual app bundle (ad-hoc signing only)
         run: |
           bash scripts/build-app.sh
-          codesign --verify --strict "build/Finally the Controller Works.app"
-          plutil -lint "build/Finally the Controller Works.app/Contents/Info.plist"
+          codesign --verify --strict "build/Finally the Controller Works (jmonster).app"
+          plutil -lint "build/Finally the Controller Works (jmonster).app/Contents/Info.plist"
       - name: Preserve exact tested source
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
