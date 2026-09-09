@@ -1,0 +1,119 @@
+--- a/src/joystick/darwin/SDL_s2udpjoystick.c
++++ b/src/joystick/darwin/SDL_s2udpjoystick.c
+@@ -83,6 +83,7 @@
+     int sock;                    // -1 when unavailable
+     bool present;
+     SDL_JoystickID instance_id;
++    SDL_Joystick *joystick;      // currently opened instance, never a replacement
+     Uint32 buttons;
+     float lx, ly, rx, ry;
+     Uint8 lt, rt;
+@@ -124,8 +125,10 @@
+     }
+ }
+ 
+-/* Drain one slot's queued datagrams, keep the newest state, and run its
+- * presence state machine (hotplug on both edges). */
++static void S2UDP_EmitState(SDL_Joystick *joystick, S2UDP_Slot *slot);
++
++/* Every received state reaches an open joystick before the next is read.
++ * Keeping only the last packet would erase a complete press/release. */
+ static void S2UDP_PumpSlot(S2UDP_Slot *slot)
+ {
+     Uint8 buf[128];
+@@ -148,6 +151,9 @@
+             slot->lt = buf[28];
+             slot->rt = buf[29];
+             slot->last_state_ms = now;
++            if (slot->present && slot->joystick) {
++                S2UDP_EmitState(slot->joystick, slot);
++            }
+         } else if (n > 4 && n < 4 + (ssize_t)sizeof(slot->name) &&
+                    SDL_memcmp(buf, "S2N1", 4) == 0) {
+             // Bridge-provided display name (may be a user rename). A live
+@@ -160,6 +166,8 @@
+                 if (slot->present) {
+                     slot->present = false;
+                     slot->last_state_ms = 0;   // re-add on next state packet
++                    if (slot->joystick) slot->joystick->hwdata = NULL;
++                    slot->joystick = NULL;
+                     SDL_PrivateJoystickRemoved(slot->instance_id);
+                 }
+             }
+@@ -177,6 +185,8 @@
+         SDL_PrivateJoystickAdded(slot->instance_id);
+     } else if (slot->present && now - slot->last_state_ms >= PRESENCE_TIMEOUT_MS) {
+         slot->present = false;
++        if (slot->joystick) slot->joystick->hwdata = NULL;
++        slot->joystick = NULL;
+         SDL_PrivateJoystickRemoved(slot->instance_id);
+     }
+ }
+@@ -352,13 +362,14 @@
+     joystick->naxes = 6;
+     joystick->nhats = 0;
+     joystick->hwdata = (struct joystick_hwdata *)slot;
++    slot->joystick = joystick;
+     return true;
+ }
+ 
+ static bool S2UDP_JoystickRumble(SDL_Joystick *joystick, Uint16 low_frequency_rumble, Uint16 high_frequency_rumble)
+ {
+     S2UDP_Slot *slot = (S2UDP_Slot *)joystick->hwdata;
+-    if (!slot) {
++    if (!slot || slot->joystick != joystick || !slot->present) {
+         return SDL_Unsupported();
+     }
+     slot->rumble_strong = low_frequency_rumble;
+@@ -400,7 +411,7 @@
+     return (Sint16)(((int)value * 65535 / 255) - 32768);
+ }
+ 
+-static void S2UDP_JoystickUpdate(SDL_Joystick *joystick)
++static void S2UDP_EmitState(SDL_Joystick *joystick, S2UDP_Slot *slot)
+ {
+     static const struct { Uint8 index; Uint32 mask; } button_map[] = {
+         { 0, S2_BTN_B }, { 1, S2_BTN_A }, { 2, S2_BTN_Y }, { 3, S2_BTN_X },
+@@ -410,14 +421,8 @@
+         { 11, S2_BTN_UP }, { 12, S2_BTN_DOWN }, { 13, S2_BTN_LEFT }, { 14, S2_BTN_RIGHT },
+         { 15, S2_BTN_CAPTURE }, { 16, S2_BTN_GR }, { 17, S2_BTN_GL }, { 18, S2_BTN_C },
+     };
+-    S2UDP_Slot *slot = (S2UDP_Slot *)joystick->hwdata;
+     Uint64 timestamp = SDL_GetTicksNS();
+     int i;
+-
+-    S2UDP_PumpAll();
+-    if (!slot || !slot->present) {
+-        return;
+-    }
+ 
+     for (i = 0; i < (int)SDL_arraysize(button_map); ++i) {
+         SDL_SendJoystickButton(timestamp, joystick, button_map[i].index,
+@@ -430,6 +435,18 @@
+     SDL_SendJoystickAxis(timestamp, joystick, 4, S2UDP_AxisFromTrigger(slot->lt));
+     SDL_SendJoystickAxis(timestamp, joystick, 5, S2UDP_AxisFromTrigger(slot->rt));
+ 
++}
++
++static void S2UDP_JoystickUpdate(SDL_Joystick *joystick)
++{
++    S2UDP_Slot *slot = (S2UDP_Slot *)joystick->hwdata;
++    S2UDP_PumpAll();
++    if (!slot || !slot->present || slot->joystick != joystick) {
++        return;
++    }
++    // Also initialize a newly opened joystick when there is no new datagram.
++    S2UDP_EmitState(joystick, slot);
++
+     // Sustain active rumble: the bridge expires intents after 500 ms so a
+     // crashed consumer can never leave the motor running.
+     if ((slot->rumble_strong || slot->rumble_weak) &&
+@@ -440,6 +457,8 @@
+ 
+ static void S2UDP_JoystickClose(SDL_Joystick *joystick)
+ {
++    S2UDP_Slot *slot = (S2UDP_Slot *)joystick->hwdata;
++    if (slot && slot->joystick == joystick) slot->joystick = NULL;
+     joystick->hwdata = NULL;
+ }
+ 
