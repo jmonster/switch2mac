@@ -1,226 +1,238 @@
-// WebSocketHub.swift
-// Browser sink: re-broadcasts controller state over a local WebSocket so a
-// small browser extension (browser/extension) can present the controllers to
-// web games through the Gamepad API — Xbox Cloud Gaming, GeForce NOW, Luna,
-// gamepad testers — with rumble flowing back. No entitlement, no root, no
-// driver: it is the UDP/SDL bridge idea applied to the browser.
-//
-// Endpoint: ws://127.0.0.1:24810 (loopback only). Messages are JSON text:
-//   hub → page:
-//     {"t":"hello","v":1}
-//     {"t":"connected","slot":0,"model":"Pro Controller 2","name":"…"}
-//     {"t":"name","slot":0,"name":"…"}
-//     {"t":"state","slot":0,"seq":123,"b":<Switch2.Buttons raw u32>,
-//      "lx":…,"ly":…,"rx":…,"ry":…,"lt":0-255,"rt":0-255}   (y: +1 = up)
-//     {"t":"disconnected","slot":0}
-//     {"t":"ping"}   every 15 s (keeps extension service workers alive)
-//   page → hub:
-//     {"t":"rumble","slot":0,"strong":0…1,"weak":0…1}
-//     {"t":"stats",…}   extension delivery telemetry, echoed to all clients
-// Every new client receives "hello" plus one "connected"/"name" per
-// currently connected player, so late joiners (a tab opened after the
-// controller paired) see the full picture immediately.
-
+// Browser output adapted from Andrei-Kondrykau/switch2mac, browser-bridge
+// 24b0cd3d225c77c9efcfca42cb4fd4325e2fccf3. The existing JSON schema is retained.
+// Opt-in and exact extension-Origin checks restrict browser access; they do
+// not authenticate native processes already running as the local user.
 import Foundation
 import Network
 
 final class WebSocketHub: ControllerOutputSink, @unchecked Sendable {
-
     static let port: UInt16 = 24810
-
+    static let enabledKey = "browserBridgeEnabled"
+    static let extensionIDsKey = "browserBridgeExtensionIDs"
+    private static let maxMessageBytes = 65536
+    private static let maxClients = 8
     var onRumble: ((Int, Double, Double) -> Void)?
 
+    private final class Client {
+        let connection: NWConnection
+        var ready = false
+        var pendingMessages = 0
+        var pendingBytes = 0
+        var received = 0
+        var windowStart = ProcessInfo.processInfo.systemUptime
+        init(_ connection: NWConnection) { self.connection = connection }
+    }
     private let queue = DispatchQueue(label: "com.petersharma.ftcw.wshub")
+    private let allowedOrigins: Set<String>
     private var listener: NWListener?
-    private var clients: [ObjectIdentifier: NWConnection] = [:]
-    private var connected: [Int: (model: String, name: String)] = [:]
+    private var clients: [ObjectIdentifier: Client] = [:]
+    private var connected: [Int: (model: String, name: String, rumble: Bool)] = [:]
     private var seq: [Int: UInt32] = [:]
-    private var lastState: [Int: (buttons: UInt32, packet: Data)] = [:]
-
+    private var lastState: [Int: String] = [:]
+    private var rumbleOwners: [Int: ObjectIdentifier] = [:]
     private var pingTimer: DispatchSourceTimer?
 
-    init() {
-        queue.async { [weak self] in
-            self?.startListener()
-            self?.startPing()
+    static func origins(from ids: String) -> Set<String> {
+        Set(ids.split(whereSeparator: { $0.isWhitespace || $0 == "," }).compactMap { id in
+            guard id.utf8.count == 32, id.utf8.allSatisfy({ (97...112).contains($0) }) else { return nil }
+            return "chrome-extension://\(id)"
+        })
+    }
+
+    init(enabled: Bool = UserDefaults.standard.bool(forKey: WebSocketHub.enabledKey),
+         allowedOrigins: Set<String> = WebSocketHub.origins(from:
+            UserDefaults.standard.string(forKey: WebSocketHub.extensionIDsKey) ?? "")) {
+        self.allowedOrigins = allowedOrigins
+        guard enabled, !allowedOrigins.isEmpty else { return }
+        queue.async { [weak self] in self?.startListener() }
+    }
+
+    private func startListener() {
+        guard listener == nil else { return }
+        let params = NWParameters.tcp
+        params.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .init(rawValue: Self.port)!)
+        let ws = NWProtocolWebSocket.Options()
+        ws.autoReplyPing = true
+        ws.maximumMessageSize = Self.maxMessageBytes
+        let origins = allowedOrigins
+        ws.setClientRequestHandler(queue) { _, headers in
+            let values = headers.filter { $0.name.lowercased() == "origin" }.map(\.value)
+            let accepted = values.count == 1 && origins.contains(values[0])
+            return NWProtocolWebSocket.Response(status: accepted ? .accept : .reject, subprotocol: nil)
+        }
+        params.defaultProtocolStack.applicationProtocols.insert(ws, at: 0)
+        do {
+            let owner = try NWListener(using: params)
+            listener = owner
+            owner.stateUpdateHandler = { [weak self, weak owner] state in
+                guard let self, let owner, self.listener === owner else { return }
+                switch state {
+                case .ready:
+                    bridgeLog(.info, "wshub", "opt-in browser bridge on 127.0.0.1:\(Self.port)")
+                    self.startPing()
+                case .failed(let error):
+                    bridgeLog(.warning, "wshub", "listener failed: \(error)")
+                    owner.cancel(); self.listener = nil
+                    self.queue.asyncAfter(deadline: .now() + 5) { [weak self] in self?.startListener() }
+                default: break
+                }
+            }
+            owner.newConnectionHandler = { [weak self, weak owner] connection in
+                guard let self, self.listener === owner else { connection.cancel(); return }
+                self.accept(connection)
+            }
+            owner.start(queue: queue)
+        } catch {
+            bridgeLog(.warning, "wshub", "cannot create listener: \(error)")
         }
     }
 
-    /// Chrome unloads an idle extension service worker after ~30 s; a
-    /// periodic message keeps the bridge's socket owner alive between inputs.
     private func startPing() {
+        guard pingTimer == nil else { return }
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + 15, repeating: 15)
         timer.setEventHandler { [weak self] in self?.broadcast(#"{"t":"ping"}"#) }
-        timer.resume()
-        pingTimer = timer
-    }
-
-    // MARK: Listener
-
-    private func startListener() {
-        let params = NWParameters.tcp
-        params.allowLocalEndpointReuse = true
-        params.requiredLocalEndpoint = NWEndpoint.hostPort(
-            host: "127.0.0.1", port: NWEndpoint.Port(rawValue: Self.port)!)
-        let ws = NWProtocolWebSocket.Options()
-        ws.autoReplyPing = true
-        params.defaultProtocolStack.applicationProtocols.insert(ws, at: 0)
-
-        let listener: NWListener
-        do {
-            listener = try NWListener(using: params)
-        } catch {
-            bridgeLog(.warning, "wshub", "cannot create listener (\(error)) — retrying in 5 s")
-            queue.asyncAfter(deadline: .now() + 5) { [weak self] in self?.startListener() }
-            return
-        }
-        listener.stateUpdateHandler = { [weak self] state in
-            guard let self else { return }
-            switch state {
-            case .ready:
-                bridgeLog(.info, "wshub", "browser bridge on ws://127.0.0.1:\(Self.port)")
-            case .failed(let error):
-                bridgeLog(.warning, "wshub", "listener failed (\(error)) — retrying in 5 s")
-                listener.cancel()
-                self.listener = nil
-                self.queue.asyncAfter(deadline: .now() + 5) { [weak self] in self?.startListener() }
-            default:
-                break
-            }
-        }
-        listener.newConnectionHandler = { [weak self] connection in
-            self?.accept(connection)
-        }
-        self.listener = listener
-        listener.start(queue: queue)
+        timer.resume(); pingTimer = timer
     }
 
     private func accept(_ connection: NWConnection) {
+        guard clients.count < Self.maxClients else { connection.cancel(); return }
         let id = ObjectIdentifier(connection)
-        connection.stateUpdateHandler = { [weak self] state in
-            guard let self else { return }
+        let client = Client(connection)
+        clients[id] = client // include incomplete handshakes in the bound
+        queue.asyncAfter(deadline: .now() + 5) { [weak self, weak client] in
+            guard let self, let client, self.clients[id] === client, !client.ready else { return }
+            self.remove(id)
+        }
+        connection.stateUpdateHandler = { [weak self, weak client] state in
+            guard let self, let client, self.clients[id] === client else { return }
             switch state {
             case .ready:
-                self.clients[id] = connection
-                bridgeLog(.info, "wshub", "browser client connected (\(self.clients.count) total)")
-                self.send(#"{"t":"hello","v":1}"#, to: connection)
+                client.ready = true
+                self.send(#"{"t":"hello","v":1}"#, to: client)
                 for (slot, info) in self.connected.sorted(by: { $0.key < $1.key }) {
-                    self.send(Self.connectedMessage(slot: slot, model: info.model, name: info.name),
-                              to: connection)
+                    self.send(Self.connectionMessage(slot, info.model, info.name), to: client)
+                    if let state = self.lastState[slot] { self.send(state, to: client) }
                 }
-                self.receive(on: connection)
-            case .failed, .cancelled:
-                if self.clients.removeValue(forKey: id) != nil {
-                    bridgeLog(.info, "wshub", "browser client left (\(self.clients.count) total)")
-                    // A page that disappears mid-rumble should not leave the
-                    // controller buzzing.
-                    for slot in self.connected.keys { self.onRumble?(slot, 0, 0) }
-                }
-            default:
-                break
+                self.receive(client)
+            case .failed, .cancelled: self.remove(id)
+            default: break
             }
         }
         connection.start(queue: queue)
     }
 
-    private func receive(on connection: NWConnection) {
-        connection.receiveMessage { [weak self] data, context, _, error in
-            guard let self else { return }
-            if let data, !data.isEmpty { self.handle(data) }
-            if error == nil, context?.isFinal != true {
-                self.receive(on: connection)
-            } else {
-                connection.cancel()
-            }
+    private func remove(_ id: ObjectIdentifier) {
+        guard let client = clients.removeValue(forKey: id) else { return }
+        client.connection.cancel()
+        // A departing observer cannot stop another client's active effect.
+        for slot in Array(rumbleOwners.keys) where rumbleOwners[slot] == id {
+            rumbleOwners.removeValue(forKey: slot)
+            onRumble?(slot, 0, 0)
         }
     }
 
-    private func handle(_ data: Data) {
+    private func receive(_ client: Client) {
+        let connection = client.connection, id = ObjectIdentifier(client.connection)
+        connection.receiveMessage { [weak self, weak client] data, context, _, error in
+            guard let self, let client, self.clients[id] === client else { return }
+            let now = ProcessInfo.processInfo.systemUptime
+            if now - client.windowStart >= 1 { client.windowStart = now; client.received = 0 }
+            client.received += 1
+            guard client.received <= 200, (data?.count ?? 0) <= Self.maxMessageBytes else {
+                self.remove(id); return
+            }
+            if let data, !data.isEmpty { self.handle(data, from: id) }
+            if error == nil, context?.isFinal != true { self.receive(client) }
+            else { self.remove(id) }
+        }
+    }
+
+    private func handle(_ data: Data, from id: ObjectIdentifier) {
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let type = object["t"] as? String else { return }
-        switch type {
-        case "rumble":
-            guard let slot = object["slot"] as? Int else { return }
-            let strong = min(max((object["strong"] as? Double) ?? 0, 0), 1)
-            let weak = min(max((object["weak"] as? Double) ?? 0, 0), 1)
+        if type == "rumble" {
+            guard let slot = object["slot"] as? Int, (0..<4).contains(slot), connected[slot]?.rumble == true,
+                  let strong = object["strong"] as? Double, strong.isFinite,
+                  let weak = object["weak"] as? Double, weak.isFinite else { return }
+            let strong = min(1, max(0, strong)), weak = min(1, max(0, weak))
+            if strong == 0 && weak == 0 {
+                guard rumbleOwners[slot] == id else { return }
+                rumbleOwners.removeValue(forKey: slot)
+            } else { rumbleOwners[slot] = id }
             onRumble?(slot, strong, weak)
-        case "stats":
-            // Page-side delivery telemetry from the extension: log it and
-            // echo to every client so it can be read outside the browser.
-            bridgeLog(.debug, "wshub", "client stats: \(String(decoding: data, as: UTF8.self))")
-            broadcast(String(decoding: data, as: UTF8.self))
-        default:
-            break
+        } else if type == "stats" {
+            // Telemetry stays local to logging, not broadcast to unrelated tabs.
+            bridgeLog(.debug, "wshub", "client stats: \(String(decoding: data.prefix(2048), as: UTF8.self))")
         }
     }
 
-    // MARK: Sending
-
-    private func send(_ text: String, to connection: NWConnection) {
+    private func send(_ text: String, to client: Client) {
+        let connection = client.connection, id = ObjectIdentifier(client.connection)
+        guard clients[id] === client, client.ready else { return }
+        let bytes = Data(text.utf8)
+        guard bytes.count <= Self.maxMessageBytes, client.pendingMessages < 128,
+              client.pendingBytes + bytes.count <= 256 * 1024 else { remove(id); return }
+        client.pendingMessages += 1; client.pendingBytes += bytes.count
         let metadata = NWProtocolWebSocket.Metadata(opcode: .text)
         let context = NWConnection.ContentContext(identifier: "text", metadata: [metadata])
-        connection.send(content: Data(text.utf8), contentContext: context,
-                        isComplete: true, completion: .contentProcessed { _ in })
+        connection.send(content: bytes, contentContext: context, isComplete: true,
+                        completion: .contentProcessed { [weak self, weak client] error in
+            guard let self, let client, self.clients[id] === client else { return }
+            client.pendingMessages -= 1; client.pendingBytes -= bytes.count
+            if error != nil { self.remove(id) }
+        })
     }
 
     private func broadcast(_ text: String) {
-        for connection in clients.values { send(text, to: connection) }
+        for client in Array(clients.values) where client.ready { send(text, to: client) }
     }
 
-    private static func connectedMessage(slot: Int, model: String, name: String) -> String {
-        #"{"t":"connected","slot":\#(slot),"model":\#(json(model)),"name":\#(json(name))}"#
+    private static func json(_ object: [String: Any]) -> String? {
+        guard let data = try? JSONSerialization.data(withJSONObject: object) else { return nil }
+        return String(decoding: data, as: UTF8.self)
     }
-
-    private static func json(_ string: String) -> String {
-        let data = (try? JSONSerialization.data(withJSONObject: [string])) ?? Data("[\"\"]".utf8)
-        let array = String(decoding: data, as: UTF8.self)
-        return String(array.dropFirst().dropLast())
+    private static func connectionMessage(_ slot: Int, _ model: String, _ name: String) -> String {
+        json(["t":"connected", "slot":slot, "model":model, "name":name])!
     }
-
-    // MARK: ControllerOutputSink (called on the Bluetooth queue)
 
     func controllerConnected(slot: Int, model: Switch2.Model) {
         queue.async { [weak self] in
-            guard let self else { return }
-            let name = self.connected[slot]?.name ?? model.displayName
-            self.connected[slot] = (model.displayName, name)
+            guard let self, (0..<4).contains(slot) else { return }
+            self.connected[slot] = (model.displayName, model.displayName, model.hasHDRumble)
+            self.lastState.removeValue(forKey: slot)
+            self.rumbleOwners.removeValue(forKey: slot)
             self.seq[slot] = 0
-            self.broadcast(Self.connectedMessage(slot: slot, model: model.displayName, name: name))
+            self.broadcast(Self.connectionMessage(slot, model.displayName, model.displayName))
         }
     }
-
     func controllerDisconnected(slot: Int) {
         queue.async { [weak self] in
             guard let self, self.connected.removeValue(forKey: slot) != nil else { return }
             self.lastState.removeValue(forKey: slot)
+            self.rumbleOwners.removeValue(forKey: slot)
             self.broadcast(#"{"t":"disconnected","slot":\#(slot)}"#)
         }
     }
-
     func controllerName(slot: Int, name: String) {
         queue.async { [weak self] in
-            guard let self else { return }
-            if let info = self.connected[slot] {
-                guard info.name != name else { return }
-                self.connected[slot] = (info.model, name)
-                self.broadcast(#"{"t":"name","slot":\#(slot),"name":\#(Self.json(name))}"#)
-            } else {
-                self.connected[slot] = ("", name)
-            }
+            guard let self, let info = self.connected[slot], info.name != name else { return }
+            self.connected[slot] = (info.model, name, info.rumble)
+            if let text = Self.json(["t":"name", "slot":slot, "name":name]) { self.broadcast(text) }
         }
     }
-
     func controllerState(slot: Int, state: ControllerState) {
         queue.async { [weak self] in
-            guard let self, !self.clients.isEmpty else { return }
+            guard let self, self.connected[slot] != nil else { return }
             let next = (self.seq[slot] ?? 0) &+ 1
             self.seq[slot] = next
-            let text = String(
-                format: #"{"t":"state","slot":%d,"seq":%u,"b":%u,"lx":%.4f,"ly":%.4f,"rx":%.4f,"ry":%.4f,"lt":%d,"rt":%d}"#,
-                slot, next, state.buttons.rawValue,
-                state.leftStick.x, state.leftStick.y, state.rightStick.x, state.rightStick.y,
-                Int(state.leftTrigger), Int(state.rightTrigger))
+            guard let text = Self.json([
+                "t":"state", "slot":slot, "seq":next, "b":state.buttons.rawValue,
+                "lx":state.leftStick.x, "ly":state.leftStick.y,
+                "rx":state.rightStick.x, "ry":state.rightStick.y,
+                "lt":state.leftTrigger, "rt":state.rightTrigger
+            ]) else { return }
+            self.lastState[slot] = text
             self.broadcast(text)
         }
     }

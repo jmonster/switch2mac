@@ -94,40 +94,56 @@
   }
 
   function makeActuator(slot) {
-    let timer = null;
-    let pending = null;
+    let timer = null, refresh = null, pending = null, generation = 0;
+    let actuator;
+    const current = () => bridgeUp && pads.get(slot)?.vibrationActuator === actuator;
     const finish = (result) => {
-      if (pending) { const p = pending; pending = null; p(result); }
+      if (pending) { const resolve = pending; pending = null; resolve(result); }
     };
-    const stop = () => {
-      if (timer) { clearTimeout(timer); timer = null; }
-      rumbleToApp(slot, 0, 0);
+    const stop = (result = 'preempted') => {
+      generation++;
+      if (timer !== null) clearTimeout(timer);
+      if (refresh !== null) clearInterval(refresh);
+      timer = refresh = null;
+      if (current()) rumbleToApp(slot, 0, 0);
+      finish(result);
     };
-    return {
+    actuator = {
       type: 'dual-rumble',
       effects: ['dual-rumble'],
       playEffect(type, params = {}) {
         if (type !== 'dual-rumble') return Promise.resolve('invalid-parameter');
-        const strong = clamp01(params.strongMagnitude);
-        const weak = clamp01(params.weakMagnitude);
-        const duration = Math.max(0, Number(params.duration) || 0);
-        const startDelay = Math.max(0, Number(params.startDelay) || 0);
-        if (timer) clearTimeout(timer);
-        finish('preempted');
+        if (!current()) return Promise.resolve('preempted');
+        const duration = Number(params.duration ?? 0), delay = Number(params.startDelay ?? 0);
+        if (!Number.isFinite(duration) || !Number.isFinite(delay) ||
+            duration < 0 || delay < 0 || duration > 60000 || delay > 60000) {
+          return Promise.resolve('invalid-parameter');
+        }
+        const strong = clamp01(params.strongMagnitude), weak = clamp01(params.weakMagnitude);
+        stop();
+        const owner = generation;
         return new Promise((resolve) => {
           pending = resolve;
-          const start = () => {
+          const pulse = () => {
+            if (owner !== generation || !current()) { stop(); return; }
             rumbleToApp(slot, strong, weak);
-            timer = setTimeout(() => { timer = null; rumbleToApp(slot, 0, 0); finish('complete'); }, duration);
           };
-          if (startDelay > 0) timer = setTimeout(start, startDelay); else start();
+          const start = () => {
+            if (owner !== generation || !current()) { stop(); return; }
+            pulse();
+            // The native session expires intents after 500 ms. Refresh only
+            // for the requested effect lifetime; never change controller bytes.
+            refresh = setInterval(pulse, 200);
+            timer = setTimeout(() => stop('complete'), duration);
+          };
+          if (delay > 0) timer = setTimeout(start, delay); else start();
         });
       },
-      reset() { stop(); finish('preempted'); return Promise.resolve('complete'); },
+      reset() { stop(); return Promise.resolve('complete'); },
       stop,
     };
+    return actuator;
   }
-
   const clamp01 = (v) => Math.min(1, Math.max(0, Number(v) || 0));
 
   const padId = (model, name) => PERSONA === 'xbox'

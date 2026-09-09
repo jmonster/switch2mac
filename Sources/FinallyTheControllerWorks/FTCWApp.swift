@@ -40,6 +40,9 @@ struct FTCWApp: App {
         }
         .defaultSize(width: 500, height: 480)
 
+        Window("Browser Bridge", id: "browser-bridge") { BrowserBridgeSettings() }
+            .windowResizability(.contentSize)
+
         Window("About", id: "about") { AboutView() }
             .windowResizability(.contentSize)
 
@@ -83,6 +86,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     func applicationDidFinishLaunching(_ notification: Notification) {
         bridgeLog(.info, "app", "Finally the Controller Works — starting bridge")
         engine.addSink(UDPHub())
+        engine.addSink(WebSocketHub())
         engine.addSink(VirtualHIDSink())
         notifications.attach(to: engine)
         // Daily auto-update check (only if a feed URL is configured); results
@@ -144,6 +148,7 @@ struct MenuContent: View {
         Divider()
 
         Button("Open Dashboard") { show("dashboard") }
+        Button("Browser Bridge Settings…") { show("browser-bridge") }
 
         // Hidden for the beta (AppInfo.showPreReleaseFeatures documents
         // the defaults key that brings them back).
