@@ -137,6 +137,14 @@ final class NetworkGamepadSink: ControllerOutputSink, @unchecked Sendable {
             busy = busy || p.pending || refreshing || (target != nil && target != port)
             guard now >= p.nextSendAt else { continue }
 
+            // Reverting a port edit can leave a partially neutralized receiver.
+            // Reassert every button, then resume ordered edges for later reports.
+            if p.switchIndex != nil && target == port {
+                p.switchIndex = nil
+                p.edges = (0..<16).map { ($0, (p.wantButtons >> $0) & 1) }
+                p.refreshIndex = 0
+            }
+
             // Configuration changes retire the old destination before any new
             // state is sent. Reports during this reset establish the new state.
             if let target, target != port {

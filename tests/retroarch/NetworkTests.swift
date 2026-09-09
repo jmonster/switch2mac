@@ -64,7 +64,7 @@ enum NetworkTests {
     }
     static func main() {
         let selected = CommandLine.arguments.last!
-        for name in ["wire", "tap", "refresh-release", "destination", "disable", "overflow", "send-failure", "finite-axis"] {
+        for name in ["wire", "tap", "refresh-release", "destination", "disable", "overflow", "send-failure", "finite-axis", "cancel-destination"] {
             if selected != "all" && selected != name { continue }
             AppConfig.networkGamepadEnabled = true; AppConfig.networkGamepadBasePort = 55400
             let a = receiver(55400), b = receiver(55410), sink = NetworkGamepadSink()
@@ -110,6 +110,22 @@ enum NetworkTests {
                 sink.queue.sync { close(sink.fd); sink.fd = -1 }
                 sink.controllerState(slot: 0, state: state(true)); tick(sink)
                 precondition(sink.queue.sync { sink.players[0].sentButtons == 0 })
+            case "cancel-destination":
+                sink.controllerState(slot: 0, state: state(true)); tick(sink); _ = packets(a)
+                AppConfig.networkGamepadBasePort = 55410
+                tick(sink, count: 10) // old destination has received A's release
+                precondition(aValues(packets(a)).contains(0))
+                AppConfig.networkGamepadBasePort = 55400 // cancel before reset finishes
+                tick(sink, count: 40)
+                precondition(aValues(packets(a)).contains(1), "Cancelled destination reset did not restore held input")
+                sink.queue.sync {
+                    sink.controllerState(slot: 0, state: state(false))
+                    sink.controllerState(slot: 0, state: state(true))
+                    sink.controllerState(slot: 0, state: state(false))
+                }
+                tick(sink, count: 3)
+                precondition(Array(aValues(packets(a)).prefix(3)) == [0,1,0], "Cancelled port switch disabled edge delivery")
+                precondition(packets(b).isEmpty, "Cancelled destination received input")
             case "finite-axis":
                 precondition(NetworkGamepadSink.axis(.nan) == 0)
                 precondition(NetworkGamepadSink.axis(.infinity) == 0)
