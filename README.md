@@ -26,8 +26,14 @@ which is **currently waiting on Apple's approval**. Until it arrives:
   that library sees real game controllers — including rumble flowing
   back to the controller.
 
-Once Apple's approval lands, the SDL step disappears and controllers
-will just show up system-wide.
+- **To use controllers in a web game** — Xbox Cloud Gaming, GeForce NOW,
+  Luna — the app also serves controller state on
+  `ws://127.0.0.1:24810`, and a small browser extension in
+  [`browser/`](browser/) presents them to the page as standard
+  gamepads, rumble included. Chromium browsers only.
+
+Once Apple's approval lands, the SDL and browser steps become optional
+and controllers will just show up system-wide.
 
 ## Install
 
@@ -57,33 +63,25 @@ Gopher64 is SDL-based, so it works through the bridge today:
 The same recipe works for any SDL3-based emulator or game — see
 [`sdl/README.md`](sdl/README.md) for the general one-line launch method.
 
-## Using it with RetroArch
+## Using it with Xbox Cloud Gaming (or any web game)
 
-RetroArch on macOS doesn't use SDL for input, so the bridge above can't
-reach it. Instead the app can feed RetroArch's built-in **Network
-Gamepad** directly — no extra library, nothing to patch:
+Verified on xbox.com/play. Chromium browsers only (Chrome, Edge, Brave,
+Arc, Vivaldi, Opera); Safari and Firefox cannot run this bridge.
 
-1. In RetroArch: **Settings → Network → Network Gamepad** → on. Leave
-   the base port at 55400, and turn on **Network Gamepad User 1** (and
-   2–4 for more players). Restart RetroArch.
-2. In the menu-bar app's dashboard, open **Configuration** and turn on
-   **Network gamepad output (RetroArch)**.
-3. Load a game. Your controller drives the RetroPad for player 1
-   directly (no "bind all" step needed) — sticks, D-pad, A/B/X/Y,
-   L/R/ZL/ZR, stick clicks, +/−.
+1. Get the extension folder: clone this repo, or download the ZIP from
+   GitHub (**Code → Download ZIP**) and unpack it. You need the
+   [`browser/extension`](browser/extension) folder.
+2. In the browser open `chrome://extensions` (`edge://extensions`,
+   `brave://extensions`, …), turn on **Developer mode** (top right),
+   click **Load unpacked** and pick that `browser/extension` folder.
+3. Start the menu-bar app and press a button on the controller so it
+   connects.
+4. Open <https://www.xbox.com/play> and play: the controller is a
+   standard gamepad, with rumble. Xbox prompts match the physical
+   positions (Switch B is where Xbox A is).
 
-Caveats: RetroArch's network protocol is one-way (no rumble), and Home,
-Capture, C, GL and GR have no RetroPad equivalent (use the app's
-button remapper for those). RetroArch listens on all interfaces with no
-authentication, so only enable its network gamepad on a network you
-trust.
-
-Looking ahead: RetroArch gained an SDL3 joypad driver upstream in
-mid-2026, but the official macOS builds aren't compiled with it yet. If
-that changes, the SDL bridge above will work with RetroArch too — with
-rumble — by launching it with the patched `libSDL3` like any other SDL3
-app, and the network gamepad becomes the fallback rather than the only
-route.
+Button table, adding other game sites, troubleshooting and the wire
+protocol are in [`browser/README.md`](browser/README.md).
 
 ## Features
 
@@ -106,7 +104,8 @@ route.
 - Button remapping per controller
 - Joy-Con 2 **mouse mode** (the optical sensor, used flat on the desk)
 - UDP/SDL bridge for games and emulators, with game rumble passthrough
-- RetroArch network-gamepad output (no SDL needed; off by default)
+- WebSocket/browser bridge for web games (Xbox Cloud Gaming, GeForce NOW),
+  with rumble passthrough
 - Signed auto-updates, first-run tour, settings import/export, live
   log with BLE gap diagnostics, launch-at-login
 
@@ -147,12 +146,12 @@ Controller ──BLE──> BridgeEngine ──> ControllerSession (per slot)
               ControllerOutputSink protocol
                ├── VirtualHIDSink (CoreHID; entitlement-gated)
                ├── UDPHub        (SDL-compat, ports 24800-24803)
-               └── NetworkGamepadSink (network gamepad / RetroArch, 55400-55403)
+               └── WebSocketHub  (browser extension, ws://127.0.0.1:24810)
 ```
 
 - `Protocol/Switch2Protocol.swift` — the wire protocol, transport-free.
 - `Bluetooth/` — CoreBluetooth engine + per-controller session state machine.
-- `Output/` — the sinks.
+- `Output/` — the two sinks.
 - `UI/` — SwiftUI dashboard (status cards + live log) and menu bar.
 
 ## Support
