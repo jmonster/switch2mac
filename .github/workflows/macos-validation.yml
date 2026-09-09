@@ -1,0 +1,33 @@
+name: macOS build and regressions
+on:
+  push:
+    branches: [test/integration-closeout-20260909]
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Record exact integration source and toolchain
+        run: |
+          git rev-parse HEAD
+          swift --version
+          xcodebuild -version
+          git archive HEAD -o "$RUNNER_TEMP/source.zip"
+      - name: Run all combined protocol and output regressions
+        run: bash tests/run.sh
+      - name: Build actual fork app and verify bundle
+        run: |
+          bash scripts/build-app.sh
+          codesign --verify --strict "build/Finally the Controller Works (jmonster).app"
+          plutil -lint "build/Finally the Controller Works (jmonster).app/Contents/Info.plist"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: tested-source
+          path: ${{ runner.temp }}/source.zip
+          retention-days: 7
