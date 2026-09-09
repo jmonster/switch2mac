@@ -27,9 +27,9 @@ jobs:
           bash -n sdl/build-sdl.sh sdl/make-gopher64-both.sh
           git -C .ci-sdl apply "$GITHUB_WORKSPACE/sdl/sdl3-3.4.14-s2udp.patch"
           bash tests/sdl-usb/run.sh .ci-sdl before
-          cmake -S .ci-sdl -B "$RUNNER_TEMP/sdl-build" -DSDL_SHARED=ON -DSDL_STATIC=OFF -DSDL_TESTS=OFF
+          cmake -S .ci-sdl -B "$RUNNER_TEMP/sdl-build" -DSDL_SHARED=ON -DSDL_STATIC=OFF -DSDL_TESTS=OFF -DSDL_HIDAPI_LIBUSB=ON
           cmake --build "$RUNNER_TEMP/sdl-build" --parallel 3
-          grep -R '^#define HAVE_LIBUSB 1' "$RUNNER_TEMP/sdl-build/include"
+          grep '^#define HAVE_LIBUSB 1' "$RUNNER_TEMP/sdl-build"/include-config-*/build_config/SDL_build_config.h
           cc -I .ci-sdl/include tests/sdl-edges/check.c -L "$RUNNER_TEMP/sdl-build" -Wl,-rpath,"$RUNNER_TEMP/sdl-build" -lSDL3 -o "$RUNNER_TEMP/check-edges"
           set +e
           "$RUNNER_TEMP/check-edges"

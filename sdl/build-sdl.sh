@@ -11,7 +11,7 @@ git -C "$source_dir" archive "$revision" | tar -x -C "$work"
 git -C "$work" apply "$root/sdl/sdl3-3.4.14-s2udp.patch"
 git -C "$work" apply "$root/sdl/s2udp-input-edges.patch"
 git -C "$work" apply "$root/sdl/s2usb-device-identity.patch"
-cmake -S "$work" -B "$work/build" -DSDL_SHARED=ON -DSDL_STATIC=OFF -DSDL_TESTS=OFF
+cmake -S "$work" -B "$work/build" -DSDL_SHARED=ON -DSDL_STATIC=OFF -DSDL_TESTS=OFF -DSDL_HIDAPI_LIBUSB=ON
 cmake --build "$work/build" --parallel 3
 mkdir -p "$root/build/sdl"
 cp "$work/build/libSDL3.0.dylib" "$root/build/sdl/libSDL3.0.dylib"
