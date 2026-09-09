@@ -1,0 +1,39 @@
+name: macOS build and regressions
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  validate:
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Record source and toolchain
+        run: |
+          git rev-parse HEAD
+          swift --version
+          xcodebuild -version
+          git archive HEAD -o "$RUNNER_TEMP/source.zip"
+      - name: Run controller protocol regressions (no radio required)
+        run: bash tests/run.sh
+      - name: Build the actual app bundle (ad-hoc signing only)
+        run: |
+          bash scripts/build-app.sh
+          codesign --verify --strict "build/Finally the Controller Works.app"
+          plutil -lint "build/Finally the Controller Works.app/Contents/Info.plist"
+      - name: Preserve exact tested source
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tested-source
+          path: ${{ runner.temp }}/source.zip
+          retention-days: 7
