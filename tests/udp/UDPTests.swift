@@ -108,5 +108,36 @@ enum UDPTests {
             }
             print("PASS peer cap and expiry without input")
         }
+
+        if selected == "all" || selected == "backlog" {
+            // Stall the sink queue and flood reports. Admission stays bounded;
+            // once the consumer catches up it must neutralize before reasserting
+            // the newest state rather than replaying stale transitions.
+            let gate = DispatchSemaphore(value: 0)
+            hub.queue.async { gate.wait() }
+            for i in 0..<200 {
+                var state = ControllerState()
+                if i == 199 { state.buttons = [.a] }
+                hub.controllerState(slot: 0, state: state)
+            }
+            gate.signal()
+            let neutral = receive(a), latest = receive(a)
+            precondition(Switch2.u32(neutral, 8) == 0)
+            precondition(Switch2.u32(latest, 8) == Switch2.Buttons.a.rawValue)
+            print("PASS bounded backlog recovery")
+        }
+        if selected == "all" || selected == "finite" {
+            var weird = ControllerState()
+            weird.leftStick = (.nan, 2)
+            weird.rightStick = (-2, .infinity)
+            let packet = UDPHub.statePacket(seq: 1, state: weird)
+            func f32(_ offset: Int) -> Float {
+                let bits = Switch2.u32(packet, offset)
+                return Float(bitPattern: bits)
+            }
+            precondition(f32(12) == 0 && f32(16) == 1)
+            precondition(f32(20) == -1 && f32(24) == 0)
+            print("PASS finite clamped axes")
+        }
     }
 }

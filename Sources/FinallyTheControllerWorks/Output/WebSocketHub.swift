@@ -23,6 +23,8 @@ final class WebSocketHub: ControllerOutputSink, @unchecked Sendable {
         init(_ connection: NWConnection) { self.connection = connection }
     }
     private let queue = DispatchQueue(label: "com.petersharma.ftcw.wshub")
+    private let stateMailbox = BoundedStateMailbox<ControllerState>(
+        perSlotCapacity: 64, maxAge: 0.25, batchLimit: 32)
     private let allowedOrigins: Set<String>
     private var listener: NWListener?
     private var clients: [ObjectIdentifier: Client] = [:]
@@ -206,6 +208,7 @@ final class WebSocketHub: ControllerOutputSink, @unchecked Sendable {
     }
 
     func controllerConnected(slot: Int, model: Switch2.Model) {
+        stateMailbox.clear(slot: slot)
         queue.async { [weak self] in
             guard let self, (0..<4).contains(slot) else { return }
             self.connected[slot] = (model.displayName, model.displayName, model.hasHDRumble)
@@ -216,10 +219,13 @@ final class WebSocketHub: ControllerOutputSink, @unchecked Sendable {
         }
     }
     func controllerDisconnected(slot: Int) {
+        stateMailbox.clear(slot: slot)
         queue.async { [weak self] in
             guard let self, self.connected.removeValue(forKey: slot) != nil else { return }
             self.lastState.removeValue(forKey: slot)
-            self.rumbleOwners.removeValue(forKey: slot)
+            if self.rumbleOwners.removeValue(forKey: slot) != nil {
+                self.onRumble?(slot, 0, 0)
+            }
             self.broadcast(#"{"t":"disconnected","slot":\#(slot)}"#)
         }
     }
@@ -231,18 +237,40 @@ final class WebSocketHub: ControllerOutputSink, @unchecked Sendable {
         }
     }
     func controllerState(slot: Int, state: ControllerState) {
-        queue.async { [weak self] in
-            guard let self, self.connected[slot] != nil else { return }
-            let next = (self.seq[slot] ?? 0) &+ 1
-            self.seq[slot] = next
-            guard let text = Self.json([
-                "t":"state", "slot":slot, "seq":next, "b":state.buttons.rawValue,
-                "lx":state.leftStick.x, "ly":state.leftStick.y,
-                "rx":state.rightStick.x, "ry":state.rightStick.y,
-                "lt":state.leftTrigger, "rt":state.rightTrigger
-            ]) else { return }
-            self.lastState[slot] = text
-            self.broadcast(text)
+        if stateMailbox.submit(slot: slot, state: state) {
+            queue.async { [weak self] in self?.drainStates() }
         }
     }
+
+    private func drainStates() {
+        let batch = stateMailbox.take()
+        for recovery in batch.recoveries {
+            publishState(slot: recovery.slot, state: ControllerState())
+            publishState(slot: recovery.slot, state: recovery.latest)
+            bridgeLog(.warning, "wshub",
+                      "slot \(recovery.slot + 1): output backlog recovered with neutral state")
+        }
+        for item in batch.items { publishState(slot: item.slot, state: item.state) }
+        if stateMailbox.completeDrain() {
+            queue.async { [weak self] in self?.drainStates() }
+        }
+    }
+
+    private func publishState(slot: Int, state: ControllerState) {
+        guard connected[slot] != nil else { return }
+        func axis(_ value: Double) -> Double {
+            value.isFinite ? max(-1, min(1, value)) : 0
+        }
+        let next = (seq[slot] ?? 0) &+ 1
+        seq[slot] = next
+        guard let text = Self.json([
+            "t":"state", "slot":slot, "seq":next, "b":state.buttons.rawValue,
+            "lx":axis(state.leftStick.x), "ly":axis(state.leftStick.y),
+            "rx":axis(state.rightStick.x), "ry":axis(state.rightStick.y),
+            "lt":state.leftTrigger, "rt":state.rightTrigger
+        ]) else { return }
+        lastState[slot] = text
+        broadcast(text)
+    }
+
 }

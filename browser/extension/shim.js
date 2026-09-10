@@ -62,7 +62,7 @@
 
   const toApp = (obj) =>
     document.dispatchEvent(new CustomEvent('ftcw-up', { detail: JSON.stringify(obj) }));
-  const rumbleToApp = (slot, strong, weak) => toApp({ t: 'rumble', slot, strong, weak });
+  const rumbleToApp = (slot, strong, weak, phase) => toApp({ t: 'rumble', slot, strong, weak, phase });
 
   // Delivery telemetry: how state messages actually arrive in this page
   // (intervals between them) and how often the site polls getGamepads().
@@ -105,7 +105,7 @@
       if (timer !== null) clearTimeout(timer);
       if (refresh !== null) clearInterval(refresh);
       timer = refresh = null;
-      if (current()) rumbleToApp(slot, 0, 0);
+      if (current()) rumbleToApp(slot, 0, 0, 'stop');
       finish(result);
     };
     actuator = {
@@ -124,13 +124,13 @@
         const owner = generation;
         return new Promise((resolve) => {
           pending = resolve;
-          const pulse = () => {
+          const pulse = (phase = 'refresh') => {
             if (owner !== generation || !current()) { stop(); return; }
-            rumbleToApp(slot, strong, weak);
+            rumbleToApp(slot, strong, weak, phase);
           };
           const start = () => {
             if (owner !== generation || !current()) { stop(); return; }
-            pulse();
+            pulse('start');
             // The native session expires intents after 500 ms. Refresh only
             // for the requested effect lifetime; never change controller bytes.
             refresh = setInterval(pulse, 200);

@@ -38,6 +38,8 @@ final class UDPHub: ControllerOutputSink, @unchecked Sendable {
 
     private var slots: [Int: SlotSocket] = [:]
     private let queue = DispatchQueue(label: "com.petersharma.ftcw.udphub")
+    private let stateMailbox = BoundedStateMailbox<ControllerState>(
+        perSlotCapacity: 64, maxAge: 0.25, batchLimit: 32)
 
     init() {
         queue.async { [weak self] in self?.openSockets() }
@@ -124,7 +126,9 @@ final class UDPHub: ControllerOutputSink, @unchecked Sendable {
 
     // MARK: ControllerOutputSink (called on the Bluetooth queue)
 
-    func controllerConnected(slot: Int, model: Switch2.Model) {}
+    func controllerConnected(slot: Int, model: Switch2.Model) {
+        stateMailbox.clear(slot: slot)
+    }
 
     func controllerName(slot: Int, name: String) {
         queue.async { [weak self] in
@@ -160,41 +164,54 @@ final class UDPHub: ControllerOutputSink, @unchecked Sendable {
     }
 
     func controllerDisconnected(slot: Int) {
+        // Drop reports that have not reached this sink before ordering the
+        // neutral state on its serial queue.
+        stateMailbox.clear(slot: slot)
         queue.async { [weak self] in
             guard let self, let s = self.slots[slot] else { return }
-            // Release held input immediately on orderly disconnect. The SDL
-            // presence watchdog remains necessary for crashes or packet loss.
-            s.seq &+= 1
-            let neutral = Self.statePacket(seq: s.seq, state: ControllerState())
-            for peer in s.peers.keys { self.send(neutral, to: peer, via: s.fd) }
+            self.sendState(slot: slot, state: ControllerState(), socket: s)
             s.name = ""
         }
     }
 
     func controllerState(slot: Int, state: ControllerState) {
-        queue.async { [weak self] in
-            guard let self, let s = self.slots[slot], !s.peers.isEmpty else { return }
-            s.seq &+= 1
-            let packet = Self.statePacket(seq: s.seq, state: state)
-            let now = ProcessInfo.processInfo.systemUptime
-            for (peer, seen) in s.peers {
-                if now - seen > Self.peerTTL {
-                    s.peers.removeValue(forKey: peer)
-                    continue
-                }
-                var dest = sockaddr_in()
-                dest.sin_family = sa_family_t(AF_INET)
-                dest.sin_port = peer.port
-                dest.sin_addr.s_addr = peer.addr
-                _ = packet.withUnsafeBytes { bytes in
-                    withUnsafePointer(to: &dest) {
-                        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { destPtr in
-                            sendto(s.fd, bytes.baseAddress, bytes.count, 0,
-                                   destPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
-                        }
-                    }
-                }
+        if stateMailbox.submit(slot: slot, state: state) {
+            queue.async { [weak self] in self?.drainStates() }
+        }
+    }
+
+    private func drainStates() {
+        let batch = stateMailbox.take()
+        // Overflow/staleness means an edge may no longer be provable. Send a
+        // neutral snapshot before the newest state rather than silently losing
+        // a release and leaving the consumer stuck.
+        for recovery in batch.recoveries {
+            guard let socket = slots[recovery.slot] else { continue }
+            sendState(slot: recovery.slot, state: ControllerState(), socket: socket)
+            sendState(slot: recovery.slot, state: recovery.latest, socket: socket)
+            bridgeLog(.warning, "udphub",
+                      "slot \(recovery.slot + 1): output backlog recovered with neutral state")
+        }
+        for item in batch.items {
+            guard let socket = slots[item.slot] else { continue }
+            sendState(slot: item.slot, state: item.state, socket: socket)
+        }
+        if stateMailbox.completeDrain() {
+            queue.async { [weak self] in self?.drainStates() }
+        }
+    }
+
+    private func sendState(slot: Int, state: ControllerState, socket s: SlotSocket) {
+        guard !s.peers.isEmpty else { return }
+        s.seq &+= 1
+        let packet = Self.statePacket(seq: s.seq, state: state)
+        let now = ProcessInfo.processInfo.systemUptime
+        for (peer, seen) in s.peers {
+            if now - seen > Self.peerTTL {
+                s.peers.removeValue(forKey: peer)
+                continue
             }
+            send(packet, to: peer, via: s.fd)
         }
     }
 
@@ -203,10 +220,14 @@ final class UDPHub: ControllerOutputSink, @unchecked Sendable {
         d.append(contentsOf: [0x53, 0x32, 0x42, 0x31])  // "S2B1"
         append(&d, seq.littleEndian)
         append(&d, state.buttons.rawValue.littleEndian)
-        append(&d, Float(state.leftStick.x).bitPattern.littleEndian)
-        append(&d, Float(state.leftStick.y).bitPattern.littleEndian)
-        append(&d, Float(state.rightStick.x).bitPattern.littleEndian)
-        append(&d, Float(state.rightStick.y).bitPattern.littleEndian)
+        func axis(_ value: Double) -> Float {
+            guard value.isFinite else { return 0 }
+            return Float(max(-1, min(1, value)))
+        }
+        append(&d, axis(state.leftStick.x).bitPattern.littleEndian)
+        append(&d, axis(state.leftStick.y).bitPattern.littleEndian)
+        append(&d, axis(state.rightStick.x).bitPattern.littleEndian)
+        append(&d, axis(state.rightStick.y).bitPattern.littleEndian)
         d.append(state.leftTrigger)
         d.append(state.rightTrigger)
         append(&d, state.batteryMillivolts.littleEndian)

@@ -47,7 +47,9 @@ enum SettingsArchive {
               let controller = try? JSONSerialization.data(withJSONObject: settings),
               let normalized = try? JSONSerialization.jsonObject(with: controller) as? [String: [String: Any]],
               validate(settings: normalized) else { return nil }
-        return try? JSONEncoder().encode(Payload(controllerSettings: controller, joyConLinks: links))
+        guard let archive = try? JSONEncoder().encode(Payload(controllerSettings: controller, joyConLinks: links)),
+              archive.count <= maxArchiveBytes else { return nil }
+        return archive
     }
 
     static func validate(settings: [String: [String: Any]]) -> Bool {
@@ -89,7 +91,10 @@ enum SettingsArchive {
         func vector(_ key: String, count: Int, magnitude: Double) -> Bool {
             guard let raw = entry[key] else { return true }
             let values: [Double]
-            if let ns = raw as? [NSNumber] { values = ns.map(\.doubleValue) }
+            if let ns = raw as? [NSNumber] {
+                guard ns.allSatisfy({ CFGetTypeID($0) != CFBooleanGetTypeID() }) else { return false }
+                values = ns.map(\.doubleValue)
+            }
             else if let ds = raw as? [Double] { values = ds }
             else { return false }
             return values.count == count && values.allSatisfy { $0.isFinite && abs($0) <= magnitude }
@@ -129,7 +134,13 @@ enum SettingsArchive {
 
     private static func validateKeyMap(_ raw: Any) -> Bool {
         guard let map = raw as? [String: [String: Any]], map.count <= 32 else { return false }
-        return map.allSatisfy { Switch2.button(named: $0.key) != nil && KeySpec(dictionary: $0.value) != nil }
+        return map.allSatisfy { name, spec in
+            guard Switch2.button(named: name) != nil, KeySpec(dictionary: spec) != nil else { return false }
+            return ["keyCode", "modifiers"].allSatisfy { key in
+                guard let n = spec[key] as? NSNumber else { return false }
+                return CFGetTypeID(n) != CFBooleanGetTypeID()
+            }
+        }
     }
 
     static func defaultRecoveryURL() -> URL {
@@ -156,7 +167,11 @@ enum SettingsArchive {
     @discardableResult
     static func apply(_ validated: Validated, defaults: UserDefaults = .standard,
                       recoveryURL: URL = defaultRecoveryURL()) -> Bool {
-        guard stageRollback(defaults: defaults, recoveryURL: recoveryURL) else { return false }
+        // Never overwrite evidence of an interrupted import with half-written values.
+        if FileManager.default.fileExists(atPath: recoveryURL.path),
+           !recover(defaults: defaults, recoveryURL: recoveryURL) { return false }
+        guard validate(settings: validated.controllerSettings), validate(links: validated.joyConLinks),
+              stageRollback(defaults: defaults, recoveryURL: recoveryURL) else { return false }
         defaults.set(validated.controllerSettings, forKey: "controllerSettings")
         defaults.set(validated.joyConLinks, forKey: "joyConLinks")
         guard defaults.synchronize() else {
@@ -171,14 +186,18 @@ enum SettingsArchive {
     @discardableResult
     static func recover(defaults: UserDefaults = .standard,
                         recoveryURL: URL = defaultRecoveryURL()) -> Bool {
-        guard let data = try? Data(contentsOf: recoveryURL),
+        guard let values = try? recoveryURL.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]),
+              values.isRegularFile == true, values.isSymbolicLink != true,
+              let size = values.fileSize, size <= 16 * maxArchiveBytes,
+              let data = try? Data(contentsOf: recoveryURL),
               let rollback = try? PropertyListDecoder().decode(Rollback.self, from: data),
               let settings = plistDictionary(rollback.controllerSettings),
               let links = plistDictionary(rollback.joyConLinks) else { return false }
         defaults.set(settings, forKey: "controllerSettings")
         defaults.set(links, forKey: "joyConLinks")
         guard defaults.synchronize() else { return false }
-        try? FileManager.default.removeItem(at: recoveryURL)
+        do { try FileManager.default.removeItem(at: recoveryURL) }
+        catch { return false }
         return true
     }
 

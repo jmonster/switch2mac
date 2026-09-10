@@ -35,7 +35,24 @@ enum LogPipelineTests {
         precondition(FileManager.default.fileExists(atPath: pipeline.fileURL.path))
         precondition(FileManager.default.fileExists(atPath: root.appendingPathComponent("bridge.log.old").path))
         let current = (try? Data(contentsOf: pipeline.fileURL)) ?? Data()
-        precondition(!current.isEmpty)
+        precondition(!current.isEmpty && current.count <= 320)
+        let old = try! Data(contentsOf: root.appendingPathComponent("bridge.log.old"))
+        precondition(old.count <= 320)
+
+        // UI admission is bounded even when MainActor does not drain its tasks.
+        DispatchQueue.global().sync {
+            let entry = LogEntry(id: 1, date: Date(), level: .info, subsystem: "test", message: "test")
+            for _ in 0..<100 { LogStore.enqueue(Array(repeating: entry, count: 256)) }
+            precondition(LogStore.pendingPresentationCount <= 5_000)
+        }
+        // Flush must drain every batch present at entry, not only the first one.
+        let all = Mutex<[LogEntry]>([])
+        let bulk = LogPipeline(directory: root.appendingPathComponent("bulk"), maxPending: 1000, batchSize: 4) { batch in
+            all.withLock { $0.append(contentsOf: batch) }
+        }
+        for index in 0..<300 { bulk.submit(.info, "flush", "item \(index)") }
+        bulk.flush()
+        precondition(all.withLock { $0.count } == 300)
         print("PASS bounded asynchronous logging and runtime rotation")
     }
 }

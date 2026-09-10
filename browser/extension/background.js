@@ -4,6 +4,8 @@
 const URL = 'ws://127.0.0.1:24810';
 const RETRY_MS = 2000;
 const ports = new Set();
+const rumbleOwners = new Map(); // slot -> content-script port
+const MAX_SOCKET_BUFFER = 256 * 1024;
 let socket = null;
 let retryTimer = null;
 let replay = new Map(); // slot -> {connection, state}; a rename is not a connection
@@ -29,10 +31,37 @@ function connect() {
     if (socket !== owner) return;
     socket = null;
     replay.clear();
+    rumbleOwners.clear();
     fanOut('{"t":"bridge","up":false}');
     scheduleRetry();
   };
   owner.onerror = () => {}; // onclose owns failure/retry
+}
+
+
+function sendNative(text) {
+  const owner = socket;
+  if (!owner || owner.readyState !== WebSocket.OPEN) return false;
+  // Do not build seconds of stale rumble/telemetry behind a wedged browser
+  // socket. Closing transfers cleanup to the native client's disconnect path.
+  if ((owner.bufferedAmount || 0) > MAX_SOCKET_BUFFER) {
+    socket = null;
+    replay.clear();
+    rumbleOwners.clear();
+    try { owner.close(); } catch {}
+    fanOut('{"t":"bridge","up":false}');
+    scheduleRetry();
+    return false;
+  }
+  try { owner.send(text); return true; } catch {
+    socket = null;
+    replay.clear();
+    rumbleOwners.clear();
+    try { owner.close(); } catch {}
+    fanOut('{"t":"bridge","up":false}');
+    scheduleRetry();
+    return false;
+  }
 }
 
 function scheduleRetry() {
@@ -63,16 +92,36 @@ chrome.runtime.onConnect.addListener((port) => {
     try { m = JSON.parse(text); } catch { return; }
     if (!m || !['rumble', 'stats'].includes(m.t) ||
         !Number.isInteger(m.slot) || m.slot < 0 || m.slot >= 4) return;
-    if (socket && socket.readyState === WebSocket.OPEN) socket.send(text);
+    if (m.t === 'rumble') {
+      const strong = Number(m.strong) || 0, weak = Number(m.weak) || 0;
+      const phase = m.phase || ((strong === 0 && weak === 0) ? 'stop' : 'start');
+      const owner = rumbleOwners.get(m.slot);
+      if (phase === 'refresh' && owner !== port) return;
+      if (phase === 'stop') {
+        if (owner !== port) return;
+        rumbleOwners.delete(m.slot);
+      } else if (phase === 'start') {
+        // A new effect may preempt the previous tab, but its old refreshes
+        // cannot reclaim ownership afterwards.
+        rumbleOwners.set(m.slot, port);
+      } else { return; }
+    }
+    sendNative(text);
   });
   port.onDisconnect.addListener(() => {
     ports.delete(port);
+    for (const [slot, owner] of [...rumbleOwners]) {
+      if (owner !== port) continue;
+      rumbleOwners.delete(slot);
+      sendNative(JSON.stringify({t:'rumble', slot, strong:0, weak:0, phase:'stop'}));
+    }
     if (ports.size !== 0) return;
     if (retryTimer !== null) clearTimeout(retryTimer);
     retryTimer = null;
     const old = socket;
     socket = null; // retire before its asynchronous close callback can run
     replay.clear();
+    rumbleOwners.clear();
     old?.close();
   });
   if (socket && socket.readyState === WebSocket.OPEN) {

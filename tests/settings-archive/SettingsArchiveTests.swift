@@ -37,6 +37,14 @@ enum SettingsArchiveTests {
         precondition(!SettingsArchive.validate(links: ["A":"B", "C":"B"]))
         precondition(!SettingsArchive.validate(links: ["A":"B", "B":"C"]))
 
+        // Every successful export must be accepted by the same-version importer.
+        let large = Dictionary(uniqueKeysWithValues: (0..<16).map {
+            ("pad-\($0)", ["future": String(repeating: "x", count: 90_000)] as [String: Any])
+        })
+        precondition(SettingsArchive.encode(settings: large, links: [:]) == nil)
+        precondition(SettingsArchive.encode(settings: ["pad": ["stickCenterL": [true, false]]], links: [:]) == nil)
+        precondition(SettingsArchive.encode(settings: ["pad": ["keyMap": ["A": ["keyCode": true, "modifiers": 0, "label": "A"]]]], links: [:]) == nil)
+
         let d = defaults()
         d.set(sampleSettings(name: "before"), forKey: "controllerSettings")
         d.set(["L0":"R0"], forKey: "joyConLinks")
@@ -57,6 +65,16 @@ enum SettingsArchiveTests {
         precondition((applied["SERIAL-1"]?["name"] as? String) == "after")
         precondition((d.dictionary(forKey: "joyConLinks") as? [String:String]) == ["L1":"R1"])
         precondition(!FileManager.default.fileExists(atPath: rollback.path))
+        // A malformed existing journal must not be replaced by a new transaction.
+        let corrupt = Data("not a recovery record".utf8)
+        try corrupt.write(to: rollback)
+        precondition(!SettingsArchive.apply(decoded, defaults: d, recoveryURL: rollback))
+        let retained = try Data(contentsOf: rollback)
+        precondition(retained == corrupt)
+        precondition((d.dictionary(forKey: "joyConLinks") as? [String:String]) == ["L1":"R1"])
+        try FileManager.default.removeItem(at: rollback)
+        try FileManager.default.removeItem(at: dir)
+
         print("PASS settings archive validation and rollback")
     }
 }

@@ -40,6 +40,37 @@ final class LogStore: ObservableObject {
     @Published private(set) var entries: [LogEntry] = []
     private init() {}
 
+    private struct Inbox: Sendable {
+        var entries: [LogEntry] = []
+        var scheduled = false
+    }
+    private nonisolated static let inbox = Mutex(Inbox())
+
+    // Display only the newest window of logs if the main actor stalls. The
+    // file writer remains independent, and at most one UI task is queued.
+    nonisolated static func enqueue(_ batch: [LogEntry]) {
+        let schedule = inbox.withLock { state in
+            state.entries.append(contentsOf: batch.suffix(5_000))
+            if state.entries.count > 5_000 { state.entries.removeFirst(state.entries.count - 5_000) }
+            guard !state.scheduled else { return false }
+            state.scheduled = true
+            return true
+        }
+        if schedule { Task { @MainActor in drainInbox() } }
+    }
+
+    nonisolated static var pendingPresentationCount: Int { inbox.withLock { $0.entries.count } }
+
+    private static func drainInbox() {
+        let batch = inbox.withLock { state in
+            let entries = state.entries
+            state.entries.removeAll(keepingCapacity: true)
+            state.scheduled = false
+            return entries
+        }
+        shared.append(batch)
+    }
+
     fileprivate func append(_ batch: [LogEntry]) {
         guard !batch.isEmpty else { return }
         entries.append(contentsOf: batch)
@@ -84,7 +115,7 @@ final class LogPipeline: @unchecked Sendable {
     init(directory: URL, maxFileBytes: Int = 5_000_000, maxPending: Int = 2_048,
          batchSize: Int = 256,
          deliver: @escaping @Sendable ([LogEntry]) -> Void = { entries in
-             Task { @MainActor in LogStore.shared.append(entries) }
+             LogStore.enqueue(entries)
          }) {
         precondition(maxFileBytes > 0 && maxPending > 0 && batchSize > 0)
         fileURL = directory.appendingPathComponent("bridge.log")
@@ -106,7 +137,7 @@ final class LogPipeline: @unchecked Sendable {
             } else {
                 state.pending.append(LogEntry(id: state.nextID, date: Date(), level: level,
                                               subsystem: String(subsystem.prefix(64)),
-                                              message: String(message.prefix(16_384))))
+                                              message: String(decoding: message.utf8.prefix(16_384), as: UTF8.self)))
                 state.nextID &+= 1
             }
             guard !state.scheduled else { return false }
@@ -116,7 +147,14 @@ final class LogPipeline: @unchecked Sendable {
         if shouldSchedule { writerQueue.async { [weak self] in self?.drain() } }
     }
 
-    func flush() { writerQueue.sync { drainSynchronously() } }
+    /// Drain the work present at entry, without waiting indefinitely for new producers.
+    func flush() {
+        writerQueue.sync {
+            let batches = buffer.withLock { ($0.pending.count + batchSize - 1) / batchSize + 1 }
+            for _ in 0..<batches { drainSynchronously() }
+            try? fileHandle?.synchronize()
+        }
+    }
 
     private func drain() {
         drainSynchronously()
@@ -150,10 +188,10 @@ final class LogPipeline: @unchecked Sendable {
         guard !batch.isEmpty else { return }
         for entry in batch {
             switch entry.level {
-            case .debug: logger.debug("[\(entry.subsystem, privacy: .public)] \(entry.message, privacy: .public)")
-            case .info: logger.info("[\(entry.subsystem, privacy: .public)] \(entry.message, privacy: .public)")
-            case .warning: logger.warning("[\(entry.subsystem, privacy: .public)] \(entry.message, privacy: .public)")
-            case .error: logger.error("[\(entry.subsystem, privacy: .public)] \(entry.message, privacy: .public)")
+            case .debug: logger.debug("[\(entry.subsystem, privacy: .public)] \(entry.message, privacy: .private)")
+            case .info: logger.info("[\(entry.subsystem, privacy: .public)] \(entry.message, privacy: .private)")
+            case .warning: logger.warning("[\(entry.subsystem, privacy: .public)] \(entry.message, privacy: .private)")
+            case .error: logger.error("[\(entry.subsystem, privacy: .public)] \(entry.message, privacy: .private)")
             }
         }
         write(batch)
@@ -163,9 +201,9 @@ final class LogPipeline: @unchecked Sendable {
 
     private func openFile() {
         let directory = fileURL.deletingLastPathComponent()
-        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         if !FileManager.default.fileExists(atPath: fileURL.path) {
-            _ = FileManager.default.createFile(atPath: fileURL.path, contents: nil)
+            _ = FileManager.default.createFile(atPath: fileURL.path, contents: nil, attributes: [.posixPermissions: 0o600])
         }
         fileBytes = (try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.size] as? Int) ?? 0
         fileHandle = try? FileHandle(forWritingTo: fileURL)
@@ -177,23 +215,28 @@ final class LogPipeline: @unchecked Sendable {
         try? fileHandle?.close(); fileHandle = nil
         try? FileManager.default.removeItem(at: oldFileURL)
         if FileManager.default.fileExists(atPath: fileURL.path) {
-            try? FileManager.default.moveItem(at: fileURL, to: oldFileURL)
+            try? FileManager.default.moveItem(atPath: fileURL.path, toPath: oldFileURL.path)
         }
         openFile()
     }
 
     private func write(_ entries: [LogEntry]) {
-        let text = entries.map { entry in
-            "\(formatter.string(from: entry.date)) \(entry.level.rawValue) [\(entry.subsystem)] \(entry.message)\n"
-        }.joined()
-        guard let data = text.data(using: .utf8) else { return }
-        rotateIfNeeded(incoming: data.count)
-        do {
-            try fileHandle?.write(contentsOf: data)
-            fileBytes += data.count
-        } catch {
-            try? fileHandle?.close(); fileHandle = nil
-            openFile()
+        for entry in entries {
+            let message = entry.message.replacingOccurrences(of: "\n", with: "\\n")
+                .replacingOccurrences(of: "\r", with: "\\r")
+            let line = "\(formatter.string(from: entry.date)) \(entry.level.rawValue) [\(entry.subsystem)] \(message)"
+            var data = Data(line.utf8.prefix(maxFileBytes - 1))
+            while String(data: data, encoding: .utf8) == nil { data.removeLast() }
+            data.append(10)
+            rotateIfNeeded(incoming: data.count)
+            guard let handle = fileHandle, fileBytes + data.count <= maxFileBytes else { continue }
+            do {
+                try handle.write(contentsOf: data)
+                fileBytes += data.count
+            } catch {
+                try? handle.close(); fileHandle = nil
+                openFile()
+            }
         }
     }
 }
