@@ -8,6 +8,13 @@ final class Delegate: ControllerSessionDelegate {
     func sessionDidUpdateState(_ session: ControllerSession) {}
 }
 
+final class StateCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    func increment() { lock.lock(); defer { lock.unlock() }; count += 1 }
+    var value: Int { lock.lock(); defer { lock.unlock() }; return count }
+}
+
 @main
 enum SessionTests {
     static func fixture() -> (ControllerSession, CBPeripheral, DispatchQueue, Delegate) {
@@ -23,6 +30,71 @@ enum SessionTests {
         let selected = CommandLine.arguments.last!
         func run(_ name: String, _ test: () -> Void) {
             if selected == "all" || selected == name { test(); print("PASS \(name)") }
+        }
+        run("retired-notification") {
+            let (s, _, _, d) = fixture(); defer { _ = d }
+            var calls = 0
+            s.notifyCompletion = { _ in calls += 1 }
+            s.teardown()
+            let input = s.chars[Switch2.GATT.inputReport]!
+            input.isNotifying = true
+            s.peripheral(s.peripheral, didUpdateNotificationStateFor: input, error: nil)
+            precondition(calls == 0, "A retired subscription callback resumed its handshake")
+        }
+        run("retired-input-command") {
+            let (s, p, q, d) = fixture(); defer { _ = d }
+            let states = StateCounter()
+            s.onState = { _, _ in states.increment() }
+            s.teardown()
+            s.handleInputReport(Data(repeating: 0, count: 63))
+            s.experimentalCommand(9, 7, payload: Data()) { _ in }
+            q.sync {}
+            precondition(states.value == 0 && p.writes.isEmpty, "Retired input/commands must not reach outputs")
+        }
+        run("ready-needs-input") {
+            let (s, _, _, d) = fixture(); defer { s.teardown() }
+            s.advanceHandshake()
+            precondition(d.ready == 0, "Subscription/handshake without a valid input report is not ready")
+            s.handleInputReport(Data(repeating: 0, count: 10))
+            precondition(d.ready == 0)
+            s.handleInputReport(Data(repeating: 0, count: 63))
+            precondition(d.ready == 1)
+            s.handleInputReport(Data(repeating: 0, count: 63))
+            precondition(d.ready == 1)
+        }
+        run("early-report-is-delivered") {
+            let (s, _, _, d) = fixture(); defer { s.teardown() }
+            s.handleInputReport(Data(repeating: 0, count: 63))
+            precondition(d.ready == 0)
+            let states = StateCounter()
+            s.onState = { _, _ in states.increment() }
+            s.advanceHandshake()
+            precondition(d.ready == 1 && states.value == 1, "Input received during handshake must not be lost")
+        }
+        run("retired-keepalive") {
+            let (s, p, q, d) = fixture(); defer { _ = d }
+            q.sync {
+                s.advanceHandshake()
+                s.teardown()
+                s.maintainTick()
+                s.begin()
+                precondition(s.keepAliveTimer == nil && p.writes.isEmpty)
+            }
+        }
+        run("notification-disabled") {
+            let (s, _, _, d) = fixture(); defer { s.teardown() }
+            let input = s.chars[Switch2.GATT.inputReport]!
+            input.isNotifying = false
+            s.peripheral(s.peripheral, didUpdateNotificationStateFor: input, error: nil)
+            precondition(d.failures == 1, "Disabled essential notifications are not success")
+        }
+        run("notification-completion-reentrancy") {
+            let (s, _, _, d) = fixture(); defer { s.teardown(); _ = d }
+            let input = s.chars[Switch2.GATT.inputReport]!
+            input.isNotifying = true
+            s.notifyCompletion = { _ in s.notifyCompletion = { _ in } }
+            s.peripheral(s.peripheral, didUpdateNotificationStateFor: input, error: nil)
+            precondition(s.notifyCompletion != nil, "A completed callback erased replacement work")
         }
         run("rumble") {
             for model in Switch2.Model.allCases {
