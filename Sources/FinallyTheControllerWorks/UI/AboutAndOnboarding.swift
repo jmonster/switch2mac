@@ -147,32 +147,22 @@ struct OnboardingView: View {
     }
 }
 
-/// Whole-app settings backup: exports/imports the two UserDefaults blobs the
-/// app relies on (per-controller settings + Joy-Con links).
+/// Whole-app settings backup. Validation and rollback live outside the UI so
+/// imported data cannot partially mutate live preferences.
 @MainActor
 enum SettingsTransfer {
-    struct Bundle: Codable {
-        var controllerSettings: Data
-        var joyConLinks: [String: String]
-        var version: Int = 1
-    }
+    typealias Bundle = SettingsArchive.Payload
 
     static func export() -> Data? {
         let d = UserDefaults.standard
-        let controller = (try? JSONSerialization.data(
-            withJSONObject: d.dictionary(forKey: "controllerSettings") ?? [:])) ?? Data()
+        let settings = d.dictionary(forKey: "controllerSettings") as? [String: [String: Any]] ?? [:]
         let links = d.dictionary(forKey: "joyConLinks") as? [String: String] ?? [:]
-        return try? JSONEncoder().encode(Bundle(controllerSettings: controller, joyConLinks: links))
+        return SettingsArchive.encode(settings: settings, links: links)
     }
 
     static func `import`(_ data: Data) -> Bool {
-        guard let bundle = try? JSONDecoder().decode(Bundle.self, from: data) else { return false }
-        let d = UserDefaults.standard
-        if let dict = try? JSONSerialization.jsonObject(with: bundle.controllerSettings)
-            as? [String: [String: Any]] {
-            d.set(dict, forKey: "controllerSettings")
-        }
-        d.set(bundle.joyConLinks, forKey: "joyConLinks")
+        guard let validated = SettingsArchive.decode(data),
+              SettingsArchive.apply(validated) else { return false }
         ControllerSettings.shared.reload()
         NotificationCenter.default.post(name: ControllerSettings.namesChangedNotification, object: nil)
         return true
