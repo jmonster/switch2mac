@@ -44,6 +44,12 @@ jobs:
           git -C .ci-sdl apply "$GITHUB_WORKSPACE/sdl/s2usb-device-identity.patch"
           bash tests/sdl-usb/check-sdl.sh .ci-sdl after
           SDL3_DYNAMIC_API="$GITHUB_WORKSPACE/build/sdl/libSDL3.0.dylib" "$RUNNER_TEMP/check-edges"
+      - name: Pro Controller gamepad, sensor and rumble integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          cc -I .ci-sdl/include tests/sdl-pro-controller/check.c -L "$RUNNER_TEMP/sdl-build" -Wl,-rpath,"$RUNNER_TEMP/sdl-build" -lSDL3 -o "$RUNNER_TEMP/check-pro"
+          SDL3_DYNAMIC_API="$GITHUB_WORKSPACE/build/sdl/libSDL3.0.dylib" "$RUNNER_TEMP/check-pro"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:

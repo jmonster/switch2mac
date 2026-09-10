@@ -6,6 +6,14 @@ GameCube controller, based on Peter Sharma's
 This fork concentrates on input delivery, controller ownership and tested
 output integrations. It is not a Nintendo product or an official upstream release.
 
+## Switch 2 Pro Controller
+
+The [Pro Controller support guide](docs/pro-controller-support.md) covers all
+21 buttons, independent stick calibration and two-motor rumble, output-backend
+capabilities, the rebuilt SDL gyro/accelerometer path, and hardware acceptance
+limits. NFC and headphone/microphone audio remain experimental. The tracked
+historical SDL binary must be rebuilt to include source changes.
+
 ## Build this fork
 
 Use a macOS development environment with Swift 6 and Apple SDKs that provide
