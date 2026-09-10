@@ -30,6 +30,14 @@ jobs:
           bash scripts/build-app.sh
           codesign --verify --strict "build/Finally the Controller Works (jmonster).app"
           plutil -lint "build/Finally the Controller Works (jmonster).app/Contents/Info.plist"
+      - name: Verify and package the tested development app
+        run: bash scripts/package-dev.sh
+      - name: Preserve the tested application
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: switch2mac-development-app
+          path: build/distribution/
+          retention-days: 14
       - name: Preserve exact tested source
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

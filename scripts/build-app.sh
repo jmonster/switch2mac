@@ -41,6 +41,16 @@ if [ -f Resources/AppIcon.icns ]; then
         "$OUT/Contents/Info.plist" 2>/dev/null || true
 fi
 
+# Keep setup resources with the binary; never install the extension automatically.
+mkdir -p "$OUT/Contents/Resources/BrowserExtension"
+cp browser/extension/manifest.json browser/extension/*.js "$OUT/Contents/Resources/BrowserExtension/"
+REVISION=$(git rev-parse HEAD)
+DIRTY=false
+[ -z "$(git status --porcelain --untracked-files=normal -- Sources Resources browser/extension scripts Package.swift)" ] || DIRTY=true
+/usr/libexec/PlistBuddy -c "Add :FTCWSourceRevision string $REVISION" "$OUT/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :FTCWSourceDirty bool $DIRTY" "$OUT/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :FTCWBuildArchitecture string $(uname -m)" "$OUT/Contents/Info.plist"
+
 if [ -n "${SIGN_IDENTITY:-}" ]; then
     if [ -n "${PROVISIONING_PROFILE:-}" ]; then
         # Full build: profile-gated HID entitlement → system-wide virtual pads.
