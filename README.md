@@ -6,6 +6,9 @@ GameCube controller, based on Peter Sharma's
 This fork concentrates on input delivery, controller ownership and tested
 output integrations. It is not a Nintendo product or an official upstream release.
 
+**Start here:** [From installation to input in a game](docs/quick-start.md).
+Bluetooth connection and game-output setup are separate steps.
+
 ## Switch 2 Pro Controller
 
 The [Pro Controller support guide](docs/pro-controller-support.md) covers all
