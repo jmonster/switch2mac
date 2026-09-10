@@ -87,6 +87,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         bridgeLog(.info, "app", "Finally the Controller Works — starting bridge")
         engine.addSink(UDPHub())
         engine.addSink(WebSocketHub())
+        engine.addSink(NetworkGamepadSink())
         engine.addSink(VirtualHIDSink())
         notifications.attach(to: engine)
         // Daily auto-update check (only if a feed URL is configured); results
