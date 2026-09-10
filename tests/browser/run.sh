@@ -13,7 +13,7 @@ s=(base/'Bluetooth/ControllerSession.swift').read_text()
 a=s.index('struct ControllerState:');b=s.index('/// Called on the Bluetooth queue.',a)
 out.joinpath('State.swift').write_text('import Foundation\n'+s[a:b])
 PY
-swiftc -swift-version 5 Sources/FinallyTheControllerWorks/Protocol/Switch2Protocol.swift \
+swiftc -swift-version 6 -warnings-as-errors Sources/FinallyTheControllerWorks/Protocol/Switch2Protocol.swift \
  "$work/State.swift" Sources/FinallyTheControllerWorks/Output/WebSocketHub.swift \
  tests/browser/BrowserServer.swift -o "$work/browser-server"
 python3 tests/browser/websocket_test.py "$work/browser-server"

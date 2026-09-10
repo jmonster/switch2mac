@@ -683,13 +683,13 @@ struct ControllerCard: View {
         )
     }
 
-    private func boolBinding(get: @escaping () -> Bool,
-                             set: @escaping (Bool) -> Void) -> Binding<Bool> {
+    private func boolBinding(get: @escaping @MainActor @Sendable () -> Bool,
+                             set: @escaping @MainActor @Sendable (Bool) -> Void) -> Binding<Bool> {
         Binding(get: get, set: set)
     }
 
-    private func boolDoubleBinding(get: @escaping () -> Double,
-                                   set: @escaping (Double) -> Void) -> Binding<Double> {
+    private func boolDoubleBinding(get: @escaping @MainActor @Sendable () -> Double,
+                                   set: @escaping @MainActor @Sendable (Double) -> Void) -> Binding<Double> {
         Binding(get: get, set: set)
     }
 

@@ -149,6 +149,7 @@ struct OnboardingView: View {
 
 /// Whole-app settings backup: exports/imports the two UserDefaults blobs the
 /// app relies on (per-controller settings + Joy-Con links).
+@MainActor
 enum SettingsTransfer {
     struct Bundle: Codable {
         var controllerSettings: Data
