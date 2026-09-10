@@ -18,3 +18,9 @@ swiftc -swift-version 5 \
   "$work/ControllerSession.swift" tests/session/FrameworkFakes.swift \
   tests/session/SessionTests.swift -o "$work/session-tests"
 "$work/session-tests" "${SESSION_CASE:-all}"
+
+swiftc -swift-version 5 \
+  Sources/FinallyTheControllerWorks/Protocol/Switch2Protocol.swift \
+  "$work/ControllerSession.swift" tests/session/FrameworkFakes.swift \
+  tests/session/FlowTests.swift -o "$work/flow-tests"
+"$work/flow-tests" "${SESSION_CASE:-all}"
