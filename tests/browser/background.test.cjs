@@ -8,7 +8,7 @@ function fixture() {
   const sockets = [], timers = new Map(); let next = 0, attach;
   class Socket {
     static OPEN = 1;
-    constructor() { this.readyState = 0; this.sent = []; sockets.push(this); }
+    constructor() { this.readyState = 0; this.sent = []; this.bufferedAmount = 0; sockets.push(this); }
     open() { this.readyState = 1; this.onopen?.(); }
     message(obj) { this.onmessage?.({data: JSON.stringify(obj)}); }
     close() { this.readyState = 3; }
@@ -71,4 +71,33 @@ test('only bounded known command messages cross from a page to the local hub', (
   assert.equal(ws.sent.length, 0);
   p.send(JSON.stringify({t:'rumble',slot:1,strong:0.3,weak:0}));
   assert.equal(ws.sent.length, 1); p.close();
+});
+
+test('one tab cannot stop or refresh another tab rumble effect', () => {
+  const f = fixture(), a = f.port(), b = f.port(), ws = f.sockets[0]; ws.open();
+  a.send(JSON.stringify({t:'rumble',slot:0,strong:1,weak:0,phase:'start'}));
+  b.send(JSON.stringify({t:'rumble',slot:0,strong:0,weak:1,phase:'refresh'}));
+  b.send(JSON.stringify({t:'rumble',slot:0,strong:0,weak:0,phase:'stop'}));
+  assert.equal(ws.sent.length, 1);
+  assert.equal(ws.sent[0].strong, 1);
+  b.send(JSON.stringify({t:'rumble',slot:0,strong:0,weak:1,phase:'start'}));
+  a.send(JSON.stringify({t:'rumble',slot:0,strong:1,weak:0,phase:'refresh'}));
+  assert.equal(ws.sent.length, 2);
+  assert.equal(ws.sent[1].weak, 1);
+  b.close();
+  assert.equal(ws.sent.at(-1).strong, 0);
+  assert.equal(ws.sent.at(-1).weak, 0);
+  a.close();
+});
+
+test('wedged websocket is retired instead of buffering stale commands', () => {
+  const f = fixture(), p = f.port(), ws = f.sockets[0]; ws.open();
+  ws.bufferedAmount = 300 * 1024;
+  p.send(JSON.stringify({t:'rumble',slot:1,strong:1,weak:0,phase:'start'}));
+  assert.equal(ws.sent.length, 0);
+  assert.equal(ws.readyState, 3);
+  assert.equal(p.received.at(-1).t, 'bridge');
+  assert.equal(p.received.at(-1).up, false);
+  assert.equal(f.timers.size, 1);
+  p.close();
 });

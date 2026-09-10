@@ -17,5 +17,6 @@ a=s.index('struct ControllerState:'); b=s.index('/// Called on the Bluetooth que
 out.joinpath('State.swift').write_text('import Foundation\n'+s[a:b])
 PY
 swiftc -swift-version 5 Sources/FinallyTheControllerWorks/Protocol/Switch2Protocol.swift \
+ Sources/FinallyTheControllerWorks/Runtime/BoundedStateMailbox.swift \
  "$work/State.swift" "$work/UDPHub.swift" tests/udp/UDPTests.swift -o "$work/test"
 "$work/test" "${UDP_CASE:-all}"
