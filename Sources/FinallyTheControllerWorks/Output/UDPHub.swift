@@ -37,12 +37,20 @@ final class UDPHub: ControllerOutputSink, @unchecked Sendable {
     }
 
     private var slots: [Int: SlotSocket] = [:]
+    // Metadata can arrive while another process still owns a slot's port.
+    private var names: [Int: String] = [:]
     private let queue = DispatchQueue(label: "com.petersharma.ftcw.udphub")
     private let stateMailbox = BoundedStateMailbox<ControllerState>(
         perSlotCapacity: 64, maxAge: 0.25, batchLimit: 32)
 
     init() {
         queue.async { [weak self] in self?.openSockets() }
+    }
+
+    deinit {
+        // A read source owns its descriptor until its cancellation handler runs.
+        // Closing here would race an already-dispatched read / descriptor reuse.
+        for socket in slots.values { socket.readSource?.cancel() }
     }
 
     /// Bind whatever ports are free; retry the rest every 5 s (another bridge
@@ -63,8 +71,8 @@ final class UDPHub: ControllerOutputSink, @unchecked Sendable {
         for slot in 0..<BridgeEngine.maxPlayers where slots[slot] == nil {
             let fd = socket(AF_INET, SOCK_DGRAM, 0)
             guard fd >= 0 else { continue }
-            var yes: Int32 = 1
-            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+            // UDP has no TIME_WAIT to bypass. Each loopback port must have one
+            // owner; address reuse lets a second bridge divert subscriptions.
             var addr = sockaddr_in()
             addr.sin_family = sa_family_t(AF_INET)
             addr.sin_port = (Self.basePort + UInt16(slot)).bigEndian
@@ -80,16 +88,24 @@ final class UDPHub: ControllerOutputSink, @unchecked Sendable {
                 close(fd)
                 continue
             }
-            _ = fcntl(fd, F_SETFL, O_NONBLOCK)
+            let flags = fcntl(fd, F_GETFL, 0)
+            guard flags >= 0, fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0,
+                  fcntl(fd, F_SETFD, FD_CLOEXEC) == 0 else {
+                bridgeLog(.warning, "udphub", "cannot configure nonblocking socket; will retry")
+                close(fd)
+                continue
+            }
 
             let slotSocket = SlotSocket(fd: fd)
+            slotSocket.name = names[slot] ?? ""
             let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
             source.setEventHandler { [weak self] in
                 self?.drainSocket(slot: slot)
             }
-            source.resume()
+            source.setCancelHandler { close(fd) }
             slotSocket.readSource = source
             slots[slot] = slotSocket
+            source.resume()
         }
     }
 
@@ -131,8 +147,11 @@ final class UDPHub: ControllerOutputSink, @unchecked Sendable {
     }
 
     func controllerName(slot: Int, name: String) {
+        guard (0..<BridgeEngine.maxPlayers).contains(slot) else { return }
         queue.async { [weak self] in
-            guard let self, let s = self.slots[slot], s.name != name else { return }
+            guard let self else { return }
+            self.names[slot] = name
+            guard let s = self.slots[slot], s.name != name else { return }
             s.name = name
             let packet = Self.namePacket(name)
             for peer in s.peers.keys {
@@ -168,7 +187,9 @@ final class UDPHub: ControllerOutputSink, @unchecked Sendable {
         // neutral state on its serial queue.
         stateMailbox.clear(slot: slot)
         queue.async { [weak self] in
-            guard let self, let s = self.slots[slot] else { return }
+            guard let self else { return }
+            self.names.removeValue(forKey: slot)
+            guard let s = self.slots[slot] else { return }
             self.sendState(slot: slot, state: ControllerState(), socket: s)
             s.name = ""
         }

@@ -57,10 +57,85 @@ enum UDPTests {
             hub.drainSocket(slot: slot)
         }
     }
+    static func bindPort(_ port: UInt16) -> Int32 {
+        let fd = socket(AF_INET, datagram, 0)
+        precondition(fd >= 0)
+        var address = sockaddr_in()
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = port.bigEndian
+        address.sin_addr.s_addr = UInt32(0x7f000001).bigEndian
+        let result = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        precondition(result == 0, "Test requires free loopback ports")
+        return fd
+    }
+
+    static func lifecycle() {
+        for _ in 0..<20 {
+            var hub: UDPHub? = UDPHub()
+            weak var retired = hub
+            let descriptors = hub!.queue.sync { hub!.slots.values.map(\.fd) }
+            precondition(descriptors.count == 4)
+            hub = nil
+            // Dispatch source cancellation is asynchronous. Wait for the
+            // actual production cancel handlers, not a replacement test hook.
+            var closed = false
+            for _ in 0..<200 {
+                closed = retired == nil && descriptors.allSatisfy { fd in
+                    fcntl(fd, F_GETFD, 0) == -1 && errno == EBADF
+                }
+                if closed { break }
+                Thread.sleep(forTimeInterval: 0.005)
+            }
+            precondition(closed, "Retired hub leaked a socket or read source")
+        }
+        print("PASS 20 create/destroy cycles close all socket descriptors")
+    }
+
+    static func lateBind() {
+        let first = bindPort(24800), second = bindPort(24801)
+        let hub = UDPHub()
+        hub.queue.sync { precondition(hub.slots[0] == nil && hub.slots[1] == nil) }
+        hub.controllerName(slot: 0, name: "waiting controller")
+        hub.controllerName(slot: 1, name: "retired controller")
+        hub.controllerDisconnected(slot: 1)
+        hub.queue.sync {}
+        close(first); close(second)
+        hub.queue.sync {
+            // Exercise the production retry operation without sleeping 5 s.
+            hub.openMissingSockets()
+            precondition(hub.slots.count == 4)
+            precondition(hub.slots[0]!.name == "waiting controller", "Retry lost the live controller name")
+            precondition(hub.slots[1]!.name.isEmpty, "Retry resurrected retired controller metadata")
+            for socket in hub.slots.values {
+                precondition(fcntl(socket.fd, F_GETFL, 0) & O_NONBLOCK != 0)
+                precondition(fcntl(socket.fd, F_GETFD, 0) & FD_CLOEXEC != 0)
+            }
+        }
+        let fd = client(24800)
+        defer { close(fd) }
+        sendAndDrain(hub, slot: 0, fd: fd, bytes: [])
+        precondition(receive(fd) == Data("S2N1waiting controller".utf8), "Late subscriber missed cached name")
+        print("PASS late-bind name replay and disconnected metadata cleanup")
+    }
+
     static func main() {
         let selected = CommandLine.arguments.last!
+        // These own all four ports and run in their own process invocation.
+        if selected == "lifecycle" { lifecycle(); return }
+        if selected == "late-bind" { lateBind(); return }
         let hub = UDPHub()
         hub.queue.sync { precondition(hub.slots.count == 4) }
+        if selected == "all" || selected == "exclusive" {
+            let competitor = UDPHub()
+            competitor.queue.sync {
+                precondition(competitor.slots.isEmpty, "A second hub stole the first hub's ports")
+            }
+            print("PASS exclusive loopback port ownership")
+        }
         let a = client(24800), b = client(24801)
         defer { close(a); close(b) }
         sendBytes(a, []); sendBytes(b, [])

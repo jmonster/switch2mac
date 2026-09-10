@@ -20,3 +20,7 @@ swiftc -swift-version 5 Sources/FinallyTheControllerWorks/Protocol/Switch2Protoc
  Sources/FinallyTheControllerWorks/Runtime/BoundedStateMailbox.swift \
  "$work/State.swift" "$work/UDPHub.swift" tests/udp/UDPTests.swift -o "$work/test"
 "$work/test" "${UDP_CASE:-all}"
+if [ "${UDP_CASE:-all}" = all ]; then
+  "$work/test" lifecycle
+  "$work/test" late-bind
+fi
