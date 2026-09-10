@@ -8,7 +8,7 @@
 //          | f32 lx,ly,rx,ry | u8 lt,rt | u16 battery_mv
 //          | i16 gyro[3] | i16 accel[3]
 //   Rumble in  (6 bytes):  "S2R1" | u8 strong | u8 weak
-//   Any inbound datagram registers its sender as a subscriber (30 s TTL).
+//   An empty hello or valid rumble registers its sender (30 s TTL).
 
 import Foundation
 import Darwin
@@ -17,6 +17,7 @@ final class UDPHub: ControllerOutputSink, @unchecked Sendable {
 
     private static let basePort: UInt16 = 24800
     private static let peerTTL: TimeInterval = 30
+    private static let maxPeers = 64
 
     var onRumble: ((Int, Double, Double) -> Void)?
 
@@ -93,7 +94,8 @@ final class UDPHub: ControllerOutputSink, @unchecked Sendable {
     private func drainSocket(slot: Int) {
         guard let s = slots[slot] else { return }
         var buf = [UInt8](repeating: 0, count: 64)
-        while true {
+        // Bound each read dispatch so a noisy local peer cannot starve output.
+        for _ in 0..<256 {
             var from = sockaddr_in()
             var fromLen = socklen_t(MemoryLayout<sockaddr_in>.size)
             let n = withUnsafeMutablePointer(to: &from) {
@@ -102,14 +104,19 @@ final class UDPHub: ControllerOutputSink, @unchecked Sendable {
                 }
             }
             if n < 0 { break }  // EWOULDBLOCK: drained
+            let isRumble = n == 6 && buf[0...3].elementsEqual([0x53, 0x32, 0x52, 0x31])
+            guard n == 0 || isRumble else { continue }
+            let now = ProcessInfo.processInfo.systemUptime
+            s.peers = s.peers.filter { now - $0.value <= Self.peerTTL }
             let peer = SockAddr(addr: from.sin_addr.s_addr, port: from.sin_port)
             let isNewPeer = s.peers[peer] == nil
-            s.peers[peer] = CFAbsoluteTimeGetCurrent()
+            guard !isNewPeer || s.peers.count < Self.maxPeers else { continue }
+            s.peers[peer] = now
             if isNewPeer, !s.name.isEmpty {
                 // Late joiners get the name before their first state packet.
                 send(Self.namePacket(s.name), to: peer, via: s.fd)
             }
-            if n >= 6, buf[0] == 0x53, buf[1] == 0x32, buf[2] == 0x52, buf[3] == 0x31 {  // "S2R1"
+            if isRumble {
                 onRumble?(slot, Double(buf[4]) / 255.0, Double(buf[5]) / 255.0)
             }
         }
@@ -154,7 +161,13 @@ final class UDPHub: ControllerOutputSink, @unchecked Sendable {
 
     func controllerDisconnected(slot: Int) {
         queue.async { [weak self] in
-            self?.slots[slot]?.seq = 0
+            guard let self, let s = self.slots[slot] else { return }
+            // Release held input immediately on orderly disconnect. The SDL
+            // presence watchdog remains necessary for crashes or packet loss.
+            s.seq &+= 1
+            let neutral = Self.statePacket(seq: s.seq, state: ControllerState())
+            for peer in s.peers.keys { self.send(neutral, to: peer, via: s.fd) }
+            s.name = ""
         }
     }
 
@@ -163,7 +176,7 @@ final class UDPHub: ControllerOutputSink, @unchecked Sendable {
             guard let self, let s = self.slots[slot], !s.peers.isEmpty else { return }
             s.seq &+= 1
             let packet = Self.statePacket(seq: s.seq, state: state)
-            let now = CFAbsoluteTimeGetCurrent()
+            let now = ProcessInfo.processInfo.systemUptime
             for (peer, seen) in s.peers {
                 if now - seen > Self.peerTTL {
                     s.peers.removeValue(forKey: peer)
