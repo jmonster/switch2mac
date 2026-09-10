@@ -1,4 +1,4 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.2
 // "Finally the Controller Works" — Switch 2 controllers on macOS, for real.
 import PackageDescription
 
@@ -9,7 +9,7 @@ let package = Package(
         .executableTarget(
             name: "FinallyTheControllerWorks",
             path: "Sources/FinallyTheControllerWorks",
-            swiftSettings: [.swiftLanguageMode(.v5)]
+            swiftSettings: [.swiftLanguageMode(.v6)]
         )
     ]
 )

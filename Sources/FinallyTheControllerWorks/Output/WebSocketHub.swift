@@ -97,15 +97,18 @@ final class WebSocketHub: ControllerOutputSink, @unchecked Sendable {
 
     private func accept(_ connection: NWConnection) {
         guard clients.count < Self.maxClients else { connection.cancel(); return }
+        dispatchPrecondition(condition: .onQueue(queue))
         let id = ObjectIdentifier(connection)
         let client = Client(connection)
         clients[id] = client // include incomplete handshakes in the bound
-        queue.asyncAfter(deadline: .now() + 5) { [weak self, weak client] in
-            guard let self, let client, self.clients[id] === client, !client.ready else { return }
+        queue.asyncAfter(deadline: .now() + 5) { [weak self, weak connection] in
+            guard let self, let connection, let client = self.clients[id],
+                  client.connection === connection, !client.ready else { return }
             self.remove(id)
         }
-        connection.stateUpdateHandler = { [weak self, weak client] state in
-            guard let self, let client, self.clients[id] === client else { return }
+        connection.stateUpdateHandler = { [weak self, weak connection] state in
+            guard let self, let connection, let client = self.clients[id],
+                  client.connection === connection else { return }
             switch state {
             case .ready:
                 client.ready = true
@@ -123,6 +126,7 @@ final class WebSocketHub: ControllerOutputSink, @unchecked Sendable {
     }
 
     private func remove(_ id: ObjectIdentifier) {
+        dispatchPrecondition(condition: .onQueue(queue))
         guard let client = clients.removeValue(forKey: id) else { return }
         client.connection.cancel()
         // A departing observer cannot stop another client's active effect.
@@ -133,9 +137,11 @@ final class WebSocketHub: ControllerOutputSink, @unchecked Sendable {
     }
 
     private func receive(_ client: Client) {
+        dispatchPrecondition(condition: .onQueue(queue))
         let connection = client.connection, id = ObjectIdentifier(client.connection)
-        connection.receiveMessage { [weak self, weak client] data, context, _, error in
-            guard let self, let client, self.clients[id] === client else { return }
+        connection.receiveMessage { [weak self, weak connection] data, context, _, error in
+            guard let self, let connection, let client = self.clients[id],
+                  client.connection === connection else { return }
             let now = ProcessInfo.processInfo.systemUptime
             if now - client.windowStart >= 1 { client.windowStart = now; client.received = 0 }
             client.received += 1
@@ -149,6 +155,7 @@ final class WebSocketHub: ControllerOutputSink, @unchecked Sendable {
     }
 
     private func handle(_ data: Data, from id: ObjectIdentifier) {
+        dispatchPrecondition(condition: .onQueue(queue))
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let type = object["t"] as? String else { return }
         if type == "rumble" {
@@ -168,6 +175,7 @@ final class WebSocketHub: ControllerOutputSink, @unchecked Sendable {
     }
 
     private func send(_ text: String, to client: Client) {
+        dispatchPrecondition(condition: .onQueue(queue))
         let connection = client.connection, id = ObjectIdentifier(client.connection)
         guard clients[id] === client, client.ready else { return }
         let bytes = Data(text.utf8)
@@ -177,8 +185,9 @@ final class WebSocketHub: ControllerOutputSink, @unchecked Sendable {
         let metadata = NWProtocolWebSocket.Metadata(opcode: .text)
         let context = NWConnection.ContentContext(identifier: "text", metadata: [metadata])
         connection.send(content: bytes, contentContext: context, isComplete: true,
-                        completion: .contentProcessed { [weak self, weak client] error in
-            guard let self, let client, self.clients[id] === client else { return }
+                        completion: .contentProcessed { [weak self, weak connection] error in
+            guard let self, let connection, let client = self.clients[id],
+                  client.connection === connection else { return }
             client.pendingMessages -= 1; client.pendingBytes -= bytes.count
             if error != nil { self.remove(id) }
         })

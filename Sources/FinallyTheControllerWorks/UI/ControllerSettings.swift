@@ -6,12 +6,13 @@
 import Foundation
 import Combine
 
+@MainActor
 final class ControllerSettings: ObservableObject {
     static let shared = ControllerSettings()
 
     /// Posted after a custom name changes so the engine can re-announce
     /// controller names to games.
-    static let namesChangedNotification = Notification.Name("ftcw.namesChanged")
+    nonisolated static let namesChangedNotification = Notification.Name("ftcw.namesChanged")
 
     private static let defaultsKey = "controllerSettings"
 
