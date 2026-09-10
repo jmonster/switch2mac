@@ -1,0 +1,57 @@
+name: SDL input regressions
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  sdl:
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: libsdl-org/SDL
+          ref: 147a8ee32dbf9ac02f3794964490687b6bbda1bc
+          path: .ci-sdl
+          persist-credentials: false
+      - name: Ensure the real wired driver is compiled
+        run: brew list libusb >/dev/null 2>&1 || brew install libusb
+      - name: Build baseline and reproduce missing events and wrong USB selection
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n sdl/build-sdl.sh sdl/make-gopher64-both.sh
+          git -C .ci-sdl apply "$GITHUB_WORKSPACE/sdl/sdl3-3.4.14-s2udp.patch"
+          bash tests/sdl-usb/check-sdl.sh .ci-sdl before
+          cmake -S .ci-sdl -B "$RUNNER_TEMP/sdl-build" -DSDL_SHARED=ON -DSDL_STATIC=OFF -DSDL_TESTS=OFF -DSDL_HIDAPI_LIBUSB=ON > "$RUNNER_TEMP/sdl-baseline.log" 2>&1
+          cmake --build "$RUNNER_TEMP/sdl-build" --parallel 3 >> "$RUNNER_TEMP/sdl-baseline.log" 2>&1 || { tail -80 "$RUNNER_TEMP/sdl-baseline.log"; exit 1; }
+          grep '^#define HAVE_LIBUSB 1' "$RUNNER_TEMP/sdl-build"/include-config-*/build_config/SDL_build_config.h
+          cc -I .ci-sdl/include tests/sdl-edges/check.c -L "$RUNNER_TEMP/sdl-build" -Wl,-rpath,"$RUNNER_TEMP/sdl-build" -lSDL3 -o "$RUNNER_TEMP/check-edges"
+          set +e
+          "$RUNNER_TEMP/check-edges"
+          result=$?
+          set -e
+          test "$result" -eq 42
+      - name: Build corrected library and verify the same production functions
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash sdl/build-sdl.sh .ci-sdl > "$RUNNER_TEMP/sdl-corrected.log" 2>&1 || { tail -80 "$RUNNER_TEMP/sdl-corrected.log"; exit 1; }
+          git -C .ci-sdl apply "$GITHUB_WORKSPACE/sdl/s2usb-device-identity.patch"
+          bash tests/sdl-usb/check-sdl.sh .ci-sdl after
+          SDL3_DYNAMIC_API="$GITHUB_WORKSPACE/build/sdl/libSDL3.0.dylib" "$RUNNER_TEMP/check-edges"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: sdl-build-diagnostics
+          path: ${{ runner.temp }}/sdl-*.log
+          retention-days: 7
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: corrected-sdl-arm64
+          path: build/sdl/libSDL3.0.dylib
+          retention-days: 7

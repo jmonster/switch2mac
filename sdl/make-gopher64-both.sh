@@ -15,7 +15,12 @@
 set -euo pipefail
 
 SRC="/Applications/Gopher64.app"
-DYLIB="$(cd "$(dirname "$0")" && pwd)/libSDL3.0.dylib"
+DYLIB="${SDL3_LIBRARY:-$(cd "$(dirname "$0")/.." && pwd)/build/sdl/libSDL3.0.dylib}"
+if [ ! -f "$DYLIB" ]; then
+    echo "Build the corrected SDL first: bash sdl/build-sdl.sh /path/to/SDL" >&2
+    echo "Or set SDL3_LIBRARY to an explicitly selected compatible dylib." >&2
+    exit 1
+fi
 WORK="$(mktemp -d)/Gopher64-Both.app"
 DEST="$HOME/Applications/Gopher64-Both.app"
 # Portable: @executable_path resolves relative to the bundle no matter where
