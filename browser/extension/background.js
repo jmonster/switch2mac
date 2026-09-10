@@ -35,12 +35,15 @@ function connect() {
     fanOut('{"t":"bridge","up":false}');
     scheduleRetry();
   };
-  owner.onerror = () => {};
+  owner.onerror = () => {}; // onclose owns failure/retry
 }
+
 
 function sendNative(text) {
   const owner = socket;
   if (!owner || owner.readyState !== WebSocket.OPEN) return false;
+  // Do not build seconds of stale rumble/telemetry behind a wedged browser
+  // socket. Closing transfers cleanup to the native client's disconnect path.
   if ((owner.bufferedAmount || 0) > MAX_SOCKET_BUFFER) {
     socket = null;
     replay.clear();
@@ -98,6 +101,8 @@ chrome.runtime.onConnect.addListener((port) => {
         if (owner !== port) return;
         rumbleOwners.delete(m.slot);
       } else if (phase === 'start') {
+        // A new effect may preempt the previous tab, but its old refreshes
+        // cannot reclaim ownership afterwards.
         rumbleOwners.set(m.slot, port);
       } else { return; }
     }
@@ -114,7 +119,7 @@ chrome.runtime.onConnect.addListener((port) => {
     if (retryTimer !== null) clearTimeout(retryTimer);
     retryTimer = null;
     const old = socket;
-    socket = null;
+    socket = null; // retire before its asynchronous close callback can run
     replay.clear();
     rumbleOwners.clear();
     old?.close();
