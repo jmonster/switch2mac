@@ -1,152 +1,89 @@
-// MouseController.swift
-// Joy-Con 2 optical mouse → macOS pointer.
-//
-// The sensor (feature bit 0x10) streams absolute, free-running 16-bit
-// counters in every input report; deltas are wrapping differences between
-// consecutive reports. Surface contact is judged from the lift-distance and
-// surface-quality fields (thresholds from Switch2Connect, verified against
-// jc2mouse). SL clicks left, SR clicks right.
-//
-// Posting synthetic mouse events requires macOS Accessibility permission
-// (System Settings > Privacy & Security > Accessibility); we preflight and
-// request it once when the feature is first enabled.
-//
-// Threading: handle() is called on the Bluetooth queue per physical unit
-// report; CGEvent posting is thread-safe.
-
+// Bluetooth-queue confined; no AppKit or permission queries on the report path.
 import Foundation
 import CoreGraphics
-import AppKit
 
 final class MouseController: @unchecked Sendable {
-
     private struct UnitState {
-        var lastX: UInt16 = 0
-        var lastY: UInt16 = 0
-        var primed = false          // first sample only seeds the counters
-        var residualX: Double = 0   // sub-pixel remainders
-        var residualY: Double = 0
-        var leftDown = false
-        var rightDown = false
+        var lastX: UInt16 = 0, lastY: UInt16 = 0
+        var primed = false
+        var residualX = 0.0, residualY = 0.0
     }
-
     private var units: [String: UnitState] = [:]
-    private var permissionChecked = false
-    private var permissionGranted = false
+    private var owners = HeldOutputs<String, Int>()
+    private var pressed = Set<Int>()
+    private var permission = false
+    private var screens: [CGRect] = []
 
-    /// Wrapping signed difference of two mod-2^16 counters.
+    func updateContext(permission: Bool, screens: [CGRect]) {
+        if !permission { reset() }
+        self.permission = permission; self.screens = screens
+    }
+    func reset(serial: String) {
+        units.removeValue(forKey: serial)
+        applyButtons(serial: serial, desired: [])
+    }
+    func reset() {
+        units.removeAll()
+        for button in owners.reset() { postButton(button, down: false) }
+        pressed.removeAll()
+    }
+    private func applyButtons(serial: String, desired: Set<Int>) {
+        let changes = owners.replace(serial, with: desired)
+        for button in changes.released { postButton(button, down: false); pressed.remove(button) }
+        for button in changes.pressed { postButton(button, down: true); pressed.insert(button) }
+    }
     private static func wrapDiff(_ current: UInt16, _ previous: UInt16) -> Int {
-        (Int(current) &- Int(previous) &+ 0x8000) & 0xFFFF - 0x8000
+        Int(Int16(bitPattern: current &- previous))
     }
-
-    /// On-surface heuristic (Switch2Connect defaults).
-    private static func isTracking(_ state: ControllerState) -> Bool {
-        state.liftDistance != 0 && state.liftDistance < 1000
-            && state.surfaceQuality < 4000
-    }
-
-    func handle(serial: String, model: Switch2.Model, state: ControllerState) {
-        guard model == .joyCon2Left || model == .joyCon2Right else { return }
-        let settings = UserDefaults.standard.dictionary(forKey: "controllerSettings")
-        let entry = settings?[serial] as? [String: Any]
-        guard entry?["mouseEnabled"] as? Bool ?? false else {
-            units.removeValue(forKey: serial)
-            return
-        }
-        guard ensurePermission() else { return }
-
+    func handle(serial: String, model: Switch2.Model, state: ControllerState,
+                configuration: ControllerConfiguration) {
+        guard configuration.mouseEnabled, permission,
+              model == .joyCon2Left || model == .joyCon2Right else { reset(serial: serial); return }
+        let left = model == .joyCon2Left ? state.buttons.contains(.slL) : state.buttons.contains(.slR)
+        let right = model == .joyCon2Left ? state.buttons.contains(.srL) : state.buttons.contains(.srR)
+        var buttons = Set<Int>()
+        if left { buttons.insert(0) }; if right { buttons.insert(1) }
+        applyButtons(serial: serial, desired: buttons)
         var unit = units[serial] ?? UnitState()
         defer { units[serial] = unit }
-
-        // Clicks come from the side buttons (the "rail" buttons that are
-        // exposed when the Joy-Con is held flat like a mouse).
-        let sl = model == .joyCon2Left ? state.buttons.contains(.slL)
-                                       : state.buttons.contains(.slR)
-        let sr = model == .joyCon2Left ? state.buttons.contains(.srL)
-                                       : state.buttons.contains(.srR)
-        updateButton(&unit.leftDown, pressed: sl, isLeft: true)
-        updateButton(&unit.rightDown, pressed: sr, isLeft: false)
-
-        guard unit.primed else {
-            unit.lastX = state.mouseX
-            unit.lastY = state.mouseY
-            unit.primed = true
-            return
-        }
-        let dxRaw = Self.wrapDiff(state.mouseX, unit.lastX)
-        let dyRaw = Self.wrapDiff(state.mouseY, unit.lastY)
-        unit.lastX = state.mouseX
-        unit.lastY = state.mouseY
-
-        guard Self.isTracking(state), dxRaw != 0 || dyRaw != 0 else { return }
-
-        let sensitivity = entry?["mouseSensitivity"] as? Double ?? 1.0
-        let scale = 0.35 * sensitivity   // counts → points; tuned live
-        var dx = Double(dxRaw) * scale + unit.residualX
-        var dy = Double(dyRaw) * scale + unit.residualY
-        let moveX = dx.rounded(.towardZero)
-        let moveY = dy.rounded(.towardZero)
-        unit.residualX = dx - moveX
-        unit.residualY = dy - moveY
-        dx = moveX
-        dy = moveY
-        guard dx != 0 || dy != 0 else { return }
-
-        postMove(dx: dx, dy: dy, leftDown: unit.leftDown)
+        let dx = Self.wrapDiff(state.mouseX, unit.lastX), dy = Self.wrapDiff(state.mouseY, unit.lastY)
+        unit.lastX = state.mouseX; unit.lastY = state.mouseY
+        guard unit.primed else { unit.primed = true; return }
+        guard state.liftDistance != 0 && state.liftDistance < 1000 && state.surfaceQuality < 4000 else { return }
+        let scale = 0.35 * configuration.mouseSensitivity
+        let x = Double(dx) * scale + unit.residualX, y = Double(dy) * scale + unit.residualY
+        let moveX = x.rounded(.towardZero), moveY = y.rounded(.towardZero)
+        unit.residualX = x - moveX; unit.residualY = y - moveY
+        guard moveX != 0 || moveY != 0 else { return }
+        postMove(dx: moveX, dy: moveY)
     }
-
-    // MARK: - Event posting
-
-    private func postMove(dx: Double, dy: Double, leftDown: Bool) {
+    private func postButton(_ button: Int, down: Bool) {
+        let left = button == 0
+        let type: CGEventType = left ? (down ? .leftMouseDown : .leftMouseUp)
+                                      : (down ? .rightMouseDown : .rightMouseUp)
+        CGEvent(mouseEventSource: nil, mouseType: type,
+                mouseCursorPosition: CGEvent(source: nil)?.location ?? .zero,
+                mouseButton: left ? .left : .right)?.post(tap: .cghidEventTap)
+    }
+    private func postMove(dx: Double, dy: Double) {
         let current = CGEvent(source: nil)?.location ?? .zero
         var target = CGPoint(x: current.x + dx, y: current.y + dy)
-        // Clamp to the union of displays so the cursor never vanishes.
-        let bounds = NSScreen.screens.reduce(CGRect.null) { $0.union($1.frame) }
-        if !bounds.isNull {
-            // NSScreen frames are bottom-left origin; CGEvent is top-left.
-            let maxY = bounds.height
-            target.x = min(max(target.x, bounds.minX), bounds.maxX - 1)
-            target.y = min(max(target.y, 0), maxY - 1)
+        if !screens.isEmpty && !screens.contains(where: { $0.contains(target) }) {
+            let candidates = screens.map { bounds in
+                CGPoint(x: max(bounds.minX, min(bounds.maxX - 1, target.x)),
+                        y: max(bounds.minY, min(bounds.maxY - 1, target.y)))
+            }
+            target = candidates.min { a, b in
+                hypot(a.x-target.x, a.y-target.y) < hypot(b.x-target.x, b.y-target.y)
+            } ?? target
         }
-        let type: CGEventType = leftDown ? .leftMouseDragged : .mouseMoved
-        if let event = CGEvent(mouseEventSource: nil, mouseType: type,
-                               mouseCursorPosition: target, mouseButton: .left) {
+        let type: CGEventType = pressed.contains(0) ? .leftMouseDragged
+            : (pressed.contains(1) ? .rightMouseDragged : .mouseMoved)
+        let button: CGMouseButton = pressed.contains(1) && !pressed.contains(0) ? .right : .left
+        if let event = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: target, mouseButton: button) {
             event.setIntegerValueField(.mouseEventDeltaX, value: Int64(dx))
             event.setIntegerValueField(.mouseEventDeltaY, value: Int64(dy))
             event.post(tap: .cghidEventTap)
         }
-    }
-
-    private func updateButton(_ held: inout Bool, pressed: Bool, isLeft: Bool) {
-        guard pressed != held else { return }
-        held = pressed
-        guard permissionGranted else { return }
-        let position = CGEvent(source: nil)?.location ?? .zero
-        let type: CGEventType = isLeft
-            ? (pressed ? .leftMouseDown : .leftMouseUp)
-            : (pressed ? .rightMouseDown : .rightMouseUp)
-        let button: CGMouseButton = isLeft ? .left : .right
-        CGEvent(mouseEventSource: nil, mouseType: type,
-                mouseCursorPosition: position, mouseButton: button)?
-            .post(tap: .cghidEventTap)
-    }
-
-    private func ensurePermission() -> Bool {
-        if permissionChecked { return permissionGranted }
-        permissionChecked = true
-        permissionGranted = CGPreflightPostEventAccess()
-        if !permissionGranted {
-            permissionGranted = CGRequestPostEventAccess()
-            if !permissionGranted {
-                bridgeLog(.warning, "mouse",
-                          "Accessibility permission needed for mouse mode — "
-                          + "grant it in System Settings > Privacy & Security > "
-                          + "Accessibility, then toggle mouse mode again")
-            }
-        }
-        if permissionGranted {
-            bridgeLog(.info, "mouse", "mouse mode ready")
-        }
-        return permissionGranted
     }
 }

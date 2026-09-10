@@ -10,11 +10,12 @@
 // the "$1 recognizer" idea over the 3-axis gyro signal.
 
 import Foundation
+import Synchronization
 import CoreGraphics
 import AppKit
 
 /// A stored gesture: normalized template + the action it triggers.
-struct AirGesture: Codable, Identifiable {
+struct AirGesture: Codable, Identifiable, Sendable {
     var id = UUID()
     var name: String
     var template: [Double]        // 3*N normalized samples
@@ -36,27 +37,40 @@ final class GestureRecognizer: @unchecked Sendable {
     static let sampleCount = 24
     static let matchThreshold = 0.55
 
-    /// Which button, held, bookends a gesture (default GL).
-    private var triggerName: String {
-        UserDefaults.standard.string(forKey: "gestureTriggerButton") ?? "GL"
+    private struct State: Sendable {
+        var trigger: Switch2.Buttons = .gl
+        var gestures: [AirGesture] = []
+        var capturing: [Int: [SIMD3<Double>]] = [:]
+        var wasHeld: [Int: Bool] = [:]
+        var recordingName: String?
+        var onRecorded: (@Sendable (AirGesture) -> Void)?
     }
-
-    private var gestures: [AirGesture] = []
-    private var capturing: [Int: [SIMD3<Double>]] = [:]   // per player, while held
-    private var wasHeld: [Int: Bool] = [:]
-
-    /// When set, the next captured path is saved as a template with this
-    /// name (via onRecorded) rather than matched.
-    var recordingName: String?
-    var onRecorded: ((AirGesture) -> Void)?
-
+    private let state = Mutex(State())
+    var recordingName: String? {
+        get { state.withLock { $0.recordingName } }
+        set { state.withLock { $0.recordingName = newValue } }
+    }
+    var onRecorded: (@Sendable (AirGesture) -> Void)? {
+        get { state.withLock { $0.onRecorded } }
+        set { state.withLock { $0.onRecorded = newValue } }
+    }
     init() { reload() }
-
     func reload() {
-        guard let data = UserDefaults.standard.data(forKey: "airGestures"),
-              let list = try? JSONDecoder().decode([AirGesture].self, from: data)
-        else { gestures = []; return }
-        gestures = list
+        let trigger = Switch2.button(named: UserDefaults.standard.string(forKey: "gestureTriggerButton") ?? "GL") ?? .gl
+        let data = UserDefaults.standard.data(forKey: "airGestures") ?? Data()
+        let list = (try? JSONDecoder().decode([AirGesture].self, from: data)) ?? []
+        state.withLock {
+            $0.trigger = trigger
+            $0.gestures = Array(list.prefix(128)).filter {
+                $0.template.count == Self.sampleCount * 3 && $0.template.allSatisfy(\.isFinite)
+            }
+        }
+    }
+    func reset(player: Int? = nil) {
+        state.withLock {
+            if let player { $0.capturing.removeValue(forKey: player); $0.wasHeld.removeValue(forKey: player) }
+            else { $0.capturing.removeAll(); $0.wasHeld.removeAll() }
+        }
     }
 
     static func save(_ gestures: [AirGesture]) {
@@ -65,47 +79,39 @@ final class GestureRecognizer: @unchecked Sendable {
         }
     }
 
-    /// Feed one player's report. Buffers gyro while the trigger is held;
-    /// on release, records or matches.
+    /// Configuration/capture state is locked; callbacks and platform effects
+    /// execute after unlocking. No per-report UserDefaults or main-actor task.
     func process(player: Int, buttons: Switch2.Buttons, gyro: (Int16, Int16, Int16)) {
-        guard let trigger = Switch2.button(named: triggerName) else { return }
-        let held = buttons.contains(trigger)
-        let was = wasHeld[player] ?? false
-        wasHeld[player] = held
-
-        if held {
-            var buf = capturing[player] ?? []
-            buf.append(SIMD3(Double(gyro.0), Double(gyro.1), Double(gyro.2)))
-            if buf.count > 400 { buf.removeFirst() }    // safety cap
-            capturing[player] = buf
-        } else if was {
-            // Released — finalize.
-            let path = capturing[player] ?? []
-            capturing[player] = nil
-            finalize(path)
+        let result: (AirGesture, (@Sendable (AirGesture) -> Void)?, Bool)? = state.withLock { storage in
+            guard storage.recordingName != nil || !storage.gestures.isEmpty else { return nil }
+            let held = buttons.contains(storage.trigger)
+            let was = storage.wasHeld[player] ?? false
+            storage.wasHeld[player] = held
+            if held {
+                var buffer = storage.capturing[player] ?? []
+                if buffer.count < 400 { buffer.append(SIMD3(Double(gyro.0), Double(gyro.1), Double(gyro.2))) }
+                storage.capturing[player] = buffer
+                return nil
+            }
+            guard was else { return nil }
+            let path = storage.capturing.removeValue(forKey: player) ?? []
+            guard path.count >= 8 else { return nil }
+            let template = Self.normalize(Self.resample(path, to: Self.sampleCount))
+            if let name = storage.recordingName {
+                storage.recordingName = nil
+                return (AirGesture(name: name, template: template), storage.onRecorded, true)
+            }
+            var best: (AirGesture, Double)?
+            for gesture in storage.gestures {
+                let distance = Self.distance(template, gesture.template)
+                if best == nil || distance < best!.1 { best = (gesture, distance) }
+            }
+            guard let (gesture, distance) = best, distance < Self.matchThreshold else { return nil }
+            return (gesture, nil, false)
         }
-    }
-
-    private func finalize(_ path: [SIMD3<Double>]) {
-        guard path.count >= 8 else { return }   // too short to be a gesture
-        let template = Self.normalize(Self.resample(path, to: Self.sampleCount))
-
-        if let name = recordingName {
-            recordingName = nil
-            let gesture = AirGesture(name: name, template: template)
-            onRecorded?(gesture)
-            return
-        }
-        // Match against saved gestures.
-        var best: (AirGesture, Double)?
-        for g in gestures where g.template.count == template.count {
-            let d = Self.distance(template, g.template)
-            if best == nil || d < best!.1 { best = (g, d) }
-        }
-        if let (g, d) = best, d < Self.matchThreshold {
-            bridgeLog(.info, "gesture", "recognized \"\(g.name)\" (distance \(String(format: "%.2f", d)))")
-            fire(g)
-        }
+        guard let (gesture, callback, recorded) = result else { return }
+        if recorded { callback?(gesture) }
+        else { DispatchQueue.main.async { [weak self] in self?.fire(gesture) } }
     }
 
     // MARK: - Signal processing
@@ -141,7 +147,7 @@ final class GestureRecognizer: @unchecked Sendable {
 
     // MARK: - Actions
 
-    private func fire(_ g: AirGesture) {
+    @MainActor private func fire(_ g: AirGesture) {
         if let key = g.key {
             guard CGPreflightPostEventAccess() || CGRequestPostEventAccess() else { return }
             for down in [true, false] {
@@ -156,7 +162,7 @@ final class GestureRecognizer: @unchecked Sendable {
         }
     }
 
-    private static func runBuiltin(_ id: String) {
+    @MainActor private static func runBuiltin(_ id: String) {
         switch id {
         case "screenshot":
             run("/usr/sbin/screencapture", ["-x",

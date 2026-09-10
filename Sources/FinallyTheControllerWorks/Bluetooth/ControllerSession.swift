@@ -71,7 +71,22 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     private var ended = false
     private var handshakeComplete = false
     private var readyReported = false
-    private var pendingCommand: (id: UInt8, completion: (Data?) -> Void)?
+    private struct CommandRequest {
+        let token: UInt64
+        let id: UInt8
+        let frame: Data
+        let accepts: ((Data) -> Bool)?
+        let completion: (Data?) -> Void
+    }
+    private var nextCommandToken: UInt64 = 0
+    private var pendingCommand: CommandRequest?
+    private var queuedCommands: [CommandRequest] = []
+    private var commandSubmitted = false
+    private var writeStallTimeout: DispatchWorkItem?
+    private var writeStallGeneration: UInt64 = 0
+    private var pendingMotor: (value: Switch2.Vibration, expires: TimeInterval)?
+    private var pumpingWrites = false
+    private var commandNotificationsReady = false
     private var commandTimeout: DispatchWorkItem?
     private var handshakeSteps: [(String, (@escaping (Bool) -> Void) -> Void)] = []
 
@@ -84,17 +99,18 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     private var rumbleTarget: (strong: Double, weak: Double) = (0, 0)
     private var rumbleSetAt: TimeInterval = 0
     private var rumbleActive = false
+    private var rumbleGeneration: UInt64 = 0
 
-    /// Latest decoded state; reads from other threads are tolerated (single
-    /// word-sized fields, refreshed at 33 Hz — stale data is harmless).
+    /// Latest decoded state. All reads and writes belong to the Bluetooth
+    /// queue; consumers receive a Sendable value snapshot, never this storage.
     private(set) var state = ControllerState()
     private(set) var reportCount: UInt64 = 0
-    private var lastReportAt: TimeInterval = 0
+    private(set) var lastReportAt: TimeInterval = 0
     private var gapCount = 0
 
     /// Last time the HUMAN did something (button/stick/trigger change) —
     /// reports stream constantly, so idleness must be judged on content.
-    private(set) var lastActivityAt: TimeInterval = CFAbsoluteTimeGetCurrent()
+    private(set) var lastActivityAt: TimeInterval = ProcessInfo.processInfo.systemUptime
 
     /// Sink receiving every decoded report (UDP hub / virtual HID).
     var onState: (@Sendable (Int, ControllerState) -> Void)?
@@ -121,7 +137,11 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     }
 
     var displayName: String { model.displayName }
-    var serialNumber: String { info?.serialNumber ?? "?" }
+    var serialNumber: String {
+        let serial = info?.serialNumber.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return serial.isEmpty || serial == "?" ? "peripheral-\(peripheral.identifier.uuidString)" : serial
+    }
+    var isRetired: Bool { ended }
     var batteryMillivolts: UInt16 { state.batteryMillivolts }
 
     // MARK: - Handshake
@@ -143,7 +163,16 @@ final class ControllerSession: NSObject, @unchecked Sendable {
         keepAliveTimer?.cancel()
         keepAliveTimer = nil
         commandTimeout?.cancel()
+        commandTimeout = nil
+        writeStallTimeout?.cancel()
+        writeStallTimeout = nil
+        pendingMotor = nil
+        let cancelled = (pendingCommand.map { [$0] } ?? []) + queuedCommands
         pendingCommand = nil
+        commandSubmitted = false
+        queuedCommands.removeAll()
+        // Complete external command waiters after making retirement terminal.
+        for request in cancelled { request.completion(nil) }
         // A dead link must also stop any audio experiment: finish the
         // stream (releasing its closures — they retain self), stop
         // capture callbacks, and free the experiment guard.
@@ -297,37 +326,112 @@ final class ControllerSession: NSObject, @unchecked Sendable {
 
     private func writeCommand(_ command: UInt8, _ subcommand: UInt8, _ data: Data,
                               flag: UInt8 = 0x01,
+                              accepts: ((Data) -> Bool)? = nil,
                               completion: @escaping (Data?) -> Void) {
-        guard !ended, let writeChar = chars[Switch2.GATT.commandWrite] else {
+        guard !ended, chars[Switch2.GATT.commandWrite] != nil else {
             completion(nil); return
         }
-        guard pendingCommand == nil else {
-            // Serialized by construction; overlap is a programming error.
-            log(.warning, "command overlap dropped (cmd \(command))")
+        guard data.count <= Int(UInt8.max) else {
+            log(.warning, "command payload exceeds the protocol length field")
+            completion(nil); return
+        }
+        let frame = Switch2.buildCommand(command, subcommand, flag: flag, data: data)
+        guard frame.count <= peripheral.maximumWriteValueLength(for: .withoutResponse) else {
+            log(.warning, "command exceeds negotiated write size; not fragmenting protocol frames")
+            completion(nil); return
+        }
+        guard queuedCommands.count + (pendingCommand == nil ? 0 : 1) < 32 else {
+            log(.error, "command queue exhausted")
+            fail("command queue exhausted")
             completion(nil)
             return
         }
-        let frame = Switch2.buildCommand(command, subcommand, flag: flag, data: data)
-        pendingCommand = (command, completion)
-        let timeout = DispatchWorkItem { [weak self] in
-            guard let self, let pending = self.pendingCommand else { return }
-            self.pendingCommand = nil
-            self.log(.warning, "command \(String(format: "%#04x", pending.id)) timed out")
-            pending.completion(nil)
+        nextCommandToken &+= 1
+        queuedCommands.append(CommandRequest(token: nextCommandToken, id: command,
+                                               frame: frame, accepts: accepts,
+                                               completion: completion))
+        pumpWrites()
+    }
+
+    /// Queue-confined: command frames remain atomic and FIFO. Motor intents
+    /// may be replaced, but controller input reports are never coalesced here.
+    private func pumpWrites() {
+        guard !ended, !pumpingWrites else { return }
+        pumpingWrites = true
+        defer { pumpingWrites = false }
+        if pendingCommand == nil, !queuedCommands.isEmpty {
+            pendingCommand = queuedCommands.removeFirst()
+            commandSubmitted = false
         }
-        commandTimeout = timeout
-        queue.asyncAfter(deadline: .now() + 2.0, execute: timeout)
-        peripheral.writeValue(frame, for: writeChar, type: .withoutResponse)
-        lastWriteAt = CFAbsoluteTimeGetCurrent()
+        let waiting = (pendingCommand != nil && !commandSubmitted) || pendingMotor != nil
+        guard waiting else { return }
+        guard peripheral.canSendWriteWithoutResponse else {
+            armWriteStallDeadline()
+            return
+        }
+        writeStallTimeout?.cancel()
+        writeStallTimeout = nil
+        // Rumble stop/replacement must not wait for a command response.
+        if let motor = pendingMotor, let characteristic = chars[Switch2.GATT.vibration(for: model)] {
+            let value = ProcessInfo.processInfo.systemUptime < motor.expires
+                ? motor.value : Switch2.Vibration.waveform(strong: 0, weak: 0)
+            let packet = Switch2.motorPacket(value, packetID: vibrationPacketID, model: model)
+            if packet.count <= peripheral.maximumWriteValueLength(for: .withoutResponse) {
+                peripheral.writeValue(packet, for: characteristic, type: .withoutResponse)
+                vibrationPacketID &+= 1
+                lastWriteAt = ProcessInfo.processInfo.systemUptime
+            }
+            pendingMotor = nil
+        }
+        if pendingCommand != nil && !commandSubmitted && !peripheral.canSendWriteWithoutResponse {
+            armWriteStallDeadline()
+        }
+        if let request = pendingCommand, !commandSubmitted,
+           peripheral.canSendWriteWithoutResponse, let writeChar = chars[Switch2.GATT.commandWrite] {
+            commandSubmitted = true
+            // The response deadline starts at submission, not while waiting
+            // for another command or for CoreBluetooth's outbound buffer.
+            let timeout = DispatchWorkItem { [weak self] in
+                guard let self, !self.ended, self.pendingCommand?.token == request.token else { return }
+                self.pendingCommand = nil
+                self.commandSubmitted = false
+                self.commandTimeout = nil
+                self.log(.warning, "command \(String(format: "%#04x", request.id)) timed out")
+                request.completion(nil)
+                self.pumpWrites()
+            }
+            commandTimeout = timeout
+            queue.asyncAfter(deadline: .now() + 2, execute: timeout)
+            peripheral.writeValue(request.frame, for: writeChar, type: .withoutResponse)
+            lastWriteAt = ProcessInfo.processInfo.systemUptime
+        }
+    }
+
+    private func armWriteStallDeadline() {
+        guard writeStallTimeout == nil else { return }
+        writeStallGeneration &+= 1
+        let generation = writeStallGeneration
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, !self.ended, self.writeStallTimeout != nil,
+                  self.writeStallGeneration == generation else { return }
+            self.writeStallTimeout = nil
+            self.fail("Bluetooth write capacity unavailable for 5 seconds")
+        }
+        writeStallTimeout = work
+        queue.asyncAfter(deadline: .now() + 5, execute: work)
     }
 
     private func handleCommandResponse(_ data: Data) {
         // An unrelated notification must not consume the command or its timer.
-        guard !ended, let pending = pendingCommand, data.count >= 8,
+        guard !ended, commandSubmitted, let pending = pendingCommand, data.count >= 8,
               data[data.startIndex] == pending.id,
               data[data.startIndex + 1] == 0x01 || data[data.startIndex + 1] == 0x02 else { return }
+        let payload = data.subdata(in: data.startIndex + 8 ..< data.endIndex)
+        guard pending.accepts?(payload) ?? true else { return }
         commandTimeout?.cancel()
+        commandTimeout = nil
         pendingCommand = nil
+        commandSubmitted = false
         // NFC experiments: log the COMPLETE frame (header included) — the
         // header status bytes distinguish "no data" from "error" replies.
         if pending.id == 0x01 {
@@ -337,13 +441,18 @@ final class ControllerSession: NSObject, @unchecked Sendable {
         // status/error reply (same shape, payload starts with a status code).
         // Both correlate to our command — pass the payload up and let the
         // caller interpret the status byte.
-        pending.completion(data.subdata(in: data.startIndex + 8 ..< data.endIndex))
+        pending.completion(payload)
+        pumpWrites()
     }
 
     private func readMemory(length: UInt8, address: UInt32,
                             completion: @escaping (Data?) -> Void) {
         let payload = Switch2.memoryReadPayload(length: length, address: address)
-        writeCommand(Switch2.Command.memory, Switch2.Subcommand.memoryRead, payload) { resp in
+        writeCommand(Switch2.Command.memory, Switch2.Subcommand.memoryRead, payload,
+                     accepts: { response in
+            response.count >= 8 + Int(length) && response[response.startIndex] == length
+                && Switch2.u32(response, 4) == address
+        }) { resp in
             guard let resp, resp.count >= 8 + Int(length),
                   resp[resp.startIndex] == length,
                   Switch2.u32(resp, 4) == address else {
@@ -405,11 +514,7 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     func experimentalCommand(_ command: UInt8, _ subcommand: UInt8,
                              payload: Data, flag: UInt8 = 0x01,
                              completion: @escaping (Data?) -> Void) {
-        queue.async { [weak self] in
-            guard let self else { completion(nil); return }
-            self.writeCommand(command, subcommand, payload, flag: flag,
-                              completion: completion)
-        }
+        writeCommand(command, subcommand, payload, flag: flag, completion: completion)
     }
 
     /// NFC experiments: subscribe every notify-capable characteristic we are
@@ -441,9 +546,11 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     /// queue only). Returns false when the characteristic is absent.
     @discardableResult
     func writeAudioFrame(_ data: Data) -> Bool {
-        guard !ended, let ch = chars[Self.audioOutputUUID] else { return false }
+        guard !ended, peripheral.canSendWriteWithoutResponse,
+              data.count <= audioWriteChunkLimit,
+              let ch = chars[Self.audioOutputUUID] else { return false }
         peripheral.writeValue(data, for: ch, type: .withoutResponse)
-        lastWriteAt = CFAbsoluteTimeGetCurrent()
+        lastWriteAt = ProcessInfo.processInfo.systemUptime
         return true
     }
 
@@ -511,24 +618,22 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     /// Precondition: at most one stream per session (enforced by restart:
     /// starting a new stream cancels the previous one without stats).
     func startAudioStream(frameInterval: TimeInterval,
-                          next: @escaping () -> Data?,
-                          done: @escaping (AudioStreamStats) -> Void) {
-        queue.async { [weak self] in
-            guard let self, !self.ended else { return }
-            self.audioStreamTimer?.cancel()
-            self.audioStreamQueue.removeAll()
-            self.audioStreamStats = AudioStreamStats(chunkLimit: self.audioWriteChunkLimit)
-            self.audioStreamNext = next
-            self.audioStreamDone = done
-            // Queue cap = 4 frames' worth of chunks (min 1 chunk per frame).
-            self.audioStreamQueueCap = 8
-            let timer = DispatchSource.makeTimerSource(flags: .strict, queue: self.queue)
-            timer.schedule(deadline: .now(), repeating: frameInterval,
-                           leeway: .microseconds(500))
-            timer.setEventHandler { [weak self] in self?.audioStreamTick() }
-            timer.resume()
-            self.audioStreamTimer = timer
-        }
+                      next: @escaping () -> Data?,
+                      done: @escaping (AudioStreamStats) -> Void) {
+        guard !ended else { return }
+        audioStreamTimer?.cancel()
+        audioStreamQueue.removeAll()
+        audioStreamStats = AudioStreamStats(chunkLimit: audioWriteChunkLimit)
+        audioStreamNext = next
+        audioStreamDone = done
+        // Queue cap = 4 frames' worth of chunks (min 1 chunk per frame).
+        audioStreamQueueCap = 8
+        let timer = DispatchSource.makeTimerSource(flags: .strict, queue: queue)
+        timer.schedule(deadline: .now(), repeating: frameInterval,
+                       leeway: .microseconds(500))
+        timer.setEventHandler { [weak self] in self?.audioStreamTick() }
+        timer.resume()
+        audioStreamTimer = timer
     }
 
     /// Stop an in-flight stream early (Bluetooth queue or any thread);
@@ -560,8 +665,11 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     /// Write queued chunks until the stack refuses; `peripheralIsReady`
     /// re-enters. Runs on the Bluetooth queue only.
     fileprivate func drainAudioStream() {
+        pumpWrites()
         guard !ended, audioStreamNext != nil, let ch = chars[Self.audioOutputUUID] else { return }
-        while !audioStreamQueue.isEmpty {
+        var budget = 8
+        while !audioStreamQueue.isEmpty && budget > 0 {
+            budget -= 1
             guard peripheral.canSendWriteWithoutResponse else {
                 audioStreamStats.stalls += 1
                 return
@@ -569,7 +677,7 @@ final class ControllerSession: NSObject, @unchecked Sendable {
             peripheral.writeValue(audioStreamQueue.removeFirst(),
                                   for: ch, type: .withoutResponse)
             audioStreamStats.chunksWritten += 1
-            lastWriteAt = CFAbsoluteTimeGetCurrent()
+            lastWriteAt = ProcessInfo.processInfo.systemUptime
         }
     }
 
@@ -596,28 +704,42 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     /// Subscribe (or unsubscribe) the audio input characteristic.
     /// Returns false via completion when the firmware doesn't expose it.
     func setAudioCapture(_ enabled: Bool, completion: @escaping (Bool) -> Void) {
-        queue.async { [weak self] in
-            guard let self, !self.ended, let ch = self.chars[Self.audioInputUUID] else {
-                completion(false); return }
-            self.peripheral.setNotifyValue(enabled, for: ch)
-            completion(true)
-        }
+        guard !ended, let ch = chars[Self.audioInputUUID] else { completion(false); return }
+        peripheral.setNotifyValue(enabled, for: ch)
+        completion(true)
     }
 
-    // MARK: - Keep-alive + rumble (shared 50 ms cadence)
+    // MARK: - Keep-alive + rumble
 
     func setRumble(strong: Double, weak: Double) {
+        queue.async { [weak self] in self?.applyRumble(strong: strong, weak: weak) }
+    }
+
+    private func applyRumble(strong: Double, weak: Double) {
+        guard !ended else { return }
+        rumbleGeneration &+= 1
+        rumbleTarget = (strong.isFinite ? max(0, min(1, strong)) : 0,
+                        weak.isFinite ? max(0, min(1, weak)) : 0)
+        rumbleSetAt = ProcessInfo.processInfo.systemUptime
+        maintainTick()
+    }
+
+    func pulseRumble(strong: Double, duration: Double) {
         queue.async { [weak self] in
-            guard let self, !self.ended else { return }
-            self.rumbleTarget = (strong, weak)
-            self.rumbleSetAt = CFAbsoluteTimeGetCurrent()
+            guard let self, !self.ended, duration.isFinite else { return }
+            self.applyRumble(strong: strong, weak: 0)
+            let generation = self.rumbleGeneration
+            self.queue.asyncAfter(deadline: .now() + max(0, min(5, duration))) { [weak self] in
+                guard let self, !self.ended, self.rumbleGeneration == generation else { return }
+                self.applyRumble(strong: 0, weak: 0)
+            }
         }
     }
 
     private func startKeepAlive() {
         guard !ended, keepAliveTimer == nil else { return }
         let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now() + 0.05, repeating: 0.05)
+        timer.schedule(deadline: .now() + 1)
         timer.setEventHandler { [weak self] in self?.maintainTick() }
         timer.resume()
         keepAliveTimer = timer
@@ -625,7 +747,13 @@ final class ControllerSession: NSObject, @unchecked Sendable {
 
     private func maintainTick() {
         guard !ended else { return }
-        let now = CFAbsoluteTimeGetCurrent()
+        defer {
+            // One deadline while idle, sustain cadence only while rumbling.
+            let active = rumbleActive || pendingMotor != nil
+            let delay = active ? 0.05 : max(0.05, 1 - (ProcessInfo.processInfo.systemUptime - lastWriteAt))
+            keepAliveTimer?.schedule(deadline: .now() + delay, leeway: .milliseconds(2))
+        }
+        let now = ProcessInfo.processInfo.systemUptime
         var (strong, weakMag) = rumbleTarget
         // Failsafe: rumble intents expire after 0.5 s so a crashed consumer
         // can never leave the motor running.
@@ -647,11 +775,9 @@ final class ControllerSession: NSObject, @unchecked Sendable {
 
     private func writeMotor(_ vib: Switch2.Vibration) {
         guard !ended, model.hasHDRumble,
-              let motor = chars[Switch2.GATT.vibration(for: model)] else { return }
-        let packet = Switch2.motorPacket(vib, packetID: vibrationPacketID, model: model)
-        vibrationPacketID &+= 1
-        peripheral.writeValue(packet, for: motor, type: .withoutResponse)
-        lastWriteAt = CFAbsoluteTimeGetCurrent()
+              chars[Switch2.GATT.vibration(for: model)] != nil else { return }
+        pendingMotor = (vib, ProcessInfo.processInfo.systemUptime + 0.5)
+        pumpWrites()
     }
 
     // MARK: - Input reports
@@ -668,7 +794,7 @@ final class ControllerSession: NSObject, @unchecked Sendable {
 
     private func handleInputReport(_ data: Data) {
         guard !ended, let report = Switch2.InputReport(data: data) else { return }
-        let now = CFAbsoluteTimeGetCurrent()
+        let now = ProcessInfo.processInfo.systemUptime
         if lastReportAt > 0, now - lastReportAt > 0.100 {
             gapCount += 1
             log(.warning, "slot \(slot + 1): BLE input gap #\(gapCount): \(Int((now - lastReportAt) * 1000)) ms")
@@ -712,7 +838,10 @@ final class ControllerSession: NSObject, @unchecked Sendable {
         // Activity: any button change, meaningful stick deflection change,
         // or trigger change counts. (Gyro noise deliberately excluded.)
         let old = state
-        if s.buttons != old.buttons
+        if !s.buttons.isEmpty || s.leftTrigger > 0 || s.rightTrigger > 0
+            || abs(s.leftStick.x) > 0.15 || abs(s.leftStick.y) > 0.15
+            || abs(s.rightStick.x) > 0.15 || abs(s.rightStick.y) > 0.15
+            || s.buttons != old.buttons
             || abs(s.leftStick.x - old.leftStick.x) > 0.1
             || abs(s.leftStick.y - old.leftStick.y) > 0.1
             || abs(s.rightStick.x - old.rightStick.x) > 0.1
@@ -789,6 +918,8 @@ extension ControllerSession: CBPeripheralDelegate {
             guard characteristic.isNotifying else { fail("essential notifications stopped"); return }
         }
         if uuid == Switch2.GATT.commandResponse {
+            guard !commandNotificationsReady else { return }
+            commandNotificationsReady = true
             runHandshake()
         } else if uuid == Switch2.GATT.inputReport {
             let completion = notifyCompletion
@@ -798,12 +929,20 @@ extension ControllerSession: CBPeripheralDelegate {
     }
 
     func peripheral(_ peripheral: CBPeripheral, didReadRSSI RSSI: NSNumber, error: Error?) {
-        if error == nil { onRSSI?(RSSI.intValue) }
+        if !ended, error == nil { onRSSI?(RSSI.intValue) }
     }
 
     /// Outbound buffer has space again — resume a stalled audio stream.
     func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
+        pumpWrites()
         drainAudioStream()
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didModifyServices invalidatedServices: [CBService]) {
+        guard !ended, invalidatedServices.contains(where: { service in
+            (service.characteristics ?? []).contains { ch in chars.values.contains { $0 === ch } }
+        }) else { return }
+        fail("controller services changed; reconnect required")
     }
 
     func peripheral(_ peripheral: CBPeripheral,

@@ -14,6 +14,7 @@
 // state is the @Published properties, updated via explicit hops.
 
 import Foundation
+import Synchronization
 import CoreBluetooth
 
 /// UI-facing snapshot of one logical controller (single or Joy-Con pair).
@@ -36,6 +37,7 @@ struct ControllerStatus: Identifiable, Sendable {
 }
 
 enum EngineState: String, Sendable {
+    case paused = "Controller output stopped"
     case off = "Bluetooth off"
     case unauthorized = "Bluetooth permission denied"
     case scanning = "Scanning for controllers…"
@@ -51,12 +53,36 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
     static let maxPlayers = 4
 
     // Main-thread state, for SwiftUI only.
-    @Published private(set) var engineState: EngineState = .off
-    @Published private(set) var controllers: [ControllerStatus] = []
+    @MainActor @Published private(set) var engineState: EngineState = .off
+    @MainActor @Published private(set) var controllers: [ControllerStatus] = []
     /// Throttled (~10 Hz) live input per player, for the input visualizer.
-    @Published private(set) var liveStates: [Int: ControllerState] = [:]
+    @MainActor @Published private(set) var liveStates: [Int: ControllerState] = [:]
     private var lastVizPush: [Int: TimeInterval] = [:]   // btQueue
 
+    @MainActor private var infoSnapshot: [String: Switch2.ControllerInfo] = [:]
+    @MainActor private var participantSnapshot: [(id: String, name: String)] = []
+    private var running = true
+    private var suspended = false
+    private var disconnecting = Set<UUID>()
+    private var deadlines: [UUID: DispatchWorkItem] = [:]
+    private var retryAfter: [UUID: TimeInterval] = [:]
+    private var observers: [NSObjectProtocol] = []
+    private var configurations: [String: ControllerConfiguration] = [:]
+    private var configurationSource: NSDictionary = [:]
+    private var inputContext = InputContext()
+    private struct Callbacks: Sendable {
+        var permission: (@Sendable (Bool) -> Void)?
+        var press: (@Sendable (String, TimeInterval) -> Void)?
+        var state: (@Sendable (String, ControllerState) -> Void)?
+    }
+    private let callbacks = Mutex(Callbacks())
+    var onInputPermissionNeeded: (@Sendable (Bool) -> Void)? {
+        get { callbacks.withLock { $0.permission } }
+        set {
+            callbacks.withLock { $0.permission = newValue }
+            btQueue.async { [weak self] in self?.reloadConfiguration() }
+        }
+    }
     private var central: CBCentralManager!
     private let btQueue = DispatchQueue(label: "com.petersharma.ftcw.bluetooth")
 
@@ -80,55 +106,152 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
     /// Current logical assignment: player index (0..maxPlayers-1) → logical.
     private var players: [Int: Logical] = [:]
     /// Remembered player numbers per logical id (stable across reshuffles).
-    private var playerMemory: [String: Int] = [:]
+    private var playerMemory: [String: Int] =
+        (UserDefaults.standard.dictionary(forKey: "playerMemory") as? [String: Int] ?? [:])
+            .filter { (0..<4).contains($0.value) }
 
     private var idleSweepTimer: DispatchSourceTimer?
 
-    override init() {
+    @MainActor override init() {
         super.init()
         central = CBCentralManager(delegate: self, queue: btQueue)
+        btQueue.async { [weak self] in self?.reloadConfiguration() }
         // Idle sweep: put controllers to sleep after the configured minutes
         // without human input (0 = never). A button press wakes them back.
         let timer = DispatchSource.makeTimerSource(queue: btQueue)
-        timer.schedule(deadline: .now() + 30, repeating: 30)
+        timer.schedule(deadline: .now() + 1, repeating: 1, leeway: .milliseconds(50))
         timer.setEventHandler { [weak self] in self?.sweepIdleSessions() }
         timer.resume()
         idleSweepTimer = timer
         // The settings store posts this when a custom name changes; push the
         // new names to sinks so games can relabel their joysticks live.
-        NotificationCenter.default.addObserver(
-            forName: ControllerSettings.namesChangedNotification,
-            object: nil, queue: nil) { [weak self] _ in
+        observers.append(NotificationCenter.default.addObserver(
+            forName: UserDefaults.didChangeNotification, object: nil, queue: nil) { [weak self] _ in
+                self?.btQueue.async { [weak self] in self?.reloadConfiguration() }
+        })
+    }
+
+    func updateInputContext(_ context: InputContext) {
+        btQueue.async { [weak self] in
             guard let self else { return }
-            self.btQueue.async { self.pushNames() }
+            self.inputContext = context
+            self.keyboardMapper.updateContext(app: context.application, permission: context.canPostEvents)
+            self.mouseController.updateContext(permission: context.canPostEvents, screens: context.screens)
         }
+    }
+
+    private func reloadConfiguration() {
+        let raw = UserDefaults.standard.dictionary(forKey: "controllerSettings") as? [String: [String: Any]] ?? [:]
+        if !configurationSource.isEqual(to: raw) {
+            configurations = raw.mapValues { ControllerConfiguration($0) }
+            configurationSource = raw as NSDictionary
+            keyboardMapper.reset()
+            mouseController.reset()
+        }
+        gestureRecognizer.reload()
+        onInputPermissionNeeded?(configurations.values.contains {
+            $0.mouseEnabled || !$0.globalKeys.isEmpty || $0.appKeys.values.contains { !$0.isEmpty }
+        })
+        let savedLinks = UserDefaults.standard.dictionary(forKey: "joyConLinks") as? [String: String] ?? [:]
+        if savedLinks != links { links = savedLinks; recomputeLogical() }
+        else { pushNames() }
+    }
+
+    func stop(completion: (@Sendable () -> Void)? = nil) {
+        btQueue.async { [weak self] in
+            guard let self else { completion?(); return }
+            self.running = false
+            self.resetConnections(cancel: true)
+            self.publishState(.paused)
+            completion?()
+        }
+    }
+    func resume() {
+        btQueue.async { [weak self] in
+            guard let self else { return }
+            self.running = true
+            self.updateScanning()
+        }
+    }
+    func setSuspended(_ value: Bool) {
+        btQueue.async { [weak self] in
+            guard let self else { return }
+            self.suspended = value
+            if value { self.resetConnections(cancel: true) }
+            else { self.updateScanning() }
+        }
+    }
+
+    private func owns(_ session: ControllerSession) -> Bool {
+        sessions[session.slot] === session || connecting[session.peripheral.identifier]?.session === session
+    }
+
+    /// Retire before requesting cancellation. CoreBluetooth cancellation is
+    /// asynchronous; do not reuse this peripheral until its terminal callback.
+    private func retire(_ session: ControllerSession, cancel: Bool, recompute: Bool = true) {
+        guard owns(session) else { return }
+        let id = session.peripheral.identifier
+        if connecting[id]?.session === session { connecting.removeValue(forKey: id) }
+        if sessions[session.slot] === session { sessions.removeValue(forKey: session.slot) }
+        deadlines.removeValue(forKey: id)?.cancel()
+        connectedAt.removeValue(forKey: session.slot)
+        mouseController.reset(serial: session.serialNumber)
+        if findingSession === session { stopFinding() }
+        session.teardown()
+        if cancel {
+            disconnecting.insert(id)
+            central.cancelPeripheralConnection(session.peripheral)
+        }
+        if recompute { recomputeLogical() }
+    }
+
+    private func resetConnections(cancel: Bool) {
+        central.stopScan()
+        let current = Array(sessions.values) + connecting.values.map { $0.session }
+        for session in current { retire(session, cancel: cancel, recompute: false) }
+        recomputeLogical()
+        if !cancel { disconnecting.removeAll() }
+        stopFinding()
+        keyboardMapper.reset(); mouseController.reset(); gestureRecognizer.reset()
+        lastVizPush.removeAll(); lastButtonsByPlayer.removeAll(); captureLast.removeAll()
+        DispatchQueue.main.async { [weak self] in self?.liveStates.removeAll() }
+    }
+
+    private func armDeadline(_ session: ControllerSession, seconds: Double) {
+        let id = session.peripheral.identifier
+        deadlines.removeValue(forKey: id)?.cancel()
+        let work = DispatchWorkItem { [weak self, weak session] in
+            guard let self, let session, self.connecting[id]?.session === session else { return }
+            bridgeLog(.warning, "engine", "connection phase timed out; retiring attempt")
+            self.retryAfter[id] = ProcessInfo.processInfo.systemUptime + 2
+            self.retire(session, cancel: true)
+            self.updateScanning()
+        }
+        deadlines[id] = work
+        btQueue.asyncAfter(deadline: .now() + seconds, execute: work)
     }
 
     /// btQueue. Disconnect sessions whose last human input is older than the
     /// configured idle timeout.
     private func sweepIdleSessions() {
+        guard running, !suspended else { return }
+        let now = ProcessInfo.processInfo.systemUptime
         let minutes = AppConfig.idleSleepMinutes
-        guard minutes > 0 else { return }
-        let cutoff = CFAbsoluteTimeGetCurrent() - minutes * 60
-        for session in sessions.values where session.lastActivityAt < cutoff {
-            let name = session.displayName
-            bridgeLog(.info, "engine",
-                      "\(name) idle for \(Int(minutes)) min — sleeping to save battery")
-            NotificationCenter.default.post(
-                name: controllerSleptNotification,
-                object: nil,
-                userInfo: ["name": name, "serial": session.serialNumber])
-            central.cancelPeripheralConnection(session.peripheral)
+        let cutoff = now - (minutes.isFinite ? max(0, minutes) : 0) * 60
+        for session in Array(sessions.values) {
+            // Audio capture intentionally suppresses normal reports on some firmware.
+            let stale = session.audioExperimentName == nil && now - session.lastReportAt > 5
+            let idle = minutes.isFinite && minutes > 0 && session.lastActivityAt < cutoff
+            if stale || idle {
+                bridgeLog(.warning, "engine", "\(session.displayName): \(stale ? "input stream stopped" : "idle timeout")")
+                retire(session, cancel: true)
+            }
         }
     }
 
     /// btQueue. The user-facing name for a logical player, honoring renames.
     private func displayName(for logical: Logical) -> String {
-        let store = UserDefaults.standard.dictionary(forKey: "controllerSettings")
-        if let custom = (store?[logical.id] as? [String: Any])?["name"] as? String,
-           !custom.isEmpty {
-            return custom
-        }
+        if let custom = configurations[logical.id]?.name, !custom.isEmpty { return custom }
         if logical.isPair { return "Joy-Con 2 Pair" }
         return sessions[logical.slots[0]]?.displayName ?? logical.model.displayName
     }
@@ -149,6 +272,11 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
                 self?.setRumble(player: player, strong: strong, weak: weakMag)
             }
             self.sinks.append(sink)
+            for (player, logical) in self.players {
+                sink.controllerConnected(slot: player, model: logical.model)
+                sink.controllerName(slot: player, name: self.displayName(for: logical))
+                if let session = self.sessions[logical.slots[0]] { self.emitState(slot: session.slot, state: session.state) }
+            }
         }
     }
 
@@ -156,15 +284,10 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
 
     /// Per-controller rumble scale, read straight from UserDefaults (which is
     /// thread-safe) so the Bluetooth queue never touches UI-observed objects.
-    private static func rumbleIntensity(forSerial serial: String) -> Double {
-        let store = UserDefaults.standard.dictionary(forKey: "controllerSettings")
-        return (store?[serial] as? [String: Any])?["rumble"] as? Double ?? 1.0
-    }
-
     func setRumble(player: Int, strong: Double, weak weakMag: Double) {
         btQueue.async { [weak self] in
             guard let self, let logical = self.players[player] else { return }
-            let scale = Self.rumbleIntensity(forSerial: logical.id)
+            let scale = self.configurations[logical.id]?.rumble ?? 1
             for slot in logical.slots {
                 self.sessions[slot]?.setRumble(strong: strong * scale,
                                                weak: weakMag * scale)
@@ -173,24 +296,20 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
     }
 
     func testRumble(player: Int) {
-        setRumble(player: player, strong: 1.0, weak: 0.0)
-        btQueue.asyncAfter(deadline: .now() + 0.4) { [weak self] in
-            self?.setRumble(player: player, strong: 0, weak: 0)
-        }
+        btQueue.async { [weak self] in self?.pulse(player: player, strong: 1, duration: 0.4) }
     }
 
-    /// Buzz one PHYSICAL unit (by serial) so the user can tell identical
-    /// Joy-Cons apart when choosing what to link. Bypasses player mapping
-    /// and intensity settings — identification must always be feelable.
+    private func pulse(player: Int, strong: Double, duration: Double) {
+        guard let logical = players[player] else { return }
+        let owners = logical.slots.compactMap { sessions[$0] }
+        let scale = configurations[logical.id]?.rumble ?? 1
+        for session in owners { session.pulseRumble(strong: strong * scale, duration: duration) }
+    }
+
     func identify(serial: String) {
         btQueue.async { [weak self] in
-            guard let self,
-                  let session = self.sessions.values.first(where: { $0.serialNumber == serial })
-            else { return }
-            session.setRumble(strong: 1.0, weak: 0)
-            self.btQueue.asyncAfter(deadline: .now() + 0.3) {
-                session.setRumble(strong: 0, weak: 0)
-            }
+            guard let self, let session = self.sessions.values.first(where: { $0.serialNumber == serial }) else { return }
+            session.pulseRumble(strong: 1, duration: 0.3)
         }
     }
 
@@ -376,7 +495,7 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
     private func nfcReadBuffer(session: ControllerSession,
                                assembled: Data, chunks: Int, retries: Int,
                                maxRetries: Int = 6, uid: Data,
-                               onNoData: (() -> Void)? = nil) {
+                               onNoData: (@Sendable () -> Void)? = nil) {
         guard assembled.count < 540, chunks < 12 else {
             self.nfcFinish(session: session, assembled: assembled, uid: uid)
             return
@@ -602,38 +721,43 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
                     try? handle.write(contentsOf: rec)
                 }
 
-                var packets = 0, audioFrames = 0, dataFrames = 0
-                var lastState: UInt8 = 0xFF
-                var lastMeter = start
+                final class CaptureCounters: @unchecked Sendable {
+                    // Accessed only on this engine's btQueue, including the deadline.
+                    var packets = 0, audioFrames = 0, dataFrames = 0
+                    var lastState: UInt8 = 0xFF
+                    var lastMeter: TimeInterval
+                    init(_ start: TimeInterval) { lastMeter = start }
+                }
+                let counters = CaptureCounters(start)
                 session.onAudioPacket = { data in
-                    packets += 1
+                    counters.packets += 1
                     record(data, to: fullFile)
                     if data.count >= 65 {
                         let state = data[13]
-                        if state & ~0x08 != lastState & ~0x08 {
+                        if state & ~0x08 != counters.lastState & ~0x08 {
                             bridgeLog(.info, "audio",
                                       String(format: "jack state 0x%02x: %@", state,
                                              Self.jackStateName(state)))
-                            lastState = state
+                            counters.lastState = state
                         }
                         let len = Int(data[14])
                         if state & 0x08 != 0, len > 0, 15 + len <= data.count {
                             let frame = data.subdata(in: 15..<(15 + len))
-                            audioFrames += 1
+                            counters.audioFrames += 1
                             // Silent idle frames are f8 ff fe + zeros; any
                             // other content counts as real data.
                             let body = frame.starts(with: [0xF8, 0xFF, 0xFE])
                                 ? frame.dropFirst(3) : frame[...]
-                            if body.contains(where: { $0 != 0 }) { dataFrames += 1 }
+                            if body.contains(where: { $0 != 0 }) { counters.dataFrames += 1 }
                             record(frame, to: regionFile)
                         }
                     }
                     let now = CFAbsoluteTimeGetCurrent()
-                    if now - lastMeter >= 5 {
-                        lastMeter = now
+                    if now - counters.lastMeter >= 5 {
+                        counters.lastMeter = now
                         bridgeLog(.info, "audio",
-                                  "…\(packets) reports, \(audioFrames) audio frames "
-                                  + "(\(dataFrames) with data)")
+                                  "…\(counters.packets) reports, \(counters.audioFrames) audio frames "
+                                  + "(\(counters.dataFrames) with data)")
                     }
                 }
                 bridgeLog(.info, "audio",
@@ -650,12 +774,12 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
                     session.setAudioCapture(false) { _ in }
                     try? fullFile.close(); try? regionFile.close()
                     session.endAudioExperiment()
-                    let verdict = dataFrames > 0
-                        ? "\(dataFrames) frames with real payload — codec material!"
+                    let verdict = counters.dataFrames > 0
+                        ? "\(counters.dataFrames) frames with real payload — codec material!"
                         : "all frames silent — no mic signal reached the controller "
-                          + "(state was \(Self.jackStateName(lastState)))"
+                          + "(state was \(Self.jackStateName(counters.lastState)))"
                     bridgeLog(.info, "audio",
-                              "capture done: \(packets) reports, \(audioFrames) audio "
+                              "capture done: \(counters.packets) reports, \(counters.audioFrames) audio "
                               + "frames; \(verdict)")
                     bridgeLog(.info, "audio", "files: \(fullURL.lastPathComponent), "
                               + "\(regionURL.lastPathComponent) in ~/Documents")
@@ -893,7 +1017,7 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
             for part in serial.split(separator: "+").map(String.init) {
                 if let session = self.sessions.values.first(where: { $0.serialNumber == part }) {
                     bridgeLog(.info, "engine", "\(session.displayName): disconnect requested")
-                    self.central.cancelPeripheralConnection(session.peripheral)
+                    self.retire(session, cancel: true)
                 }
             }
         }
@@ -930,6 +1054,10 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
     func link(leftSerial: String, rightSerial: String) {
         btQueue.async { [weak self] in
             guard let self else { return }
+            guard leftSerial != rightSerial,
+                  self.sessionBySerial(leftSerial)?.session.model == .joyCon2Left,
+                  self.sessionBySerial(rightSerial)?.session.model == .joyCon2Right else { return }
+            self.links = self.links.filter { $0.key != leftSerial && $0.value != rightSerial }
             self.links[leftSerial] = rightSerial
             UserDefaults.standard.set(self.links, forKey: "joyConLinks")
             bridgeLog(.info, "engine", "linked grip: \(leftSerial) + \(rightSerial)")
@@ -972,7 +1100,8 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
         var pairedSlots = Set<Int>()
         for (lSerial, rSerial) in links {
             guard let l = sessionBySerial(lSerial), let r = sessionBySerial(rSerial),
-                  l.session.model == .joyCon2Left, r.session.model == .joyCon2Right
+                  l.session.model == .joyCon2Left, r.session.model == .joyCon2Right,
+                  !pairedSlots.contains(l.slot), !pairedSlots.contains(r.slot)
             else { continue }
             desired.append(Logical(id: "\(lSerial)+\(rSerial)",
                                    slots: [l.slot, r.slot],
@@ -997,7 +1126,7 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
         var unassigned: [Logical] = []
         for logical in desired {
             if let remembered = playerMemory[logical.id],
-               remembered < Self.maxPlayers, newPlayers[remembered] == nil {
+               (0..<Self.maxPlayers).contains(remembered), newPlayers[remembered] == nil {
                 newPlayers[remembered] = logical
             } else {
                 unassigned.append(logical)
@@ -1019,6 +1148,12 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
             let new = newPlayers[player]
             if old?.id != new?.id {
                 if old != nil {
+                    keyboardMapper.reset(player: player)
+                    gestureRecognizer.reset(player: player)
+                    lastVizPush.removeValue(forKey: player)
+                    lastButtonsByPlayer.removeValue(forKey: player)
+                    captureLast.removeValue(forKey: player)
+                    DispatchQueue.main.async { [weak self] in self?.liveStates.removeValue(forKey: player) }
                     for sink in sinks { sink.controllerDisconnected(slot: player) }
                 }
                 if let new {
@@ -1027,6 +1162,10 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
             }
         }
         players = newPlayers
+        if playerMemory.count <= 256 {
+            let previous = UserDefaults.standard.dictionary(forKey: "playerMemory") as? [String: Int] ?? [:]
+            if previous != playerMemory { UserDefaults.standard.set(playerMemory, forKey: "playerMemory") }
+        }
         pushNames()
 
         // 4. LEDs follow logical player numbers.
@@ -1043,15 +1182,13 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
     let gestureRecognizer = GestureRecognizer()
 
     // Reaction game: full-rate rising-edge button detection per logical
-    // participant (keyed by logical id). Set by the game coordinator.
-    var onParticipantPress: ((_ id: String, _ time: TimeInterval) -> Void)?
+    // participant (keyed by the logical id). Set by the game coordinator.
+    var onParticipantPress: (@Sendable (_ id: String, _ time: TimeInterval) -> Void)? {
+        get { callbacks.withLock { $0.press } }
+        set { callbacks.withLock { $0.press = newValue } }
+    }
     private var lastButtonsByPlayer: [Int: Switch2.Buttons] = [:]
     private var captureLast: [Int: Switch2.Buttons] = [:]
-
-    private static func captureScreenshotEnabled(serial: String) -> Bool {
-        let store = UserDefaults.standard.dictionary(forKey: "controllerSettings")
-        return (store?[serial] as? [String: Any])?["captureScreenshot"] as? Bool ?? false
-    }
 
     private static func takeScreenshot() {
         let dir = FileManager.default.urls(for: .picturesDirectory, in: .userDomainMask).first
@@ -1067,7 +1204,10 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
 
     /// Full-rate per-participant sensor stream for the challenge games
     /// (keyed by logical id). Set by the challenge coordinator.
-    var onParticipantState: ((_ id: String, _ state: ControllerState) -> Void)?
+    var onParticipantState: (@Sendable (_ id: String, _ state: ControllerState) -> Void)? {
+        get { callbacks.withLock { $0.state } }
+        set { callbacks.withLock { $0.state = newValue } }
+    }
 
     /// Rumble every connected participant simultaneously (party buzz).
     /// Returns the buzz timestamp so reaction times can be measured against it.
@@ -1076,28 +1216,15 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
         let now = CFAbsoluteTimeGetCurrent()
         btQueue.async { [weak self] in
             guard let self else { return }
-            for player in self.players.keys {
-                self.setRumble(player: player, strong: strong, weak: 0)
-            }
-            self.btQueue.asyncAfter(deadline: .now() + .milliseconds(durationMs)) {
-                for player in self.players.keys {
-                    self.setRumble(player: player, strong: 0, weak: 0)
-                }
-            }
+            for player in self.players.keys { self.pulse(player: player, strong: strong, duration: Double(max(0, durationMs)) / 1000) }
         }
         return now
     }
 
-    /// Buzz + flash LEDs on ONE participant (used for "you're up" cues).
     func buzz(id: String, strong: Double = 1.0, durationMs: Int = 200) {
         btQueue.async { [weak self] in
-            guard let self,
-                  let (player, _) = self.players.first(where: { $0.value.id == id })
-            else { return }
-            self.setRumble(player: player, strong: strong, weak: 0)
-            self.btQueue.asyncAfter(deadline: .now() + .milliseconds(durationMs)) {
-                self.setRumble(player: player, strong: 0, weak: 0)
-            }
+            guard let self, let player = self.players.first(where: { $0.value.id == id })?.key else { return }
+            self.pulse(player: player, strong: strong, duration: Double(max(0, durationMs)) / 1000)
         }
     }
 
@@ -1116,9 +1243,10 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
     // MARK: - Find My Controller
 
     /// Live RSSI-based proximity while a find is active (published to UI).
-    @Published private(set) var findingSerial: String?
-    @Published private(set) var findRSSI: Int = -100
+    @MainActor @Published private(set) var findingSerial: String?
+    @MainActor @Published private(set) var findRSSI: Int = -100
     private var findTimer: DispatchSourceTimer?
+    private weak var findingSession: ControllerSession?
 
     /// Flash LEDs, pulse rumble, and poll RSSI for ~15 s so a lost
     /// controller can be located. Call again with the same serial to stop.
@@ -1131,20 +1259,23 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
             }
             guard let session = self.sessions.values.first(where: { $0.serialNumber == serial })
             else { return }
+            self.findingSession = session
             DispatchQueue.main.async { self.findingSerial = serial }
-            session.onRSSI = { [weak self] rssi in
-                DispatchQueue.main.async { self?.findRSSI = rssi }
+            session.onRSSI = { [weak self, weak session] rssi in
+                guard let self, let session, self.findingSession === session,
+                      self.sessions[session.slot] === session else { return }
+                DispatchQueue.main.async { self.findRSSI = rssi }
             }
             var step = 0
             let timer = DispatchSource.makeTimerSource(queue: self.btQueue)
             timer.schedule(deadline: .now(), repeating: .milliseconds(250))
             timer.setEventHandler { [weak self] in
-                guard let self else { return }
+                guard let self, self.findingSession === session,
+                      self.sessions[session.slot] === session else { return }
                 // Chase the four LEDs and pulse rumble on each beat.
                 let pattern: UInt8 = 1 << UInt8(step % 4)
                 session.setRawLEDs(pattern)
-                self.setRumble(player: self.playerFor(serial: serial) ?? -1,
-                               strong: step % 2 == 0 ? 0.9 : 0.0, weak: 0)
+                session.setRumble(strong: step % 2 == 0 ? 0.9 : 0.0, weak: 0)
                 session.requestRSSI()
                 step += 1
                 if step >= 60 { self.stopFinding() }   // ~15 s
@@ -1154,18 +1285,14 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
         }
     }
 
-    private func playerFor(serial: String) -> Int? {
-        players.first(where: { $0.value.slots.contains { sessions[$0]?.serialNumber == serial } })?.key
-    }
-
     private func stopFinding() {
         findTimer?.cancel(); findTimer = nil
-        if let serial = findingSerial,
-           let session = sessions.values.first(where: { $0.serialNumber == serial }) {
+        if let session = findingSession {
             session.onRSSI = nil
             session.setRawLEDs(nil)    // restore player LEDs
         }
-        DispatchQueue.main.async { [weak self] in self?.findingSerial = nil }
+        findingSession = nil
+        DispatchQueue.main.async { [weak self] in self?.findingSerial = nil; self?.findRSSI = -100 }
     }
 
     /// Re-apply LEDs for a serial after its custom pattern changed.
@@ -1176,24 +1303,8 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
     }
 
     /// Controller info (colors etc.) for the info panel.
-    func info(serial: String) -> Switch2.ControllerInfo? {
-        var result: Switch2.ControllerInfo?
-        btQueue.sync {
-            result = sessions.values.first { $0.serialNumber == serial }?.info
-        }
-        return result
-    }
-
-    /// The current logical participants (id + display name), for the game UI.
-    func participants() -> [(id: String, name: String)] {
-        var result: [(String, String)] = []
-        btQueue.sync {
-            for logical in players.values {
-                result.append((logical.id, self.displayName(for: logical)))
-            }
-        }
-        return result.map { (id: $0.0, name: $0.1) }
-    }
+    @MainActor func info(serial: String) -> Switch2.ControllerInfo? { infoSnapshot[serial] }
+    @MainActor func participants() -> [(id: String, name: String)] { participantSnapshot }
 
     /// Route one physical unit's report to its logical player.
     private func emitState(slot: Int, state: ControllerState) {
@@ -1201,7 +1312,8 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
         // Joy-Con can be lifted off the grip and used as the mouse).
         if let session = sessions[slot] {
             mouseController.handle(serial: session.serialNumber,
-                                   model: session.model, state: state)
+                                   model: session.model, state: state,
+                                   configuration: configurations[session.serialNumber] ?? ControllerConfiguration())
         }
         guard let (player, logical) = players.first(where: { $0.value.slots.contains(slot) })
         else { return }
@@ -1210,14 +1322,13 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
            let l = sessions[logical.slots[0]], let r = sessions[logical.slots[1]] {
             out = Self.mergeStates(left: l.state, right: r.state)
         }
-        out = Self.applyAxisOptions(out, serial: logical.id,
-                                    analogTriggers: logical.model.hasAnalogTriggers)
+        let configuration = configurations[logical.id] ?? ControllerConfiguration()
+        out = configuration.apply(out, analogTriggers: logical.model.hasAnalogTriggers)
 
         // Keyboard mapping: post keystrokes and suppress mapped buttons from
         // the gamepad output so they don't double-act.
-        if keyboardMapper.process(player: player, serial: logical.id, buttons: out.buttons) {
-            out.buttons.subtract(keyboardMapper.mappedButtons(serial: logical.id))
-        }
+        let suppressed = keyboardMapper.process(player: player, configuration: configuration, buttons: out.buttons)
+        ControllerConfiguration.suppress(suppressed, in: &out, analogTriggers: logical.model.hasAnalogTriggers)
 
         for sink in sinks { sink.controllerState(slot: player, state: out) }
 
@@ -1243,8 +1354,8 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
         // Capture button → macOS screenshot (opt-in per controller).
         let prevButtons = captureLast[player] ?? []
         if !prevButtons.contains(.capture), out.buttons.contains(.capture),
-           Self.captureScreenshotEnabled(serial: logical.id) {
-            Self.takeScreenshot()
+           configuration.screenshot {
+            DispatchQueue.global(qos: .utility).async { Self.takeScreenshot() }
         }
         captureLast[player] = out.buttons
 
@@ -1257,69 +1368,6 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
                 self?.liveStates[player] = snapshot
             }
         }
-    }
-
-    /// Per-controller axis shaping (UserDefaults is thread-safe):
-    /// radial deadzone with rescaling (preserves direction, keeps full
-    /// range reachable) and optional Y inversions.
-    private static func applyAxisOptions(_ state: ControllerState,
-                                         serial: String,
-                                         analogTriggers: Bool = false) -> ControllerState {
-        let store = UserDefaults.standard.dictionary(forKey: "controllerSettings")
-        guard let entry = store?[serial] as? [String: Any] else { return state }
-        var s = state
-        let dz = entry["deadzone"] as? Double ?? 0.0
-        if dz > 0 {
-            s.leftStick = Self.radialDeadzone(s.leftStick, dz)
-            s.rightStick = Self.radialDeadzone(s.rightStick, dz)
-        }
-        // Stick center offset (drift correction): shift then re-clamp.
-        if let cl = entry["stickCenterL"] as? [Double], cl.count == 2 {
-            s.leftStick.x = max(-1, min(1, s.leftStick.x - cl[0]))
-            s.leftStick.y = max(-1, min(1, s.leftStick.y - cl[1]))
-        }
-        if let cr = entry["stickCenterR"] as? [Double], cr.count == 2 {
-            s.rightStick.x = max(-1, min(1, s.rightStick.x - cr[0]))
-            s.rightStick.y = max(-1, min(1, s.rightStick.y - cr[1]))
-        }
-        // Trigger threshold: ZL/ZR only assert past the configured travel.
-        if let thr = entry["triggerThreshold"] as? Double, thr > 0 {
-            let cut = UInt8(min(255, thr * 255))
-            if s.leftTrigger < cut { s.leftTrigger = 0 }
-            if s.rightTrigger < cut { s.rightTrigger = 0 }
-        }
-        if entry["invertLX"] as? Bool ?? false { s.leftStick.x = -s.leftStick.x }
-        if entry["invertLY"] as? Bool ?? false { s.leftStick.y = -s.leftStick.y }
-        if entry["invertRX"] as? Bool ?? false { s.rightStick.x = -s.rightStick.x }
-        if entry["invertRY"] as? Bool ?? false { s.rightStick.y = -s.rightStick.y }
-        if let map = entry["buttonMap"] as? [String: String], !map.isEmpty {
-            // Full remap: each pressed physical control asserts its mapped
-            // output (identity when unmapped). Multiple physical buttons may
-            // legitimately map to one output (union semantics).
-            var out: Switch2.Buttons = []
-            for (name, button) in Switch2.namedButtons where s.buttons.contains(button) {
-                let targetName = map[name] ?? name
-                if let target = Switch2.button(named: targetName) {
-                    out.insert(target)
-                }
-            }
-            s.buttons = out
-            // Digital triggers follow the POST-remap ZL/ZR bits (the GC
-            // pad's true analog triggers are left untouched by remapping).
-            if !analogTriggers {
-                s.leftTrigger = out.contains(.zl) ? 255 : 0
-                s.rightTrigger = out.contains(.zr) ? 255 : 0
-            }
-        }
-        return s
-    }
-
-    private static func radialDeadzone(_ stick: (x: Double, y: Double),
-                                       _ deadzone: Double) -> (x: Double, y: Double) {
-        let magnitude = (stick.x * stick.x + stick.y * stick.y).squareRoot()
-        guard magnitude > deadzone else { return (0, 0) }
-        let rescaled = min(1, (magnitude - deadzone) / (1 - deadzone))
-        return (stick.x / magnitude * rescaled, stick.y / magnitude * rescaled)
     }
 
     /// Combine two Joy-Con states into one gamepad. The shared button
@@ -1346,6 +1394,7 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
     // MARK: - Scan control (btQueue)
 
     private func updateScanning() {
+        guard running, !suspended else { central.stopScan(); publishState(.paused); return }
         guard central.state == .poweredOn else { return }
         let occupied = sessions.count + connecting.count
         if occupied < Self.maxSessions {
@@ -1414,8 +1463,14 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
                 model: session.model))
         }
         snapshot.sort { $0.id < $1.id }
+        let published = snapshot
+        let infos = Dictionary(sessions.values.compactMap { session in session.info.map { (session.serialNumber, $0) } },
+                               uniquingKeysWith: { first, _ in first })
+        let participants = players.sorted { $0.key < $1.key }.map { (id: $0.value.id, name: displayName(for: $0.value)) }
         DispatchQueue.main.async { [weak self] in
-            self?.controllers = snapshot
+            self?.controllers = published
+            self?.infoSnapshot = infos
+            self?.participantSnapshot = participants
         }
     }
 }
@@ -1430,14 +1485,17 @@ extension BridgeEngine: CBCentralManagerDelegate {
             bridgeLog(.info, "engine", "Bluetooth ready")
             updateScanning()
         case .unauthorized:
+            resetConnections(cancel: false)
             bridgeLog(.error, "engine",
                       "Bluetooth permission denied — grant it in System Settings > Privacy & Security > Bluetooth")
             publishState(.unauthorized)
         case .poweredOff:
+            resetConnections(cancel: false)
             bridgeLog(.warning, "engine", "Bluetooth is off")
             publishState(.off)
         default:
-            break
+            resetConnections(cancel: false)
+            publishState(.off)
         }
     }
 
@@ -1445,7 +1503,10 @@ extension BridgeEngine: CBCentralManagerDelegate {
                         didDiscover peripheral: CBPeripheral,
                         advertisementData: [String: Any],
                         rssi RSSI: NSNumber) {
-        guard let manu = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data,
+        guard running, !suspended, central.state == .poweredOn,
+              !disconnecting.contains(peripheral.identifier),
+              ProcessInfo.processInfo.systemUptime >= (retryAfter[peripheral.identifier] ?? 0),
+              let manu = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data,
               manu.count > 2,
               Switch2.u16(manu, 0) == Switch2.nintendoCompanyID,
               let adv = Switch2.parseAdvertisement(manufacturerData: manu.dropFirst(2)),
@@ -1464,29 +1525,28 @@ extension BridgeEngine: CBCentralManagerDelegate {
         publishState(.connecting)
         central.connect(peripheral, options: nil)
 
-        // Connect attempts can hang; give up after 10 s and rescan.
-        btQueue.asyncAfter(deadline: .now() + 10) { [weak self] in
-            guard let self, let pending = self.connecting[peripheral.identifier],
-                  pending.session === session else { return }
-            bridgeLog(.warning, "engine", "connect timeout; rescanning")
-            self.central.cancelPeripheralConnection(peripheral)
-            self.connecting.removeValue(forKey: peripheral.identifier)
-            self.updateScanning()
-        }
+        armDeadline(session, seconds: 10)
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-        guard let pending = connecting[peripheral.identifier] else { return }
+        guard !disconnecting.contains(peripheral.identifier), running, !suspended,
+              let pending = connecting[peripheral.identifier], pending.session.peripheral === peripheral else {
+            central.cancelPeripheralConnection(peripheral); return
+        }
         bridgeLog(.info, "engine", "connected, starting handshake")
+        armDeadline(pending.session, seconds: 45)
         pending.session.begin()
     }
 
     func centralManager(_ central: CBCentralManager,
                         didFailToConnect peripheral: CBPeripheral,
                         error: Error?) {
-        if connecting.removeValue(forKey: peripheral.identifier) != nil {
-            bridgeLog(.warning, "engine",
-                      "connect failed (\(error?.localizedDescription ?? "unknown"))")
+        disconnecting.remove(peripheral.identifier)
+        if let pending = connecting[peripheral.identifier], pending.session.peripheral === peripheral {
+            retire(pending.session, cancel: false)
+            if retryAfter.count > 64 { retryAfter.removeAll() }
+            retryAfter[peripheral.identifier] = ProcessInfo.processInfo.systemUptime + 2
+            bridgeLog(.warning, "engine", "connect failed (\(error?.localizedDescription ?? "unknown"))")
         }
         updateScanning()
     }
@@ -1494,15 +1554,12 @@ extension BridgeEngine: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager,
                         didDisconnectPeripheral peripheral: CBPeripheral,
                         error: Error?) {
-        connecting.removeValue(forKey: peripheral.identifier)
-        if let (slot, session) = sessions.first(where: {
-            $0.value.peripheral.identifier == peripheral.identifier
-        }) {
-            session.teardown()
-            sessions.removeValue(forKey: slot)
-            connectedAt.removeValue(forKey: slot)
-            bridgeLog(.info, "engine", "\(session.displayName) disconnected")
-            recomputeLogical()
+        disconnecting.remove(peripheral.identifier)
+        if let pending = connecting[peripheral.identifier], pending.session.peripheral === peripheral {
+            retire(pending.session, cancel: false)
+        }
+        if let session = sessions.values.first(where: { $0.peripheral === peripheral }) {
+            retire(session, cancel: false)
         }
         updateScanning()
     }
@@ -1513,23 +1570,32 @@ extension BridgeEngine: CBCentralManagerDelegate {
 extension BridgeEngine: ControllerSessionDelegate {
 
     func sessionReady(_ session: ControllerSession) {
-        connecting.removeValue(forKey: session.peripheral.identifier)
+        let id = session.peripheral.identifier
+        guard running, !suspended, !session.isRetired, !disconnecting.contains(id),
+              connecting[id]?.session === session, sessions[session.slot] == nil else {
+            if !owns(session) { session.teardown() }
+            return
+        }
+        deadlines.removeValue(forKey: id)?.cancel()
+        connecting.removeValue(forKey: id)
         sessions[session.slot] = session
         connectedAt[session.slot] = Date()
-        session.onState = { [weak self] slot, state in
-            self?.emitState(slot: slot, state: state)
+        session.onState = { [weak self, weak session] slot, state in
+            guard let self, let session, self.sessions[slot] === session else { return }
+            self.emitState(slot: slot, state: state)
         }
         recomputeLogical()
         updateScanning()
     }
 
     func sessionFailed(_ session: ControllerSession, reason: String) {
-        connecting.removeValue(forKey: session.peripheral.identifier)
-        central.cancelPeripheralConnection(session.peripheral)
+        guard owns(session) else { return }
+        retire(session, cancel: true)
         updateScanning()
     }
 
     func sessionDidUpdateState(_ session: ControllerSession) {
+        guard sessions[session.slot] === session else { return }
         publishControllers()
     }
 }
@@ -1539,7 +1605,7 @@ extension BridgeEngine: ControllerSessionDelegate {
 /// Receives decoded controller traffic on the Bluetooth queue. The `slot`
 /// parameter is the LOGICAL player index (0..maxPlayers-1). Implementations
 /// must be fast and non-blocking (fire-and-forget I/O only).
-protocol ControllerOutputSink: AnyObject {
+protocol ControllerOutputSink: AnyObject, Sendable {
     func controllerConnected(slot: Int, model: Switch2.Model)
     func controllerDisconnected(slot: Int)
     func controllerState(slot: Int, state: ControllerState)
