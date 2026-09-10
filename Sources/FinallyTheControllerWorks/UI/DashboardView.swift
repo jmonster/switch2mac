@@ -685,12 +685,14 @@ struct ControllerCard: View {
 
     private func boolBinding(get: @escaping @MainActor @Sendable () -> Bool,
                              set: @escaping @MainActor @Sendable (Bool) -> Void) -> Binding<Bool> {
-        Binding(get: get, set: set)
+        Binding(get: { MainActor.assumeIsolated { get() } },
+                set: { value in MainActor.assumeIsolated { set(value) } })
     }
 
     private func boolDoubleBinding(get: @escaping @MainActor @Sendable () -> Double,
                                    set: @escaping @MainActor @Sendable (Double) -> Void) -> Binding<Double> {
-        Binding(get: get, set: set)
+        Binding(get: { MainActor.assumeIsolated { get() } },
+                set: { value in MainActor.assumeIsolated { set(value) } })
     }
 
     private var triggerBinding: Binding<Double> {
