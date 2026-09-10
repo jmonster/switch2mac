@@ -16,27 +16,31 @@ final class KeyCaptureSession: ObservableObject {
     /// session), so two monitors can never both swallow keystrokes.
     private static weak var armed: KeyCaptureSession?
 
-    func begin(id: String, onCapture: @escaping (KeySpec) -> Void) {
+    func begin(id: String, onCapture: @escaping @MainActor (KeySpec) -> Void) {
         KeyCaptureSession.armed?.cancel()
         KeyCaptureSession.armed = self
         capturingID = id
         monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             // AppKit delivers local event monitors synchronously on the main
             // thread. Do not enqueue a task: the return value controls delivery.
-            return MainActor.assumeIsolated {
-                guard let self else { return event }
-                if event.keyCode == 53 {           // Escape backs out, binds nothing
+            let code = event.keyCode
+            let flags = event.modifierFlags
+            let characters = event.charactersIgnoringModifiers
+            let consumed = MainActor.assumeIsolated {
+                guard let self else { return false }
+                if code == 53 {           // Escape backs out, binds nothing
                     self.cancel()
-                    return nil
+                    return true
                 }
                 let spec = KeySpec(
-                    keyCode: event.keyCode,
-                    modifiers: Self.cgFlags(from: event.modifierFlags),
-                    label: Self.describe(event))
+                    keyCode: code,
+                    modifiers: Self.cgFlags(from: flags),
+                    label: Self.describe(code: code, characters: characters, flags: flags))
                 self.cancel()
                 onCapture(spec)
-                return nil                          // swallow the key
+                return true
             }
+            return consumed ? nil : event
         }
     }
 
@@ -62,15 +66,14 @@ final class KeyCaptureSession: ObservableObject {
         return cg.rawValue
     }
 
-    static func describe(_ event: NSEvent) -> String {
+    static func describe(code: UInt16, characters: String?, flags f: NSEvent.ModifierFlags) -> String {
         var parts: [String] = []
-        let f = event.modifierFlags
         if f.contains(.control) { parts.append("⌃") }
         if f.contains(.option) { parts.append("⌥") }
         if f.contains(.shift) { parts.append("⇧") }
         if f.contains(.command) { parts.append("⌘") }
-        let key = event.charactersIgnoringModifiers?.uppercased()
-        parts.append(specialKeyName(event.keyCode) ?? (key?.isEmpty == false ? key! : "key\(event.keyCode)"))
+        let key = characters?.uppercased()
+        parts.append(specialKeyName(code) ?? (key?.isEmpty == false ? key! : "key\(code)"))
         return parts.joined()
     }
 

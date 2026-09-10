@@ -17,7 +17,7 @@ struct KeyCaptureTests {
         precondition(first.capturingID == nil && second.capturingID == "B")
         NSApp.sendEvent(key(0, "a", [.command, .shift]))
         precondition(received.count == 1 && received[0].keyCode == 0)
-        precondition(received[0].modifiers == CGEventFlags([.maskCommand, .maskShift]).rawValue)
+        precondition(received[0].modifiers == CGEventFlags.maskCommand.union(.maskShift).rawValue)
         precondition(received[0].label == "⇧⌘A" && second.capturingID == nil)
         second.begin(id: "B") { received.append($0) }
         NSApp.sendEvent(key(53, "\u{1b}"))
