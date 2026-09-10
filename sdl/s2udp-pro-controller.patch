@@ -1,0 +1,141 @@
+diff --git a/src/joystick/darwin/SDL_s2udpjoystick.c b/src/joystick/darwin/SDL_s2udpjoystick.c
+index 5eee622..abae0b3 100644
+--- a/src/joystick/darwin/SDL_s2udpjoystick.c
++++ b/src/joystick/darwin/SDL_s2udpjoystick.c
+@@ -87,6 +87,10 @@ typedef struct
+     Uint32 buttons;
+     float lx, ly, rx, ry;
+     Uint8 lt, rt;
++    Sint16 gyro[3], accel[3];
++    bool sensors_enabled;
++    Uint64 state_generation, sensor_generation;
++    Uint64 sensor_timestamp;     // host receipt; S2B1 has no controller timestamp
+     Uint64 last_state_ms;
+     Uint64 last_hello_ms;
+     Uint16 rumble_strong, rumble_weak;
+@@ -98,6 +102,7 @@ static S2UDP_Slot s_slots[S2UDP_MAX_SLOTS];
+ static bool s_initialized = false;
+ 
+ static Uint32 read_u32(const Uint8 *p) { return (Uint32)(p[0] | (p[1] << 8) | (p[2] << 16) | ((Uint32)p[3] << 24)); }
++static Sint16 read_s16(const Uint8 *p) { return (Sint16)((Uint16)p[0] | ((Uint16)p[1] << 8)); }
+ static float read_f32(const Uint8 *p)
+ {
+     Uint32 bits = read_u32(p);
+@@ -125,6 +130,17 @@ static void S2UDP_SendRumble(S2UDP_Slot *slot)
+     }
+ }
+ 
++/* Do not let a closed, renamed or expired joystick keep rumbling a slot
++ * that might subsequently be owned by another controller. */
++static void S2UDP_StopEffects(S2UDP_Slot *slot)
++{
++    if (slot->rumble_strong || slot->rumble_weak) {
++        slot->rumble_strong = slot->rumble_weak = 0;
++        S2UDP_SendRumble(slot);
++    }
++    slot->sensors_enabled = false;
++}
++
+ static void S2UDP_EmitState(SDL_Joystick *joystick, S2UDP_Slot *slot);
+ 
+ /* Every received state reaches an open joystick before the next is read.
+@@ -150,6 +166,12 @@ static void S2UDP_PumpSlot(S2UDP_Slot *slot)
+             slot->ry = read_f32(buf + 24);
+             slot->lt = buf[28];
+             slot->rt = buf[29];
++            for (int i = 0; i < 3; ++i) {
++                slot->gyro[i] = read_s16(buf + 32 + i * 2);
++                slot->accel[i] = read_s16(buf + 38 + i * 2);
++            }
++            ++slot->state_generation;
++            slot->sensor_timestamp = SDL_GetTicksNS();
+             slot->last_state_ms = now;
+             if (slot->present && slot->joystick) {
+                 S2UDP_EmitState(slot->joystick, slot);
+@@ -166,6 +188,7 @@ static void S2UDP_PumpSlot(S2UDP_Slot *slot)
+                 if (slot->present) {
+                     slot->present = false;
+                     slot->last_state_ms = 0;   // re-add on next state packet
++                    S2UDP_StopEffects(slot);
+                     if (slot->joystick) slot->joystick->hwdata = NULL;
+                     slot->joystick = NULL;
+                     SDL_PrivateJoystickRemoved(slot->instance_id);
+@@ -185,6 +208,7 @@ static void S2UDP_PumpSlot(S2UDP_Slot *slot)
+         SDL_PrivateJoystickAdded(slot->instance_id);
+     } else if (slot->present && now - slot->last_state_ms >= PRESENCE_TIMEOUT_MS) {
+         slot->present = false;
++        S2UDP_StopEffects(slot);
+         if (slot->joystick) slot->joystick->hwdata = NULL;
+         slot->joystick = NULL;
+         SDL_PrivateJoystickRemoved(slot->instance_id);
+@@ -363,6 +387,13 @@ static bool S2UDP_JoystickOpen(SDL_Joystick *joystick, int device_index)
+     joystick->nhats = 0;
+     joystick->hwdata = (struct joystick_hwdata *)slot;
+     slot->joystick = joystick;
++    slot->sensors_enabled = false;
++    slot->sensor_generation = slot->state_generation;
++    // BLE report cadence is not encoded in S2B1: 0 means unknown, not 250 Hz.
++    SDL_PrivateJoystickAddSensor(joystick, SDL_SENSOR_GYRO, 0.0f);
++    SDL_PrivateJoystickAddSensor(joystick, SDL_SENSOR_ACCEL, 0.0f);
++    SDL_SetBooleanProperty(SDL_GetJoystickProperties(joystick),
++                           SDL_PROP_JOYSTICK_CAP_RUMBLE_BOOLEAN, true);
+     return true;
+ }
+ 
+@@ -395,11 +426,19 @@ static bool S2UDP_JoystickSendEffect(SDL_Joystick *joystick, const void *data, i
+ 
+ static bool S2UDP_JoystickSetSensorsEnabled(SDL_Joystick *joystick, bool enabled)
+ {
+-    return SDL_Unsupported();
++    S2UDP_Slot *slot = (S2UDP_Slot *)joystick->hwdata;
++    if (!slot || slot->joystick != joystick || !slot->present) {
++        return SDL_Unsupported();
++    }
++    slot->sensors_enabled = enabled;
++    // Do not replay an old sample when enabling or reopening a gamepad.
++    slot->sensor_generation = slot->state_generation;
++    return true;
+ }
+ 
+ static Sint16 S2UDP_AxisFromFloat(float value)
+ {
++    if (SDL_isnan(value) || SDL_isinf(value)) return 0;
+     if (value < -1.0f) value = -1.0f;
+     if (value > 1.0f) value = 1.0f;
+     return (Sint16)(value * 32767.0f);
+@@ -435,6 +474,23 @@ static void S2UDP_EmitState(SDL_Joystick *joystick, S2UDP_Slot *slot)
+     SDL_SendJoystickAxis(timestamp, joystick, 4, S2UDP_AxisFromTrigger(slot->lt));
+     SDL_SendJoystickAxis(timestamp, joystick, 5, S2UDP_AxisFromTrigger(slot->rt));
+ 
++    if (slot->sensors_enabled && slot->sensor_generation != slot->state_generation) {
++        // Match the pinned SDL Switch 2 driver's nominal scale and Pro frame:
++        // raw (X,Y,Z) -> SDL (X,Z,-Y), radians/s and m/s^2 respectively.
++        // No bias calibration or firmware-dependent sensitivity detection is
++        // claimed: the legacy UDP format carries neither calibration nor IMU time.
++        const float gyro_scale = 34.8f / 32767.0f;
++        const float accel_scale = 9.80665f * 8.0f / 32767.0f;
++        const float gyro[3] = { slot->gyro[0] * gyro_scale,
++            slot->gyro[2] * gyro_scale, -slot->gyro[1] * gyro_scale };
++        const float accel[3] = { slot->accel[0] * accel_scale,
++            slot->accel[2] * accel_scale, -slot->accel[1] * accel_scale };
++        SDL_SendJoystickSensor(timestamp, joystick, SDL_SENSOR_GYRO,
++                               slot->sensor_timestamp, gyro, 3);
++        SDL_SendJoystickSensor(timestamp, joystick, SDL_SENSOR_ACCEL,
++                               slot->sensor_timestamp, accel, 3);
++        slot->sensor_generation = slot->state_generation;
++    }
+ }
+ 
+ static void S2UDP_JoystickUpdate(SDL_Joystick *joystick)
+@@ -458,7 +514,10 @@ static void S2UDP_JoystickUpdate(SDL_Joystick *joystick)
+ static void S2UDP_JoystickClose(SDL_Joystick *joystick)
+ {
+     S2UDP_Slot *slot = (S2UDP_Slot *)joystick->hwdata;
+-    if (slot && slot->joystick == joystick) slot->joystick = NULL;
++    if (slot && slot->joystick == joystick) {
++        S2UDP_StopEffects(slot);
++        slot->joystick = NULL;
++    }
+     joystick->hwdata = NULL;
+ }
+ 

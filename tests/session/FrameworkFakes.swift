@@ -23,6 +23,7 @@ final class CBPeripheral {
     weak var delegate: CBPeripheralDelegate?
     var services: [CBService]?
     var canSendWriteWithoutResponse = true
+    var writeLimit = 180
     var writes: [(Data, CBCharacteristic)] = []
     var identifier = UUID()
     func discoverServices(_ uuids: [CBUUID]?) {}
@@ -32,11 +33,12 @@ final class CBPeripheral {
         writes.append((data, ch))
     }
     func readRSSI() {}
-    func maximumWriteValueLength(for type: CBCharacteristicWriteType) -> Int { 180 }
+    func maximumWriteValueLength(for type: CBCharacteristicWriteType) -> Int { writeLimit }
 }
 final class IOBluetoothHostController {
-    static func `default`() -> IOBluetoothHostController? { nil }
-    func addressAsString() -> String? { nil }
+    static var testAddress: String?
+    static func `default`() -> IOBluetoothHostController? { IOBluetoothHostController() }
+    func addressAsString() -> String? { Self.testAddress }
 }
 enum LogLevel { case debug, info, warning, error }
 func bridgeLog(_ level: LogLevel, _ category: String, _ message: String) {}

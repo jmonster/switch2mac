@@ -84,7 +84,8 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     private var commandSubmitted = false
     private var writeStallTimeout: DispatchWorkItem?
     private var writeStallGeneration: UInt64 = 0
-    private var pendingMotor: (value: Switch2.Vibration, expires: TimeInterval)?
+    private var pendingMotor: (value: Switch2.MotorVibration, expires: TimeInterval)?
+    private var warnedMotorUnavailable = false
     private var pumpingWrites = false
     private var commandNotificationsReady = false
     private var commandTimeout: DispatchWorkItem?
@@ -237,11 +238,12 @@ final class ControllerSession: NSObject, @unchecked Sendable {
 
     private func stepReadInfo(_ done: @escaping (Bool) -> Void) {
         readMemory(length: 0x40, address: Switch2.Address.controllerInfo) { [weak self] data in
-            guard let self, let data, let info = Switch2.ControllerInfo(memoryBlock: data) else {
+            guard let self, let data, let info = Switch2.ControllerInfo(memoryBlock: data),
+                  info.vendorID == Switch2.nintendoVendorID, let model = info.model else {
                 done(false); return
             }
             self.info = info
-            if let model = info.model { self.model = model }
+            self.model = model
             done(true)
         }
     }
@@ -268,12 +270,12 @@ final class ControllerSession: NSObject, @unchecked Sendable {
                                       _ done: @escaping (Switch2.StickCalibration?) -> Void) {
         readMemory(length: 0x0B, address: user) { [weak self] data in
             guard let self, !self.ended else { return }
-            if let data, !Switch2.StickCalibration.isBlank(data) {
-                done(Switch2.StickCalibration(data: data))
+            if let data, let cal = Switch2.StickCalibration(validatedData: data) {
+                done(cal)
                 return
             }
             self.readMemory(length: 0x0B, address: factory) { data in
-                done(data.map { Switch2.StickCalibration(data: $0) })
+                done(data.flatMap { Switch2.StickCalibration(validatedData: $0) })
             }
         }
     }
@@ -374,7 +376,7 @@ final class ControllerSession: NSObject, @unchecked Sendable {
         // Rumble stop/replacement must not wait for a command response.
         if let motor = pendingMotor, let characteristic = chars[Switch2.GATT.vibration(for: model)] {
             let value = ProcessInfo.processInfo.systemUptime < motor.expires
-                ? motor.value : Switch2.Vibration.waveform(strong: 0, weak: 0)
+                ? motor.value : Switch2.MotorVibration.stopped
             let packet = Switch2.motorPacket(value, packetID: vibrationPacketID, model: model)
             if packet.count <= peripheral.maximumWriteValueLength(for: .withoutResponse) {
                 peripheral.writeValue(packet, for: characteristic, type: .withoutResponse)
@@ -763,9 +765,13 @@ final class ControllerSession: NSObject, @unchecked Sendable {
         // suppress its LED keep-alive when an unsupported rumble is requested.
         if model.hasHDRumble && (strong > 0.001 || weakMag > 0.001 || rumbleActive) {
             let active = strong > 0.001 || weakMag > 0.001
-            writeMotor(Switch2.Vibration.waveform(strong: strong, weak: weakMag))
-            rumbleActive = active
-            return
+            if writeMotor(Switch2.MotorVibration.waveform(strong: strong, weak: weakMag, model: model)) {
+                rumbleActive = active
+                return
+            }
+            // Missing characteristic / insufficient MTU is not an input failure.
+            // Keep the link alive even when a game continuously requests rumble.
+            rumbleActive = false
         }
         // Idle: the 1 Hz keep-alive that stops macOS terminating the link.
         if now - lastWriteAt >= 1.0, pendingCommand == nil {
@@ -773,11 +779,28 @@ final class ControllerSession: NSObject, @unchecked Sendable {
         }
     }
 
-    private func writeMotor(_ vib: Switch2.Vibration) {
-        guard !ended, model.hasHDRumble,
-              chars[Switch2.GATT.vibration(for: model)] != nil else { return }
-        pendingMotor = (vib, ProcessInfo.processInfo.systemUptime + 0.5)
+    @discardableResult
+    private func writeMotor(_ vib: Switch2.Vibration) -> Bool {
+        writeMotor(Switch2.MotorVibration(vib))
+    }
+
+    @discardableResult
+    private func writeMotor(_ motors: Switch2.MotorVibration) -> Bool {
+        guard !ended, model.hasHDRumble else { return false }
+        let size = Switch2.motorPacket(motors, packetID: 0, model: model).count
+        guard chars[Switch2.GATT.vibration(for: model)] != nil,
+              size <= peripheral.maximumWriteValueLength(for: .withoutResponse) else {
+            if !warnedMotorUnavailable {
+                log(.warning, "rumble unavailable: missing motor characteristic or write size below \(size) bytes")
+                warnedMotorUnavailable = true
+            }
+            pendingMotor = nil
+            return false
+        }
+        warnedMotorUnavailable = false
+        pendingMotor = (motors, ProcessInfo.processInfo.systemUptime + 0.5)
         pumpWrites()
+        return true
     }
 
     // MARK: - Input reports

@@ -310,6 +310,18 @@ enum Switch2 {
             minRange = (Double(mn.0), Double(mn.1))
         }
 
+        /// Memory is not necessarily usable calibration: an erased, truncated,
+        /// or zero-span block must fall back to factory/nominal calibration,
+        /// not turn a stick into a permanently neutral axis.
+        init?(validatedData data: Data) {
+            guard data.count >= 9, !Self.isBlank(data) else { return nil }
+            self.init(data: data)
+            guard center.x > 0, center.x < 4095,
+                  center.y > 0, center.y < 4095,
+                  maxRange.x > 0, maxRange.y > 0,
+                  minRange.x > 0, minRange.y > 0 else { return nil }
+        }
+
         /// Map a raw stick pair to -1...1 per axis, with deadzone.
         func apply(_ raw: (UInt16, UInt16), deadzone: Double = 0) -> (Double, Double) {
             func axis(_ value: Double, _ center: Double,
@@ -395,7 +407,9 @@ enum Switch2 {
 
         /// Resonant low band; drive amplitude only (tuning from the bridge).
         static func waveform(strong: Double, weak: Double) -> Vibration {
-            let mag = min(1.0, max(0, strong) + max(0, weak) * 0.5)
+            let strong = strong.isFinite ? max(0, min(1, strong)) : 0
+            let weak = weak.isFinite ? max(0, min(1, weak)) : 0
+            let mag = min(1.0, strong + weak * 0.5)
             return Vibration(lfFreq: 0x0E1, lfAmp: UInt16(mag * Double(0x3FF)))
         }
 
@@ -407,8 +421,9 @@ enum Switch2 {
         /// so the playable range is 1...511 Hz — about the two octaves
         /// around middle C. `amp` maps 0...1 onto the 10-bit amplitude.
         static func tone(freqHz: Int, amp: Double) -> Vibration {
-            Vibration(lfFreq: UInt16(min(511, max(1, freqHz))),
-                      lfAmp: UInt16(min(1.0, max(0, amp)) * Double(0x3FF)))
+            let amplitude = amp.isFinite ? min(1.0, max(0, amp)) : 0
+            return Vibration(lfFreq: UInt16(min(511, max(1, freqHz))),
+                             lfAmp: UInt16(amplitude * Double(0x3FF)))
         }
 
         func packed() -> Data {
@@ -423,16 +438,51 @@ enum Switch2 {
         }
     }
 
-    /// Build one motor packet: three identical sub-frame samples per block so
-    /// the actuator runs continuously; Pro takes two blocks (L+R motors).
+    /// A complete motor intent. Keep both channels together when replacing a
+    /// queued intent, including stop/expiry, so one motor cannot outlive the other.
+    struct MotorVibration: Sendable {
+        var left: Vibration
+        var right: Vibration
+
+        init(left: Vibration, right: Vibration) {
+            self.left = left
+            self.right = right
+        }
+
+        /// Tones and other single-sample callers intentionally drive both motors.
+        init(_ sample: Vibration) { self.init(left: sample, right: sample) }
+
+        static let stopped = MotorVibration(Vibration())
+
+        static func waveform(strong: Double, weak: Double, model: Model) -> MotorVibration {
+            guard model == .proController2 else {
+                // Preserve the established single-actuator Joy-Con mix.
+                return MotorVibration(.waveform(strong: strong, weak: weak))
+            }
+            // Pro: strong -> left, weak -> right. Both use the existing resonant
+            // waveform; do not collapse two independent game amplitudes to mono.
+            return MotorVibration(left: .waveform(strong: strong, weak: 0),
+                                  right: .waveform(strong: weak, weak: 0))
+        }
+    }
+
+    /// Backward-compatible uniform tone/experiment packet.
     static func motorPacket(_ vib: Vibration, packetID: UInt8, model: Model) -> Data {
-        let header = Data([0x50 + (packetID & 0x0F)])
-        let sample = vib.packed()
-        var block = header
-        block.append(sample); block.append(sample); block.append(sample)
+        motorPacket(MotorVibration(vib), packetID: packetID, model: model)
+    }
+
+    /// Three identical sub-frames per motor; Pro has separate L then R blocks.
+    /// The sequence nibble belongs to the whole write and wraps modulo 16.
+    static func motorPacket(_ motors: MotorVibration, packetID: UInt8, model: Model) -> Data {
+        func block(_ sample: Vibration) -> Data {
+            var data = Data([0x50 | (packetID & 0x0F)])
+            let packed = sample.packed()
+            for _ in 0..<3 { data.append(packed) }
+            return data
+        }
         var payload = Data([0x00])
-        payload.append(block)
-        if model == .proController2 { payload.append(block) }
+        payload.append(block(motors.left))
+        if model == .proController2 { payload.append(block(motors.right)) }
         return payload
     }
 }
