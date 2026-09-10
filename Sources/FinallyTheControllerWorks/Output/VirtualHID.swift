@@ -1,9 +1,8 @@
 // VirtualHID.swift
 // The system-wide sink: one CoreHID virtual gamepad per connected controller.
-// With this active, ANY app on the Mac — unaltered Gopher64, Steam, ports —
-// sees a normal HID gamepad. Requires the com.apple.developer.hid.virtual.device
-// entitlement (Apple Developer provisioning); without it, device creation
-// fails and we log once — the UDP/SDL path still works.
+// Publishes a generic gamepad for compatible HID consumers. Requires the
+// com.apple.developer.hid.virtual.device entitlement; other output sinks
+// remain independent when virtual-device creation fails.
 //
 // Report layout (14 bytes, must match `gamepadDescriptor`):
 //   bytes 0-2: 19 buttons (bit i = button i in our fixed order) + 5 pad bits
@@ -21,13 +20,13 @@
 import Foundation
 import CoreHID
 
-final class VirtualHIDSink: ControllerOutputSink, @unchecked Sendable {
+final class VirtualHIDSink: ControllerOutputSink {
 
-    var onRumble: ((Int, Double, Double) -> Void)?
+    // This descriptor has no rumble output report.
+    var onRumble: ((Int, Double, Double) -> Void)? { get { nil } set {} }
+    private let slots = (0..<4).map { Slot(index: $0) }
 
-    private let queue = DispatchQueue(label: "com.petersharma.ftcw.virtualhid")
-    private var devices: [Int: HIDVirtualDevice] = [:]
-    private var entitlementDenied = false
+    deinit { for slot in slots { slot.finish() } }
 
     /// Generic gamepad: 19 buttons, two 16-bit stick pairs, two 8-bit
     /// triggers, one hat. Mirrors the probe descriptor that validated the
@@ -82,52 +81,186 @@ final class VirtualHIDSink: ControllerOutputSink, @unchecked Sendable {
     // MARK: ControllerOutputSink (called on the Bluetooth queue)
 
     func controllerConnected(slot: Int, model: Switch2.Model) {
-        queue.async { [weak self] in
-            guard let self, self.devices[slot] == nil, !self.entitlementDenied else { return }
-            let props = HIDVirtualDevice.Properties(
-                descriptor: Self.gamepadDescriptor,
-                vendorID: UInt32(Switch2.nintendoVendorID),
-                productID: UInt32(model.rawValue),
-                transport: nil,
-                product: "\(model.displayName) (Finally)",
-                manufacturer: "Finally the Controller Works",
-                serialNumber: "FTCW-slot\(slot + 1)",
-                uniqueID: "com.petersharma.ftcw.slot\(slot + 1)")
-            guard let device = HIDVirtualDevice(properties: props) else {
-                self.entitlementDenied = true
-                bridgeLog(.warning, "virtualhid",
-                          "virtual gamepad creation refused — app is missing the "
-                          + "com.apple.developer.hid.virtual.device entitlement. "
-                          + "Games will see controllers via the SDL path only.")
-                return
-            }
-            self.devices[slot] = device
-            Task {
-                await device.activate(delegate: NullHIDDelegate.shared)
-                bridgeLog(.info, "virtualhid",
-                          "slot \(slot + 1): system-wide virtual gamepad created")
-            }
-        }
+        guard slots.indices.contains(slot) else { return }
+        slots[slot].connect(model)
     }
 
     func controllerDisconnected(slot: Int) {
-        queue.async { [weak self] in
-            if self?.devices.removeValue(forKey: slot) != nil {
-                bridgeLog(.info, "virtualhid", "slot \(slot + 1): virtual gamepad removed")
-            }
-        }
+        guard slots.indices.contains(slot) else { return }
+        slots[slot].disconnect()
     }
 
     /// Virtual devices are named at creation; renames apply on next connect.
     func controllerName(slot: Int, name: String) {}
 
     func controllerState(slot: Int, state: ControllerState) {
-        queue.async { [weak self] in
-            guard let self, let device = self.devices[slot] else { return }
-            let report = Self.report(from: state)
-            Task {
-                try? await device.dispatchInputReport(data: report,
-                                                      timestamp: SuspendingClock.now)
+        guard slots.indices.contains(slot) else { return }
+        slots[slot].submit(Self.report(from: state))
+    }
+
+    /// One consumer per logical slot, including while an older device retires.
+    /// The lock protects admission/state only; no CoreHID call or await holds it.
+    private final class Slot: @unchecked Sendable {
+        private struct Report: Sendable {
+            let data: Data
+            let timestamp = SuspendingClock.now
+            let admitted = ContinuousClock.now
+        }
+        private enum Action: Sendable {
+            case activate(UInt64, Switch2.Model)
+            case report(Report)
+            case retire
+            case stop
+        }
+        private let index: Int
+        private let lock = NSLock()
+        private var requested: (generation: UInt64, model: Switch2.Model)?
+        private var generation: UInt64 = 0
+        private var reports: [Report] = []
+        private var ended = false
+        private var worker: Task<Void, Never>?
+        private var waiting: (generation: UInt64?, reply: CheckedContinuation<Action, Never>)?
+
+        init(index: Int) { self.index = index }
+
+        func connect(_ model: Switch2.Model) {
+            lock.withLock {
+                guard !ended else { return }
+                generation &+= 1
+                requested = (generation, model)
+                reports.removeAll(keepingCapacity: true)
+                if worker == nil { worker = Task { await self.run() } }
+                wakeLocked()
+            }
+        }
+
+        func disconnect() {
+            lock.withLock {
+                requested = nil
+                reports.removeAll(keepingCapacity: true)
+                wakeLocked()
+            }
+        }
+
+        func finish() {
+            lock.withLock {
+                ended = true
+                requested = nil
+                reports.removeAll()
+                wakeLocked()
+            }
+        }
+
+        func submit(_ data: Data) {
+            let overflow = lock.withLock {
+                guard !ended, requested != nil else { return false }
+                // Bound admission BEFORE scheduling work, not inside a queued closure.
+                guard reports.count < 128 else {
+                    requested = nil
+                    reports.removeAll(keepingCapacity: true)
+                    wakeLocked()
+                    return true
+                }
+                reports.append(Report(data: data))
+                wakeLocked()
+                return false
+            }
+            if overflow { logFailure("report queue full; reconnect to retry") }
+        }
+
+        private func actionLocked(for current: UInt64?) -> Action? {
+            if ended { return .stop }
+            guard let current else {
+                return requested.map { .activate($0.generation, $0.model) }
+            }
+            guard requested?.generation == current else { return .retire }
+            return reports.isEmpty ? nil : .report(reports.removeFirst())
+        }
+
+        private func wakeLocked() {
+            guard let waiter = waiting, let action = actionLocked(for: waiter.generation) else { return }
+            waiting = nil
+            waiter.reply.resume(returning: action)
+        }
+
+        private func next(for current: UInt64?) async -> Action {
+            await withCheckedContinuation { reply in
+                lock.withLock {
+                    if let action = actionLocked(for: current) { reply.resume(returning: action) }
+                    else { waiting = (current, reply) }
+                }
+            }
+        }
+
+        private func isCurrent(_ current: UInt64) -> Bool {
+            lock.withLock { !ended && requested?.generation == current }
+        }
+
+        private func fail(_ current: UInt64, _ reason: String) {
+            lock.withLock {
+                // An old operation's error must not discard its replacement's input.
+                if requested?.generation == current {
+                    requested = nil
+                    reports.removeAll(keepingCapacity: true)
+                }
+            }
+            logFailure(reason)
+        }
+
+        private func logFailure(_ reason: String) {
+            bridgeLog(.warning, "virtualhid", "slot \(index + 1): \(reason)")
+        }
+
+        private func neutralize(_ device: HIDVirtualDevice?) async {
+            guard let device else { return }
+            do {
+                try await device.dispatchInputReport(data: VirtualHIDSink.report(from: ControllerState()),
+                                                     timestamp: SuspendingClock.now)
+            } catch { logFailure("neutral report failed: \(error)") }
+        }
+
+        private func run() async {
+            // Only this consumer owns the device, across activation AND report awaits.
+            var current: UInt64?
+            var device: HIDVirtualDevice?
+            while true {
+                switch await next(for: current) {
+                case let .activate(token, model):
+                    guard isCurrent(token) else { continue }
+                    current = token
+                    let props = HIDVirtualDevice.Properties(
+                        descriptor: VirtualHIDSink.gamepadDescriptor,
+                        vendorID: UInt32(Switch2.nintendoVendorID), productID: UInt32(model.rawValue),
+                        transport: nil, product: "\(model.displayName) (Finally)",
+                        manufacturer: "Finally the Controller Works",
+                        serialNumber: "FTCW-slot\(index + 1)", uniqueID: "com.petersharma.ftcw.slot\(index + 1)")
+                    guard let created = HIDVirtualDevice(properties: props) else {
+                        fail(token, "virtual device creation refused; check HID entitlement and device properties")
+                        continue
+                    }
+                    device = created
+                    await created.activate(delegate: NullHIDDelegate.shared)
+                    if isCurrent(token) {
+                        bridgeLog(.info, "virtualhid", "slot \(index + 1): virtual gamepad activated")
+                    }
+                case let .report(report):
+                    guard let current, let device, isCurrent(current) else { continue }
+                    guard report.admitted.duration(to: .now) < .seconds(1) else {
+                        fail(current, "report queue stale; reconnect to retry")
+                        continue
+                    }
+                    do {
+                        try await device.dispatchInputReport(data: report.data, timestamp: report.timestamp)
+                    } catch { fail(current, "input report failed: \(error)") }
+                case .retire:
+                    await neutralize(device)
+                    device = nil
+                    current = nil
+                case .stop:
+                    await neutralize(device)
+                    device = nil
+                    return
+                }
             }
         }
     }
@@ -147,7 +280,8 @@ final class VirtualHIDSink: ControllerOutputSink, @unchecked Sendable {
         set(17, b.contains(.gl)); set(18, b.contains(.c))
 
         func axis(_ v: Double) -> Int16 {
-            Int16(max(-32768, min(32767, v * 32767)))
+            guard v.isFinite else { return 0 }
+            return Int16(max(-32768, min(32767, v * 32767)))
         }
 
         var d = Data(capacity: 14)
