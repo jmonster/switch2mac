@@ -44,6 +44,8 @@ final class NetworkGamepadSink: ControllerOutputSink, @unchecked Sendable {
     }
 
     private let queue = DispatchQueue(label: "com.petersharma.ftcw.netpad")
+    private let stateMailbox = BoundedStateMailbox<ControllerState>(
+        perSlotCapacity: 64, maxAge: 0.25, batchLimit: 32)
     private let players = (0..<BridgeEngine.maxPlayers).map { _ in Player() }
     private var fd: Int32 = -1
     private var timer: DispatchSourceTimer?
@@ -61,6 +63,7 @@ final class NetworkGamepadSink: ControllerOutputSink, @unchecked Sendable {
     }
 
     func controllerConnected(slot: Int, model: Switch2.Model) {
+        stateMailbox.clear(slot: slot)
         queue.async { [weak self] in
             guard let self, self.players.indices.contains(slot) else { return }
             self.players[slot].connected = true
@@ -68,6 +71,7 @@ final class NetworkGamepadSink: ControllerOutputSink, @unchecked Sendable {
     }
     func controllerName(slot: Int, name: String) {}
     func controllerDisconnected(slot: Int) {
+        stateMailbox.clear(slot: slot)
         queue.async { [weak self] in
             guard let self, self.players.indices.contains(slot) else { return }
             let p = self.players[slot]
@@ -78,35 +82,61 @@ final class NetworkGamepadSink: ControllerOutputSink, @unchecked Sendable {
 
     func controllerState(slot: Int, state: ControllerState) {
         guard AppConfig.networkGamepadEnabled else { return }
-        queue.async { [weak self] in
-            guard let self, self.players.indices.contains(slot), AppConfig.networkGamepadEnabled else { return }
-            let p = self.players[slot]
-            guard !p.failed else { return }
-            p.connected = true
-            var buttons: UInt16 = 0
-            for (button, id) in Self.buttonMap where state.buttons.contains(button) { buttons |= 1 << id }
-            if state.leftTrigger >= 128 { buttons |= 1 << 12 }
-            if state.rightTrigger >= 128 { buttons |= 1 << 13 }
-            let changed = p.wantButtons ^ buttons
-            let edges = (0..<16).filter { changed & (1 << $0) != 0 }.map { ($0, (buttons >> $0) & 1) }
-            if p.switchIndex == nil {
-                guard p.edges.count + edges.count <= Self.maxEdges else {
-                    p.failed = true; p.neutralize(); self.ensurePumping()
-                    bridgeLog(.error, "netpad", "player \(slot + 1) edge queue exhausted; neutralizing. Disable/re-enable network output to retry.")
-                    return
-                }
-                p.edges.append(contentsOf: edges)
-            }
-            p.wantButtons = buttons
-            p.wantAxes = [Self.axis(state.leftStick.x), Self.axis(-state.leftStick.y),
-                          Self.axis(state.rightStick.x), Self.axis(-state.rightStick.y)]
-            self.ensurePumping()
+        if stateMailbox.submit(slot: slot, state: state) {
+            queue.async { [weak self] in self?.drainStates() }
         }
+    }
+
+    private func drainStates() {
+        let batch = stateMailbox.take()
+        for recovery in batch.recoveries {
+            guard players.indices.contains(recovery.slot) else { continue }
+            let p = players[recovery.slot]
+            p.failed = true
+            p.neutralize()
+            ensurePumping()
+            bridgeLog(.error, "netpad",
+                      "player \(recovery.slot + 1) input backlog exceeded latency/capacity; neutralizing. Disable/re-enable network output to retry.")
+        }
+        for item in batch.items { acceptState(slot: item.slot, state: item.state) }
+        if stateMailbox.completeDrain() {
+            queue.async { [weak self] in self?.drainStates() }
+        }
+    }
+
+    private func acceptState(slot: Int, state: ControllerState) {
+        guard players.indices.contains(slot), AppConfig.networkGamepadEnabled else { return }
+        let p = players[slot]
+        guard !p.failed else { return }
+        p.connected = true
+        var buttons: UInt16 = 0
+        for (button, id) in Self.buttonMap where state.buttons.contains(button) { buttons |= 1 << id }
+        if state.leftTrigger >= 128 { buttons |= 1 << 12 }
+        if state.rightTrigger >= 128 { buttons |= 1 << 13 }
+        let changed = p.wantButtons ^ buttons
+        let edges = (0..<16).filter { changed & (1 << $0) != 0 }.map { ($0, (buttons >> $0) & 1) }
+        if p.switchIndex == nil {
+            guard p.edges.count + edges.count <= Self.maxEdges else {
+                p.failed = true; p.neutralize(); ensurePumping()
+                bridgeLog(.error, "netpad", "player \(slot + 1) edge queue exhausted; neutralizing. Disable/re-enable network output to retry.")
+                return
+            }
+            p.edges.append(contentsOf: edges)
+        }
+        p.wantButtons = buttons
+        p.wantAxes = [Self.axis(state.leftStick.x), Self.axis(-state.leftStick.y),
+                      Self.axis(state.rightStick.x), Self.axis(-state.rightStick.y)]
+        ensurePumping()
     }
 
     private static func axis(_ value: Double) -> Int16 {
         guard value.isFinite else { return 0 }
-        let raw = Int32(max(-1, min(1, value)) * 32767)
+        let clamped = max(-1, min(1, value))
+        // Preserve endpoints: quantization is traffic shaping, not a reason to
+        // make full stick travel unreachable in the consumer.
+        if clamped >= 1 { return 32767 }
+        if clamped <= -1 { return -32767 }
+        let raw = Int32((clamped * 32767).rounded())
         return Int16(raw / analogQuantum * analogQuantum)
     }
     private func ensurePumping() {
