@@ -3,11 +3,11 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>Finally the Controller Works</string>
+    <string>Finally the Controller Works (jmonster)</string>
     <key>CFBundleDisplayName</key>
-    <string>Finally the Controller Works</string>
+    <string>Finally the Controller Works (jmonster)</string>
     <key>CFBundleIdentifier</key>
-    <string>com.petersharma.finallythecontrollerworks</string>
+    <string>io.github.jmonster.switch2mac</string>
     <key>CFBundleExecutable</key>
     <string>FinallyTheControllerWorks</string>
     <key>CFBundleVersion</key>

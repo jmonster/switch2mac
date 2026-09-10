@@ -68,6 +68,9 @@ final class ControllerSession: NSObject, @unchecked Sendable {
 
     private var chars: [UUID: CBCharacteristic] = [:]
     private var handshakeStarted = false
+    private var ended = false
+    private var handshakeComplete = false
+    private var readyReported = false
     private var pendingCommand: (id: UInt8, completion: (Data?) -> Void)?
     private var commandTimeout: DispatchWorkItem?
     private var handshakeSteps: [(String, (@escaping (Bool) -> Void) -> Void)] = []
@@ -125,11 +128,18 @@ final class ControllerSession: NSObject, @unchecked Sendable {
 
     /// Called by the engine once CoreBluetooth reports the connect.
     func begin() {
+        guard !ended else { return }
         log(.info, "slot \(slot + 1): discovering services")
         peripheral.discoverServices(nil)
     }
 
     func teardown() {
+        guard !ended else { return }
+        ended = true
+        notifyCompletion = nil
+        handshakeSteps.removeAll()
+        onState = nil
+        onRSSI = nil
         keepAliveTimer?.cancel()
         keepAliveTimer = nil
         commandTimeout?.cancel()
@@ -143,12 +153,14 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     }
 
     private func fail(_ reason: String) {
+        guard !ended else { return }
         log(.error, "slot \(slot + 1): \(reason)")
         teardown()
         delegate?.sessionFailed(self, reason: reason)
     }
 
     private func runHandshake() {
+        guard !ended else { return }
         // Order matters and mirrors the console: command-response subscribe
         // must precede any command; identity before vibration char choice.
         handshakeSteps = [
@@ -163,21 +175,33 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     }
 
     private func advanceHandshake() {
+        guard !ended else { return }
         guard !handshakeSteps.isEmpty else {
+            handshakeComplete = true
+            // Keep the existing keep-alive while awaiting the first report.
             startKeepAlive()
-            log(.info, "slot \(slot + 1): handshake complete — \(displayName) serial \(serialNumber)")
-            delegate?.sessionReady(self)
+            if announceReady() { onState?(slot, state) }
             return
         }
         let (name, step) = handshakeSteps.removeFirst()
         step { [weak self] ok in
-            guard let self else { return }
+            guard let self, !self.ended else { return }
             if ok {
                 self.advanceHandshake()
             } else {
                 self.fail("handshake step '\(name)' failed")
             }
         }
+    }
+
+    /// Notification subscription alone is not usable controller input.
+    @discardableResult
+    private func announceReady() -> Bool {
+        guard !ended, handshakeComplete, reportCount > 0, !readyReported else { return false }
+        readyReported = true
+        log(.info, "slot \(slot + 1): handshake and first input complete — \(displayName)")
+        delegate?.sessionReady(self)
+        return true
     }
 
     // MARK: Handshake steps
@@ -196,7 +220,7 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     private func stepReadCalibration(_ done: @escaping (Bool) -> Void) {
         readStickCalibration(user: Switch2.Address.userStick1,
                              factory: Switch2.Address.factoryStick1) { [weak self] cal in
-            guard let self else { return }
+            guard let self, !self.ended else { return }
             self.leftCal = cal
             guard self.model.hasSecondStick else {
                 done(true)   // single-stick unit: slot-2 holds no valid data
@@ -204,7 +228,7 @@ final class ControllerSession: NSObject, @unchecked Sendable {
             }
             self.readStickCalibration(user: Switch2.Address.userStick2,
                                       factory: Switch2.Address.factoryStick2) { [weak self] cal in
-                guard let self else { return }
+                guard let self, !self.ended else { return }
                 self.rightCal = cal
                 done(true)   // calibration is best-effort; defaults are usable
             }
@@ -214,7 +238,7 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     private func readStickCalibration(user: UInt32, factory: UInt32,
                                       _ done: @escaping (Switch2.StickCalibration?) -> Void) {
         readMemory(length: 0x0B, address: user) { [weak self] data in
-            guard let self else { return }
+            guard let self, !self.ended else { return }
             if let data, !Switch2.StickCalibration.isBlank(data) {
                 done(Switch2.StickCalibration(data: data))
                 return
@@ -274,7 +298,7 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     private func writeCommand(_ command: UInt8, _ subcommand: UInt8, _ data: Data,
                               flag: UInt8 = 0x01,
                               completion: @escaping (Data?) -> Void) {
-        guard let writeChar = chars[Switch2.GATT.commandWrite] else {
+        guard !ended, let writeChar = chars[Switch2.GATT.commandWrite] else {
             completion(nil); return
         }
         guard pendingCommand == nil else {
@@ -298,7 +322,10 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     }
 
     private func handleCommandResponse(_ data: Data) {
-        guard let pending = pendingCommand else { return }
+        // An unrelated notification must not consume the command or its timer.
+        guard !ended, let pending = pendingCommand, data.count >= 8,
+              data[data.startIndex] == pending.id,
+              data[data.startIndex + 1] == 0x01 || data[data.startIndex + 1] == 0x02 else { return }
         commandTimeout?.cancel()
         pendingCommand = nil
         // NFC experiments: log the COMPLETE frame (header included) — the
@@ -310,11 +337,6 @@ final class ControllerSession: NSObject, @unchecked Sendable {
         // status/error reply (same shape, payload starts with a status code).
         // Both correlate to our command — pass the payload up and let the
         // caller interpret the status byte.
-        guard data.count >= 8, data[data.startIndex] == pending.id,
-              data[data.startIndex + 1] == 0x01 || data[data.startIndex + 1] == 0x02 else {
-            pending.completion(nil)
-            return
-        }
         pending.completion(data.subdata(in: data.startIndex + 8 ..< data.endIndex))
     }
 
@@ -323,7 +345,8 @@ final class ControllerSession: NSObject, @unchecked Sendable {
         let payload = Switch2.memoryReadPayload(length: length, address: address)
         writeCommand(Switch2.Command.memory, Switch2.Subcommand.memoryRead, payload) { resp in
             guard let resp, resp.count >= 8 + Int(length),
-                  resp[resp.startIndex] == length else {
+                  resp[resp.startIndex] == length,
+                  Switch2.u32(resp, 4) == address else {
                 completion(nil); return
             }
             completion(resp.subdata(in: resp.startIndex + 8 ..< resp.endIndex))
@@ -350,7 +373,7 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     /// bypasses persisted patterns. Restores normal LEDs when `nil`.
     func setRawLEDs(_ pattern: UInt8?) {
         queue.async { [weak self] in
-            guard let self else { return }
+            guard let self, !self.ended else { return }
             if let pattern {
                 self.writeCommand(Switch2.Command.leds, Switch2.Subcommand.ledsSetPlayer,
                                   Data([pattern, 0, 0, 0])) { _ in }
@@ -368,7 +391,10 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     /// Read the current RSSI; result arrives via the rssi callback.
     var onRSSI: ((Int) -> Void)?
     func requestRSSI() {
-        queue.async { [weak self] in self?.peripheral.readRSSI() }
+        queue.async { [weak self] in
+            guard let self, !self.ended else { return }
+            self.peripheral.readRSSI()
+        }
     }
 
     // MARK: - Experiments (NFC probing, audio capture)
@@ -393,7 +419,7 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     private(set) var promiscuousNotify = false
     func setPromiscuousNotify(_ enabled: Bool) {
         queue.async { [weak self] in
-            guard let self else { return }
+            guard let self, !self.ended else { return }
             self.promiscuousNotify = enabled
             let known: Set<UUID> = [Switch2.GATT.inputReport,
                                     Switch2.GATT.commandResponse,
@@ -415,7 +441,7 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     /// queue only). Returns false when the characteristic is absent.
     @discardableResult
     func writeAudioFrame(_ data: Data) -> Bool {
-        guard let ch = chars[Self.audioOutputUUID] else { return false }
+        guard !ended, let ch = chars[Self.audioOutputUUID] else { return false }
         peripheral.writeValue(data, for: ch, type: .withoutResponse)
         lastWriteAt = CFAbsoluteTimeGetCurrent()
         return true
@@ -464,7 +490,7 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     private(set) var audioExperimentName: String?
     func beginAudioExperiment(_ name: String) -> Bool {
         dispatchPrecondition(condition: .onQueue(queue))
-        guard audioExperimentName == nil else { return false }
+        guard !ended, audioExperimentName == nil else { return false }
         audioExperimentName = name
         return true
     }
@@ -488,7 +514,7 @@ final class ControllerSession: NSObject, @unchecked Sendable {
                           next: @escaping () -> Data?,
                           done: @escaping (AudioStreamStats) -> Void) {
         queue.async { [weak self] in
-            guard let self else { return }
+            guard let self, !self.ended else { return }
             self.audioStreamTimer?.cancel()
             self.audioStreamQueue.removeAll()
             self.audioStreamStats = AudioStreamStats(chunkLimit: self.audioWriteChunkLimit)
@@ -534,7 +560,7 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     /// Write queued chunks until the stack refuses; `peripheralIsReady`
     /// re-enters. Runs on the Bluetooth queue only.
     fileprivate func drainAudioStream() {
-        guard audioStreamNext != nil, let ch = chars[Self.audioOutputUUID] else { return }
+        guard !ended, audioStreamNext != nil, let ch = chars[Self.audioOutputUUID] else { return }
         while !audioStreamQueue.isEmpty {
             guard peripheral.canSendWriteWithoutResponse else {
                 audioStreamStats.stalls += 1
@@ -571,9 +597,8 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     /// Returns false via completion when the firmware doesn't expose it.
     func setAudioCapture(_ enabled: Bool, completion: @escaping (Bool) -> Void) {
         queue.async { [weak self] in
-            guard let self, let ch = self.chars[Self.audioInputUUID] else {
-                completion(false); return
-            }
+            guard let self, !self.ended, let ch = self.chars[Self.audioInputUUID] else {
+                completion(false); return }
             self.peripheral.setNotifyValue(enabled, for: ch)
             completion(true)
         }
@@ -583,13 +608,14 @@ final class ControllerSession: NSObject, @unchecked Sendable {
 
     func setRumble(strong: Double, weak: Double) {
         queue.async { [weak self] in
-            guard let self else { return }
+            guard let self, !self.ended else { return }
             self.rumbleTarget = (strong, weak)
             self.rumbleSetAt = CFAbsoluteTimeGetCurrent()
         }
     }
 
     private func startKeepAlive() {
+        guard !ended, keepAliveTimer == nil else { return }
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + 0.05, repeating: 0.05)
         timer.setEventHandler { [weak self] in self?.maintainTick() }
@@ -598,13 +624,16 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     }
 
     private func maintainTick() {
+        guard !ended else { return }
         let now = CFAbsoluteTimeGetCurrent()
         var (strong, weakMag) = rumbleTarget
         // Failsafe: rumble intents expire after 0.5 s so a crashed consumer
         // can never leave the motor running.
         if now - rumbleSetAt > 0.5 { strong = 0; weakMag = 0 }
 
-        if strong > 0.001 || weakMag > 0.001 || rumbleActive {
+        // The GameCube model explicitly lacks this motor protocol. Do not
+        // suppress its LED keep-alive when an unsupported rumble is requested.
+        if model.hasHDRumble && (strong > 0.001 || weakMag > 0.001 || rumbleActive) {
             let active = strong > 0.001 || weakMag > 0.001
             writeMotor(Switch2.Vibration.waveform(strong: strong, weak: weakMag))
             rumbleActive = active
@@ -617,7 +646,8 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     }
 
     private func writeMotor(_ vib: Switch2.Vibration) {
-        guard let motor = chars[Switch2.GATT.vibration(for: model)] else { return }
+        guard !ended, model.hasHDRumble,
+              let motor = chars[Switch2.GATT.vibration(for: model)] else { return }
         let packet = Switch2.motorPacket(vib, packetID: vibrationPacketID, model: model)
         vibrationPacketID &+= 1
         peripheral.writeValue(packet, for: motor, type: .withoutResponse)
@@ -626,8 +656,18 @@ final class ControllerSession: NSObject, @unchecked Sendable {
 
     // MARK: - Input reports
 
+    /// Nominal 12-bit range only when factory/user calibration is unavailable.
+    /// This is degraded, uncalibrated input, not a claim of factory accuracy.
+    private static func uncalibratedStick(_ raw: (UInt16, UInt16)) -> (Double, Double) {
+        func axis(_ value: UInt16) -> Double {
+            let offset = Double(value) - 2048
+            return max(-1, min(1, offset / (offset >= 0 ? 2047 : 2048)))
+        }
+        return (axis(raw.0), axis(raw.1))
+    }
+
     private func handleInputReport(_ data: Data) {
-        guard let report = Switch2.InputReport(data: data) else { return }
+        guard !ended, let report = Switch2.InputReport(data: data) else { return }
         let now = CFAbsoluteTimeGetCurrent()
         if lastReportAt > 0, now - lastReportAt > 0.100 {
             gapCount += 1
@@ -641,14 +681,14 @@ final class ControllerSession: NSObject, @unchecked Sendable {
         switch model {
         case .joyCon2Left:
             // One stick, reporting in the first field, calibrated by slot 1.
-            s.leftStick = leftCal?.apply(report.leftStickRaw) ?? (0, 0)
+            s.leftStick = leftCal?.apply(report.leftStickRaw) ?? Self.uncalibratedStick(report.leftStickRaw)
         case .joyCon2Right:
             // One stick, reporting in the SECOND field — but calibrated by
             // the unit's slot-1 data (a Joy-Con has no slot-2 calibration).
-            s.rightStick = leftCal?.apply(report.rightStickRaw) ?? (0, 0)
+            s.rightStick = leftCal?.apply(report.rightStickRaw) ?? Self.uncalibratedStick(report.rightStickRaw)
         default:
-            s.leftStick = leftCal?.apply(report.leftStickRaw) ?? (0, 0)
-            s.rightStick = rightCal?.apply(report.rightStickRaw) ?? (0, 0)
+            s.leftStick = leftCal?.apply(report.leftStickRaw) ?? Self.uncalibratedStick(report.leftStickRaw)
+            s.rightStick = rightCal?.apply(report.rightStickRaw) ?? Self.uncalibratedStick(report.rightStickRaw)
         }
         if model.hasAnalogTriggers {
             s.leftTrigger = report.leftTriggerRaw
@@ -683,6 +723,7 @@ final class ControllerSession: NSObject, @unchecked Sendable {
         }
 
         state = s
+        announceReady()
         onState?(slot, s)
 
         // Battery / rate refresh for the UI at ~1 Hz.
@@ -701,6 +742,7 @@ final class ControllerSession: NSObject, @unchecked Sendable {
 extension ControllerSession: CBPeripheralDelegate {
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+        guard !ended else { return }
         if let error { fail("service discovery: \(error.localizedDescription)"); return }
         for service in peripheral.services ?? [] {
             peripheral.discoverCharacteristics(nil, for: service)
@@ -710,6 +752,7 @@ extension ControllerSession: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral,
                     didDiscoverCharacteristicsFor service: CBService,
                     error: Error?) {
+        guard !ended else { return }
         if let error { fail("characteristic discovery: \(error.localizedDescription)"); return }
         for ch in service.characteristics ?? [] {
             if let uuid = UUID(uuidString: ch.uuid.uuidString) {
@@ -730,6 +773,7 @@ extension ControllerSession: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral,
                     didUpdateNotificationStateFor characteristic: CBCharacteristic,
                     error: Error?) {
+        guard !ended else { return }
         let uuid = UUID(uuidString: characteristic.uuid.uuidString)
         if let error {
             // Only the essential channels are fatal — an experimental
@@ -741,11 +785,15 @@ extension ControllerSession: CBPeripheralDelegate {
             }
             return
         }
+        if uuid == Switch2.GATT.commandResponse || uuid == Switch2.GATT.inputReport {
+            guard characteristic.isNotifying else { fail("essential notifications stopped"); return }
+        }
         if uuid == Switch2.GATT.commandResponse {
             runHandshake()
         } else if uuid == Switch2.GATT.inputReport {
-            notifyCompletion?(true)
+            let completion = notifyCompletion
             notifyCompletion = nil
+            completion?(true)
         }
     }
 
@@ -761,7 +809,7 @@ extension ControllerSession: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral,
                     didUpdateValueFor characteristic: CBCharacteristic,
                     error: Error?) {
-        guard error == nil, let data = characteristic.value else { return }
+        guard !ended, error == nil, let data = characteristic.value else { return }
         let uuid = UUID(uuidString: characteristic.uuid.uuidString)
         if uuid == Switch2.GATT.inputReport {
             handleInputReport(data)
