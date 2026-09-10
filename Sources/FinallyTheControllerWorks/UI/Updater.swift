@@ -1,5 +1,5 @@
 // Updater.swift
-// Self-contained auto-updater for the Developer ID (non-App-Store) build.
+// Retained upstream updater; disabled by AppInfo.updatesEnabled in this fork.
 //
 // Flow: fetch a small JSON "appcast" from a configurable feed URL → if it
 // advertises a newer build, download the .zip → verify its SHA-256 AND that
@@ -29,7 +29,7 @@ struct AppcastEntry: Codable {
 @MainActor
 final class Updater: ObservableObject {
 
-    /// Our Developer ID team — downloads must be signed by this team.
+    /// Upstream Developer ID team. Fork updates remain disabled, not re-trusted.
     nonisolated static let requiredTeamID = "4BA4S6WKX7"
 
     enum State: Equatable {
@@ -69,6 +69,7 @@ final class Updater: ObservableObject {
     }
 
     var feedURL: URL? {
+        guard AppInfo.updatesEnabled else { return nil }
         // The Configuration field overrides the built-in default, so a beta
         // build updates out of the box while testers can still point at a
         // staging feed.
@@ -91,7 +92,7 @@ final class Updater: ObservableObject {
 
     func check(userInitiated: Bool) async {
         guard let url = feedURL else {
-            if userInitiated { state = .failed("No update feed URL is configured.") }
+            if userInitiated { state = .failed(AppInfo.updatesEnabled ? "No update feed URL is configured." : "Updates are disabled in this fork. Install reviewed builds manually.") }
             return
         }
         let prior = state
@@ -123,6 +124,7 @@ final class Updater: ObservableObject {
     }
 
     func downloadAndInstall(_ entry: AppcastEntry) {
+        guard AppInfo.updatesEnabled else { return }
         Task { await self.performDownload(entry) }
     }
 
@@ -153,6 +155,7 @@ final class Updater: ObservableObject {
 
     /// User-confirmed install: hand off to the detached installer and quit.
     func installNow() {
+        guard AppInfo.updatesEnabled else { return }
         guard case .readyToInstall = state, let app = verifiedApp else { return }
         verifiedApp = nil        // a second click must be a no-op
         state = .installing
@@ -366,7 +369,9 @@ struct UpdaterView: View {
             }
 
             if updater.feedURL == nil {
-                Text("Set an update feed URL in the dashboard's Configuration section to enable updates.")
+                Text(AppInfo.updatesEnabled
+                     ? "Set an update feed URL in the dashboard's Configuration section to enable updates."
+                     : "This fork uses manual updates until its own signing and update policy is configured.")
                     .font(.caption).foregroundStyle(.tertiary).multilineTextAlignment(.center)
             }
         }
