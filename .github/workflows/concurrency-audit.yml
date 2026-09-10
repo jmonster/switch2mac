@@ -1,0 +1,29 @@
+name: Swift concurrency audit
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: concurrency-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  audit:
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Build with complete concurrency checking
+        shell: bash
+        run: |
+          set -euo pipefail
+          swift --version
+          swift build -Xswiftc -strict-concurrency=complete 2>&1 | tee "$RUNNER_TEMP/concurrency.log"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: concurrency-diagnostics
+          path: ${{ runner.temp }}/concurrency.log
+          retention-days: 7

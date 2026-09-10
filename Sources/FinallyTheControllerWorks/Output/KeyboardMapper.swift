@@ -1,154 +1,55 @@
-// KeyboardMapper.swift
-// Turns controller buttons into keyboard keystrokes so the controller works
-// in apps and games that have NO controller support (map buttons to WASD,
-// arrows, space, etc.). Mappings can be global ("All apps") or scoped to the
-// frontmost application's bundle id — a per-app profile that switches
-// automatically as you change apps.
-//
-// A key-mapped button is SUPPRESSED from the gamepad output (so it doesn't
-// double-act as both a key and a pad button). Key events are posted via
-// CGEvent, which needs the same Accessibility permission as mouse mode.
-
+// Bluetooth-queue confined. UI/workspace state arrives as an immutable context.
 import Foundation
 import CoreGraphics
-import AppKit
-
-/// A bound key: virtual keycode + modifier flags + a human label.
-struct KeySpec: Codable, Equatable {
-    var keyCode: UInt16
-    var modifiers: UInt64      // CGEventFlags rawValue
-    var label: String
-
-    var asDictionary: [String: Any] {
-        ["keyCode": Int(keyCode), "modifiers": Int(modifiers), "label": label]
-    }
-    init(keyCode: UInt16, modifiers: UInt64, label: String) {
-        self.keyCode = keyCode; self.modifiers = modifiers; self.label = label
-    }
-    init?(dictionary: [String: Any]) {
-        guard let k = dictionary["keyCode"] as? Int,
-              let m = dictionary["modifiers"] as? Int,
-              let l = dictionary["label"] as? String else { return nil }
-        keyCode = UInt16(k); modifiers = UInt64(m); label = l
-    }
-}
 
 final class KeyboardMapper: @unchecked Sendable {
+    private var held = HeldOutputs<Int, UInt16>()
+    private var emitted: [UInt16: KeySpec] = [:]
+    private var frontApp = ""
+    private var permission = false
+    private let post: (KeySpec, Bool) -> Void
 
-    /// Frontmost app bundle id, refreshed by a workspace observer.
-    private var frontApp: String = ""
-    private var lastButtons: [Int: Switch2.Buttons] = [:]    // per player
-    private var permissionOK = false
-    private var permissionChecked = false
-    private var lastPreflightAt: CFAbsoluteTime = 0
+    init(post: @escaping (KeySpec, Bool) -> Void = KeyboardMapper.postKey) { self.post = post }
 
-    init() {
-        frontApp = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? ""
-        NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.didActivateApplicationNotification,
-            object: nil, queue: .main) { [weak self] note in
-            let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
-            self?.frontApp = app?.bundleIdentifier ?? ""
-        }
+    func updateContext(app: String, permission: Bool) {
+        if app != frontApp || permission != self.permission { reset() }
+        frontApp = app; self.permission = permission
     }
 
-    /// The set of buttons currently mapped to keys for this controller in the
-    /// active app — these are suppressed from the gamepad output.
-    func mappedButtons(serial: String) -> Switch2.Buttons {
-        let map = Self.activeMap(serial: serial, app: frontApp)
-        var mask: Switch2.Buttons = []
-        for name in map.keys {
-            if let b = Switch2.button(named: name) { mask.insert(b) }
+    /// Return the precise controls suppressed; do not parse the map twice or
+    /// suppress a digital trigger's bit while leaving its axis asserted.
+    func process(player: Int, configuration: ControllerConfiguration,
+                 buttons: Switch2.Buttons) -> Switch2.Buttons {
+        let map = configuration.keys(for: frontApp)
+        guard permission else { reset(player: player); return [] }
+        var desired: [UInt16: KeySpec] = [:]
+        var suppressed: Switch2.Buttons = []
+        // Stable order makes shared-key modifier selection deterministic.
+        for (raw, spec) in map.sorted(by: { $0.key < $1.key }) {
+            let button = Switch2.Buttons(rawValue: raw)
+            suppressed.insert(button)
+            if buttons.contains(button), desired[spec.keyCode] == nil { desired[spec.keyCode] = spec }
         }
-        return mask
+        let changes = held.replace(player, with: Set(desired.keys))
+        for code in changes.released.sorted() { release(code) }
+        for code in changes.pressed.sorted() {
+            if let spec = desired[code] { emitted[code] = spec; post(spec, true) }
+        }
+        return suppressed
     }
 
-    /// Process one player's button state; post key events on edges.
-    /// Returns true if this controller has ANY key mapping active (so the
-    /// engine knows to suppress mapped buttons).
-    @discardableResult
-    func process(player: Int, serial: String, buttons: Switch2.Buttons) -> Bool {
-        let map = Self.activeMap(serial: serial, app: frontApp)
-        guard !map.isEmpty else {
-            lastButtons[player] = buttons
-            return false
-        }
-        // No Accessibility permission → no keystrokes can be posted. Return
-        // false so the engine does NOT suppress the mapped buttons: they
-        // degrade to ordinary gamepad presses instead of going dead.
-        guard ensurePermission() else {
-            lastButtons[player] = buttons
-            return false
-        }
-
-        let prev = lastButtons[player] ?? []
-        for (name, spec) in map {
-            guard let b = Switch2.button(named: name) else { continue }
-            let now = buttons.contains(b), was = prev.contains(b)
-            if now && !was { postKey(spec, down: true) }
-            else if !now && was { postKey(spec, down: false) }
-        }
-        lastButtons[player] = buttons
-        return true
+    func reset(player: Int) {
+        for code in held.replace(player, with: []).released.sorted() { release(code) }
     }
-
-    // MARK: - Mapping lookup
-
-    /// The effective button→key map for a controller in an app: the app
-    /// override if present, else the global ("") map.
-    private static func activeMap(serial: String, app: String) -> [String: KeySpec] {
-        let store = UserDefaults.standard.dictionary(forKey: "controllerSettings")
-        guard let entry = store?[serial] as? [String: Any] else { return [:] }
-        func parse(_ raw: Any?) -> [String: KeySpec] {
-            guard let dict = raw as? [String: [String: Any]] else { return [:] }
-            var out: [String: KeySpec] = [:]
-            for (k, v) in dict { if let s = KeySpec(dictionary: v) { out[k] = s } }
-            return out
-        }
-        let byApp = entry["keyMapByApp"] as? [String: [String: [String: Any]]]
-        if !app.isEmpty, let appMap = byApp?[app], !appMap.isEmpty {
-            return parse(appMap)
-        }
-        return parse(entry["keyMap"])
+    func reset() {
+        for code in held.reset().sorted() { release(code) }
     }
-
-    // MARK: - Event posting
-
-    private func postKey(_ spec: KeySpec, down: Bool) {
-        guard let event = CGEvent(keyboardEventSource: nil,
-                                  virtualKey: CGKeyCode(spec.keyCode), keyDown: down) else { return }
+    private func release(_ code: UInt16) {
+        if let original = emitted.removeValue(forKey: code) { post(original, false) }
+    }
+    private static func postKey(_ spec: KeySpec, _ down: Bool) {
+        guard let event = CGEvent(keyboardEventSource: nil, virtualKey: spec.keyCode, keyDown: down) else { return }
         event.flags = CGEventFlags(rawValue: spec.modifiers)
         event.post(tap: .cghidEventTap)
-    }
-
-    /// True when we may post CGEvents. The system prompt is requested at most
-    /// once, but a denial must NOT latch: the user can grant permission in
-    /// System Settings mid-session, and re-preflighting is cheap — a one-time
-    /// check would leave the feature dead until relaunch.
-    private func ensurePermission() -> Bool {
-        if permissionOK { return true }
-        if !permissionChecked {
-            permissionChecked = true
-            permissionOK = CGPreflightPostEventAccess() || CGRequestPostEventAccess()
-            if !permissionOK {
-                bridgeLog(.warning, "keymap",
-                          "Accessibility permission needed for keyboard mapping — "
-                          + "grant it in System Settings > Privacy & Security > Accessibility")
-            }
-        } else {
-            // process() runs per input report (~66 Hz) on the Bluetooth
-            // queue — a TCC round trip at that rate would add jitter to the
-            // whole input path, so re-preflight at most every 2 seconds.
-            let now = CFAbsoluteTimeGetCurrent()
-            if now - lastPreflightAt >= 2 {
-                lastPreflightAt = now
-                permissionOK = CGPreflightPostEventAccess()
-                if permissionOK {
-                    bridgeLog(.info, "keymap",
-                              "Accessibility permission granted — keyboard mapping active")
-                }
-            }
-        }
-        return permissionOK
     }
 }

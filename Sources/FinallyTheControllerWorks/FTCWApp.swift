@@ -82,9 +82,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     let challenges = ChallengeCoordinator()
     let updater = Updater()
     private let notifications = NotificationManager()
+    private var inputEnvironment: InputEnvironment?
+    private var workspaceObservers: [NSObjectProtocol] = []
+    private var terminating = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         bridgeLog(.info, "app", "Finally the Controller Works — starting bridge")
+        inputEnvironment = InputEnvironment { [weak engine] context in engine?.updateInputContext(context) }
+        engine.onInputPermissionNeeded = { [weak self] needed in
+            Task { @MainActor in self?.inputEnvironment?.setNeeded(needed) }
+        }
+        for (name, suspended) in [(NSWorkspace.willSleepNotification, true), (NSWorkspace.didWakeNotification, false)] {
+            workspaceObservers.append(NSWorkspace.shared.notificationCenter.addObserver(forName: name, object: nil, queue: .main) { [weak engine] _ in
+                engine?.setSuspended(suspended)
+            })
+        }
         engine.addSink(UDPHub())
         engine.addSink(WebSocketHub())
         engine.addSink(NetworkGamepadSink())
@@ -94,6 +106,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         // surface as an "Update Available" item in the menu-bar dropdown.
         updater.checkOnLaunchIfDue()
     }
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard !terminating else { return .terminateLater }
+        terminating = true
+        inputEnvironment?.stop()
+        for observer in workspaceObservers { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
+        workspaceObservers.removeAll()
+        engine.stop {
+            // Allow already-enqueued neutral reports and network disconnects
+            // to drain. This is best effort, not a network acknowledgement.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { NSApp.reply(toApplicationShouldTerminate: true) }
+        }
+        return .terminateLater
+    }
+
 }
 
 struct MenuContent: View {
@@ -148,6 +174,10 @@ struct MenuContent: View {
 
         Divider()
 
+        Button(engine.engineState == .paused ? "Resume Controllers" : "Stop All Controller Output") {
+            if engine.engineState == .paused { engine.resume() } else { engine.stop() }
+        }
+        .keyboardShortcut(".", modifiers: [.command, .shift])
         Button("Open Dashboard") { show("dashboard") }
         Button("Browser Bridge Settings…") { show("browser-bridge") }
 
@@ -163,7 +193,9 @@ struct MenuContent: View {
 
         Divider()
 
-        Button("Check for Updates…") { show("update") }
+        Button("Build and Installation Help…") {
+            NSWorkspace.shared.open(URL(string: "https://github.com/jmonster/switch2mac#build-this-fork")!)
+        }
 
         Button("Buy me a coffee ☕") {
             AppInfo.openBuyMeACoffee()
@@ -174,6 +206,7 @@ struct MenuContent: View {
         Button("About") { show("about") }
 
         Toggle("Launch at Login", isOn: $launchAtLogin)
+            .onAppear { launchAtLogin = SMAppService.mainApp.status == .enabled }
             .onChange(of: launchAtLogin) { _, enable in
                 do {
                     if enable {
