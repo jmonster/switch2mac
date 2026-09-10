@@ -23,6 +23,7 @@ final class WebSocketHub: ControllerOutputSink, @unchecked Sendable {
         init(_ connection: NWConnection) { self.connection = connection }
     }
     private let queue = DispatchQueue(label: "com.petersharma.ftcw.wshub")
+    private let stateMailbox = BoundedStateMailbox<ControllerState>(perSlotCapacity: 64, maxAge: 0.25, batchLimit: 32)
     private let allowedOrigins: Set<String>
     private var listener: NWListener?
     private var clients: [ObjectIdentifier: Client] = [:]
@@ -39,9 +40,7 @@ final class WebSocketHub: ControllerOutputSink, @unchecked Sendable {
         })
     }
 
-    init(enabled: Bool = UserDefaults.standard.bool(forKey: WebSocketHub.enabledKey),
-         allowedOrigins: Set<String> = WebSocketHub.origins(from:
-            UserDefaults.standard.string(forKey: WebSocketHub.extensionIDsKey) ?? "")) {
+    init(enabled: Bool = UserDefaults.standard.bool(forKey: WebSocketHub.enabledKey), allowedOrigins: Set<String> = WebSocketHub.origins(from: UserDefaults.standard.string(forKey: WebSocketHub.extensionIDsKey) ?? "")) {
         self.allowedOrigins = allowedOrigins
         guard enabled, !allowedOrigins.isEmpty else { return }
         queue.async { [weak self] in self?.startListener() }
@@ -57,8 +56,7 @@ final class WebSocketHub: ControllerOutputSink, @unchecked Sendable {
         let origins = allowedOrigins
         ws.setClientRequestHandler(queue) { _, headers in
             let values = headers.filter { $0.name.lowercased() == "origin" }.map(\.value)
-            let accepted = values.count == 1 && origins.contains(values[0])
-            return NWProtocolWebSocket.Response(status: accepted ? .accept : .reject, subprotocol: nil)
+            return NWProtocolWebSocket.Response(status: values.count == 1 && origins.contains(values[0]) ? .accept : .reject, subprotocol: nil)
         }
         params.defaultProtocolStack.applicationProtocols.insert(ws, at: 0)
         do {
@@ -67,9 +65,7 @@ final class WebSocketHub: ControllerOutputSink, @unchecked Sendable {
             owner.stateUpdateHandler = { [weak self, weak owner] state in
                 guard let self, let owner, self.listener === owner else { return }
                 switch state {
-                case .ready:
-                    bridgeLog(.info, "wshub", "opt-in browser bridge on 127.0.0.1:\(Self.port)")
-                    self.startPing()
+                case .ready: self.startPing()
                 case .failed(let error):
                     bridgeLog(.warning, "wshub", "listener failed: \(error)")
                     owner.cancel(); self.listener = nil
@@ -82,16 +78,14 @@ final class WebSocketHub: ControllerOutputSink, @unchecked Sendable {
                 self.accept(connection)
             }
             owner.start(queue: queue)
-        } catch {
-            bridgeLog(.warning, "wshub", "cannot create listener: \(error)")
-        }
+        } catch { bridgeLog(.warning, "wshub", "cannot create listener: \(error)") }
     }
 
     private func startPing() {
         guard pingTimer == nil else { return }
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + 15, repeating: 15)
-        timer.setEventHandler { [weak self] in self?.broadcast(#"{"t":"ping"}"#) }
+        timer.setEventHandler { [weak self] in self?.broadcast("{\"t\":\"ping\"}") }
         timer.resume(); pingTimer = timer
     }
 
@@ -100,19 +94,17 @@ final class WebSocketHub: ControllerOutputSink, @unchecked Sendable {
         dispatchPrecondition(condition: .onQueue(queue))
         let id = ObjectIdentifier(connection)
         let client = Client(connection)
-        clients[id] = client // include incomplete handshakes in the bound
+        clients[id] = client
         queue.asyncAfter(deadline: .now() + 5) { [weak self, weak connection] in
-            guard let self, let connection, let client = self.clients[id],
-                  client.connection === connection, !client.ready else { return }
+            guard let self, let connection, let client = self.clients[id], client.connection === connection, !client.ready else { return }
             self.remove(id)
         }
         connection.stateUpdateHandler = { [weak self, weak connection] state in
-            guard let self, let connection, let client = self.clients[id],
-                  client.connection === connection else { return }
+            guard let self, let connection, let client = self.clients[id], client.connection === connection else { return }
             switch state {
             case .ready:
                 client.ready = true
-                self.send(#"{"t":"hello","v":1}"#, to: client)
+                self.send("{\"t\":\"hello\",\"v\":1}", to: client)
                 for (slot, info) in self.connected.sorted(by: { $0.key < $1.key }) {
                     self.send(Self.connectionMessage(slot, info.model, info.name), to: client)
                     if let state = self.lastState[slot] { self.send(state, to: client) }
@@ -129,7 +121,6 @@ final class WebSocketHub: ControllerOutputSink, @unchecked Sendable {
         dispatchPrecondition(condition: .onQueue(queue))
         guard let client = clients.removeValue(forKey: id) else { return }
         client.connection.cancel()
-        // A departing observer cannot stop another client's active effect.
         for slot in Array(rumbleOwners.keys) where rumbleOwners[slot] == id {
             rumbleOwners.removeValue(forKey: slot)
             onRumble?(slot, 0, 0)
@@ -140,38 +131,25 @@ final class WebSocketHub: ControllerOutputSink, @unchecked Sendable {
         dispatchPrecondition(condition: .onQueue(queue))
         let connection = client.connection, id = ObjectIdentifier(client.connection)
         connection.receiveMessage { [weak self, weak connection] data, context, _, error in
-            guard let self, let connection, let client = self.clients[id],
-                  client.connection === connection else { return }
+            guard let self, let connection, let client = self.clients[id], client.connection === connection else { return }
             let now = ProcessInfo.processInfo.systemUptime
             if now - client.windowStart >= 1 { client.windowStart = now; client.received = 0 }
             client.received += 1
-            guard client.received <= 200, (data?.count ?? 0) <= Self.maxMessageBytes else {
-                self.remove(id); return
-            }
+            guard client.received <= 200, (data?.count ?? 0) <= Self.maxMessageBytes else { self.remove(id); return }
             if let data, !data.isEmpty { self.handle(data, from: id) }
-            if error == nil, context?.isFinal != true { self.receive(client) }
-            else { self.remove(id) }
+            if error == nil, context?.isFinal != true { self.receive(client) } else { self.remove(id) }
         }
     }
 
     private func handle(_ data: Data, from id: ObjectIdentifier) {
         dispatchPrecondition(condition: .onQueue(queue))
-        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let type = object["t"] as? String else { return }
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any], let type = object["t"] as? String else { return }
         if type == "rumble" {
-            guard let slot = object["slot"] as? Int, (0..<4).contains(slot), connected[slot]?.rumble == true,
-                  let rawStrong = object["strong"] as? Double, rawStrong.isFinite,
-                  let rawWeak = object["weak"] as? Double, rawWeak.isFinite else { return }
+            guard let slot = object["slot"] as? Int, (0..<4).contains(slot), connected[slot]?.rumble == true, let rawStrong = object["strong"] as? Double, rawStrong.isFinite, let rawWeak = object["weak"] as? Double, rawWeak.isFinite else { return }
             let strong = min(1, max(0, rawStrong)), weak = min(1, max(0, rawWeak))
-            if strong == 0 && weak == 0 {
-                guard rumbleOwners[slot] == id else { return }
-                rumbleOwners.removeValue(forKey: slot)
-            } else { rumbleOwners[slot] = id }
+            if strong == 0 && weak == 0 { guard rumbleOwners[slot] == id else { return }; rumbleOwners.removeValue(forKey: slot) } else { rumbleOwners[slot] = id }
             onRumble?(slot, strong, weak)
-        } else if type == "stats" {
-            // Telemetry stays local to logging, not broadcast to unrelated tabs.
-            bridgeLog(.debug, "wshub", "client stats: \(String(decoding: data.prefix(2048), as: UTF8.self))")
-        }
+        } else if type == "stats" { bridgeLog(.debug, "wshub", "client stats received") }
     }
 
     private func send(_ text: String, to client: Client) {
@@ -179,70 +157,53 @@ final class WebSocketHub: ControllerOutputSink, @unchecked Sendable {
         let connection = client.connection, id = ObjectIdentifier(client.connection)
         guard clients[id] === client, client.ready else { return }
         let bytes = Data(text.utf8)
-        guard bytes.count <= Self.maxMessageBytes, client.pendingMessages < 128,
-              client.pendingBytes + bytes.count <= 256 * 1024 else { remove(id); return }
+        guard bytes.count <= Self.maxMessageBytes, client.pendingMessages < 128, client.pendingBytes + bytes.count <= 256 * 1024 else { remove(id); return }
         client.pendingMessages += 1; client.pendingBytes += bytes.count
         let metadata = NWProtocolWebSocket.Metadata(opcode: .text)
         let context = NWConnection.ContentContext(identifier: "text", metadata: [metadata])
-        connection.send(content: bytes, contentContext: context, isComplete: true,
-                        completion: .contentProcessed { [weak self, weak connection] error in
-            guard let self, let connection, let client = self.clients[id],
-                  client.connection === connection else { return }
+        connection.send(content: bytes, contentContext: context, isComplete: true, completion: .contentProcessed { [weak self, weak connection] error in
+            guard let self, let connection, let client = self.clients[id], client.connection === connection else { return }
             client.pendingMessages -= 1; client.pendingBytes -= bytes.count
             if error != nil { self.remove(id) }
         })
     }
 
-    private func broadcast(_ text: String) {
-        for client in Array(clients.values) where client.ready { send(text, to: client) }
-    }
-
-    private static func json(_ object: [String: Any]) -> String? {
-        guard let data = try? JSONSerialization.data(withJSONObject: object) else { return nil }
-        return String(decoding: data, as: UTF8.self)
-    }
-    private static func connectionMessage(_ slot: Int, _ model: String, _ name: String) -> String {
-        json(["t":"connected", "slot":slot, "model":model, "name":name])!
-    }
+    private func broadcast(_ text: String) { for client in Array(clients.values) where client.ready { send(text, to: client) } }
+    private static func json(_ object: [String: Any]) -> String? { guard let data = try? JSONSerialization.data(withJSONObject: object) else { return nil }; return String(decoding: data, as: UTF8.self) }
+    private static func connectionMessage(_ slot: Int, _ model: String, _ name: String) -> String { json(["t":"connected", "slot":slot, "model":model, "name":name])! }
 
     func controllerConnected(slot: Int, model: Switch2.Model) {
+        stateMailbox.clear(slot: slot)
         queue.async { [weak self] in
             guard let self, (0..<4).contains(slot) else { return }
             self.connected[slot] = (model.displayName, model.displayName, model.hasHDRumble)
-            self.lastState.removeValue(forKey: slot)
-            self.rumbleOwners.removeValue(forKey: slot)
-            self.seq[slot] = 0
+            self.lastState.removeValue(forKey: slot); self.rumbleOwners.removeValue(forKey: slot); self.seq[slot] = 0
             self.broadcast(Self.connectionMessage(slot, model.displayName, model.displayName))
         }
     }
     func controllerDisconnected(slot: Int) {
+        stateMailbox.clear(slot: slot)
         queue.async { [weak self] in
             guard let self, self.connected.removeValue(forKey: slot) != nil else { return }
             self.lastState.removeValue(forKey: slot)
-            self.rumbleOwners.removeValue(forKey: slot)
-            self.broadcast(#"{"t":"disconnected","slot":\#(slot)}"#)
+            if self.rumbleOwners.removeValue(forKey: slot) != nil { self.onRumble?(slot, 0, 0) }
+            self.broadcast("{\"t\":\"disconnected\",\"slot\":\(slot)}")
         }
     }
-    func controllerName(slot: Int, name: String) {
-        queue.async { [weak self] in
-            guard let self, let info = self.connected[slot], info.name != name else { return }
-            self.connected[slot] = (info.model, name, info.rumble)
-            if let text = Self.json(["t":"name", "slot":slot, "name":name]) { self.broadcast(text) }
-        }
+    func controllerName(slot: Int, name: String) { queue.async { [weak self] in guard let self, let info = self.connected[slot], info.name != name else { return }; self.connected[slot] = (info.model, name, info.rumble); if let text = Self.json(["t":"name", "slot":slot, "name":name]) { self.broadcast(text) } } }
+    func controllerState(slot: Int, state: ControllerState) { if stateMailbox.submit(slot: slot, state: state) { queue.async { [weak self] in self?.drainStates() } } }
+
+    private func drainStates() {
+        let batch = stateMailbox.take()
+        for recovery in batch.recoveries { publishState(slot: recovery.slot, state: ControllerState()); publishState(slot: recovery.slot, state: recovery.latest); bridgeLog(.warning, "wshub", "slot \(recovery.slot + 1): output backlog recovered with neutral state") }
+        for item in batch.items { publishState(slot: item.slot, state: item.state) }
+        if stateMailbox.completeDrain() { queue.async { [weak self] in self?.drainStates() } }
     }
-    func controllerState(slot: Int, state: ControllerState) {
-        queue.async { [weak self] in
-            guard let self, self.connected[slot] != nil else { return }
-            let next = (self.seq[slot] ?? 0) &+ 1
-            self.seq[slot] = next
-            guard let text = Self.json([
-                "t":"state", "slot":slot, "seq":next, "b":state.buttons.rawValue,
-                "lx":state.leftStick.x, "ly":state.leftStick.y,
-                "rx":state.rightStick.x, "ry":state.rightStick.y,
-                "lt":state.leftTrigger, "rt":state.rightTrigger
-            ]) else { return }
-            self.lastState[slot] = text
-            self.broadcast(text)
-        }
+    private func publishState(slot: Int, state: ControllerState) {
+        guard connected[slot] != nil else { return }
+        func axis(_ value: Double) -> Double { value.isFinite ? max(-1, min(1, value)) : 0 }
+        let next = (seq[slot] ?? 0) &+ 1; seq[slot] = next
+        guard let text = Self.json(["t":"state", "slot":slot, "seq":next, "b":state.buttons.rawValue, "lx":axis(state.leftStick.x), "ly":axis(state.leftStick.y), "rx":axis(state.rightStick.x), "ry":axis(state.rightStick.y), "lt":state.leftTrigger, "rt":state.rightTrigger]) else { return }
+        lastState[slot] = text; broadcast(text)
     }
 }
