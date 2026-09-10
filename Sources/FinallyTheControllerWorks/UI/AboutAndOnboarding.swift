@@ -13,6 +13,12 @@ enum AppInfo {
         Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "0"
     }
 
+    static var sourceRevision: String {
+        let revision = Bundle.main.infoDictionary?["FTCWSourceRevision"] as? String ?? "unrecorded"
+        let dirty = Bundle.main.infoDictionary?["FTCWSourceDirty"] as? Bool ?? false
+        return String(revision.prefix(12)) + (dirty ? " (modified)" : "")
+    }
+
     /// This fork has no approved update signing identity/feed. Never consume
     /// the upstream feed or a persisted override until that trust path exists.
     static let updatesEnabled = false
@@ -64,6 +70,8 @@ struct AboutView: View {
                 .font(.title2.bold())
             Text("Version \(AppInfo.version) (\(AppInfo.build))")
                 .foregroundStyle(.secondary)
+            Text("Source: \(AppInfo.sourceRevision)")
+                .font(.caption.monospaced()).textSelection(.enabled)
             Text("Nintendo Switch 2 controllers on macOS —\nover Bluetooth, at last.")
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)

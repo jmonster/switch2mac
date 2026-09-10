@@ -32,6 +32,12 @@ Bluetooth/privacy approvals, preferences and login-item registration for this
 app separately. Do not run two bridges against the same controller at once.
 See [fork identity and signing policy](docs/fork-identity.md).
 
+Successful macOS CI runs provide a **switch2mac-development-app** artifact containing
+an app ZIP, SHA-256 checksum and source revision. Extract it and move the app to
+Applications before loading its bundled browser extension. These are ad-hoc
+development builds, not notarized releases; normal macOS security policy applies.
+The About window identifies the source revision and locally modified builds.
+
 ## Choose an output for the intended game
 
 - **SDL3 games:** the [SDL bridge](sdl/README.md) uses a custom library, not a
