@@ -77,10 +77,18 @@ struct MenuBarIcon: View {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
-    let engine = BridgeEngine()
+    let engine: BridgeEngine
     let game = ReactionGame()
     let challenges = ChallengeCoordinator()
     let updater = Updater()
+
+    override init() {
+        // An import interrupted after changing only one preference key must be
+        // repaired before BridgeEngine snapshots settings or Joy-Con links.
+        _ = SettingsArchive.recover()
+        engine = BridgeEngine()
+        super.init()
+    }
     private let notifications = NotificationManager()
     private var inputEnvironment: InputEnvironment?
     private var workspaceObservers: [NSObjectProtocol] = []
