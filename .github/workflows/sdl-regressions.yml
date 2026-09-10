@@ -24,7 +24,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          bash -n sdl/build-sdl.sh sdl/make-gopher64-both.sh
+          bash -n sdl/build-sdl.sh sdl/make-gopher64-both.sh tests/sdl-usb/check-sdl.sh
           git -C .ci-sdl apply "$GITHUB_WORKSPACE/sdl/sdl3-3.4.14-s2udp.patch"
           bash tests/sdl-usb/check-sdl.sh .ci-sdl before
           cmake -S .ci-sdl -B "$RUNNER_TEMP/sdl-build" -DSDL_SHARED=ON -DSDL_STATIC=OFF -DSDL_TESTS=OFF -DSDL_HIDAPI_LIBUSB=ON > "$RUNNER_TEMP/sdl-baseline.log" 2>&1
@@ -43,13 +43,15 @@ jobs:
           bash sdl/build-sdl.sh .ci-sdl > "$RUNNER_TEMP/sdl-corrected.log" 2>&1 || { tail -80 "$RUNNER_TEMP/sdl-corrected.log"; exit 1; }
           git -C .ci-sdl apply "$GITHUB_WORKSPACE/sdl/s2usb-device-identity.patch"
           bash tests/sdl-usb/check-sdl.sh .ci-sdl after
-          SDL3_DYNAMIC_API="$GITHUB_WORKSPACE/build/sdl/libSDL3.0.dylib" "$RUNNER_TEMP/check-edges"
+          # Resolve the same test executable against ONLY the corrected dylib.
+          # SDL3_DYNAMIC_API would load both libraries' Objective-C classes.
+          DYLD_LIBRARY_PATH="$GITHUB_WORKSPACE/build/sdl" "$RUNNER_TEMP/check-edges"
       - name: Pro Controller gamepad, sensor and rumble integration
         shell: bash
         run: |
           set -euo pipefail
           cc -I .ci-sdl/include tests/sdl-pro-controller/check.c -L "$RUNNER_TEMP/sdl-build" -Wl,-rpath,"$RUNNER_TEMP/sdl-build" -lSDL3 -o "$RUNNER_TEMP/check-pro"
-          SDL3_DYNAMIC_API="$GITHUB_WORKSPACE/build/sdl/libSDL3.0.dylib" "$RUNNER_TEMP/check-pro"
+          DYLD_LIBRARY_PATH="$GITHUB_WORKSPACE/build/sdl" "$RUNNER_TEMP/check-pro"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:

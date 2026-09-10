@@ -4,6 +4,10 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/../.." && pwd)
 source_dir=${1:?Provide the SDL source directory with patches applied}
 mode=${2:-after}
+case "$mode" in
+    before|after) ;;
+    *) echo 'Mode must be before or after' >&2; exit 2 ;;
+esac
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/IOKit"
@@ -24,9 +28,12 @@ def function(name):
 text='' if sys.argv[3]=='before' else function('S2USB_GetIdentity')
 Path(sys.argv[2]).write_text(text+function('AcquireVendorInterface'))
 PY
-flags=()
-[ "$mode" != before ] || flags+=(-DBASELINE)
-cc "${flags[@]}" -I "$work" "$root/tests/sdl-usb/harness.c" -o "$work/test"
+# Apple's Bash 3.2 treats an empty array as unbound under `set -u`.
+# Use nonempty positional arguments so the positive check is actually built.
+set -- -I "$work" "$root/tests/sdl-usb/harness.c" -o "$work/test"
+if [ "$mode" = before ]; then set -- -DBASELINE "$@"; fi
+cc "$@"
+test -x "$work/test"
 if [ "$mode" = before ]; then
     set +e
     "$work/test"
