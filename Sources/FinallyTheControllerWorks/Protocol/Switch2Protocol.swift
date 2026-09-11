@@ -97,14 +97,35 @@ enum Switch2 {
         /// Base flags the console always sets alongside motion.
         static let baseline: UInt8 = 0x03
 
-        /// Flags we enable per model. (0xFF causes phantom ZL/ZR on
-        /// Joy-Cons per Switch2Connect; mouse bit is Joy-Con-only.)
-        static func flags(for model: Model) -> UInt8 {
-            switch model {
-            case .joyCon2Left, .joyCon2Right:
-                return baseline | motion | mouse | battery | magnetometer   // 0xB7
-            default:
-                return baseline | motion | battery | magnetometer           // 0xA7
+        /// Explicit experimental consumer demand. Compatibility remains the
+        /// default until real model/firmware acceptance and energy measurements
+        /// justify reducing sensors automatically. Baseline and battery stay on.
+        enum SensorProfile: String, CaseIterable, Sendable {
+            case compatibility, gamepad, motion, pointer
+            static func resolve(_ value: String?, acknowledged: Bool) -> Self {
+                guard acknowledged, let value, let profile = Self(rawValue: value) else { return .compatibility }
+                return profile
+            }
+        }
+        static let selectedProfile = SensorProfile.resolve(
+            ProcessInfo.processInfo.environment["SWITCH2MAC_EXPERIMENTAL_SENSORS"],
+            acknowledged: ProcessInfo.processInfo.environment["SWITCH2MAC_ACKNOWLEDGE_UNQUALIFIED_POWER"] == "1")
+
+        /// Existing callers use one process-stable profile for BOTH feature
+        /// initialization and enablement. No preferences are polled per report.
+        static func flags(for model: Model) -> UInt8 { flags(for: model, profile: selectedProfile) }
+
+        static func flags(for model: Model, profile: SensorProfile) -> UInt8 {
+            let optical = model == .joyCon2Left || model == .joyCon2Right
+            switch profile {
+            case .compatibility:
+                return baseline | motion | battery | magnetometer | (optical ? mouse : 0)
+            case .gamepad:
+                return baseline | battery
+            case .motion:
+                return baseline | battery | motion
+            case .pointer:
+                return baseline | battery | (optical ? mouse : 0)
             }
         }
     }
