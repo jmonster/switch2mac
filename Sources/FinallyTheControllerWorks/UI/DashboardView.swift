@@ -389,7 +389,12 @@ struct ControllerCard: View {
                             .frame(width: 44, alignment: .trailing)
                             .foregroundStyle(.secondary)
                         Button("Test") { onTestRumble() }
-                            .help("Play a short rumble pulse at this controller's strength")
+                            .disabled(status.player < 0 || !status.model.hasHDRumble)
+                            .help("Direct controller pulse, not a test of game-output rumble")
+                    }
+                    if !status.model.hasHDRumble {
+                        Text("GameCube preset rumble is not verified. HD-motor tests are unavailable for this model.")
+                            .font(.caption).foregroundStyle(.secondary)
                     }
                     if AppInfo.showPreReleaseFeatures {
                         DisclosureGroup("Keyboard mapping") {
@@ -617,7 +622,7 @@ struct ControllerCard: View {
                                             Button("Format probe (4 phases)") { onAudioTone() }
                                                 .help("Raw PCM, legacy rate, idle-frame mimic, then a frequency sweep — run once bare and once with headphones plugged in")
                                             Button("Haptic melody") { onHapticMelody() }
-                                                .help("A little tune on the actuators via the documented rumble lane — no audio experiment, should always work")
+                                                .help("Experimental actuator tune on the rumble lane; not a guarantee of hardware or game compatibility")
                                         }
                                     }
                                     .padding(.top, 6)
