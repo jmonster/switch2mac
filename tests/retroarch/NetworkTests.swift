@@ -114,8 +114,9 @@ enum NetworkTests {
                 let right = out.filter { Switch2.u32($0, 4) == 5 && Switch2.u32($0, 8) == 1 }
                 precondition(!right.isEmpty, "continuously dirty left stick starved right-stick delivery")
             case "stale-edge":
-                sink.controllerState(slot: 0, state: state(true)); sink.queue.sync {}
                 sink.queue.sync {
+                    sink.acceptState(slot: 0, state: state(true))
+                    sink.timer?.cancel(); sink.timer = nil
                     precondition(!sink.players[0].edges.isEmpty)
                     sink.players[0].edges[0].enqueuedAt = ProcessInfo.processInfo.systemUptime - 1
                 }
