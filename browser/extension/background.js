@@ -104,7 +104,7 @@ chrome.runtime.onConnect.addListener((port) => {
         // A new effect may preempt the previous tab, but its old refreshes
         // cannot reclaim ownership afterwards.
         rumbleOwners.set(m.slot, port);
-      } else { return; }
+      } else if (phase !== 'refresh') { return; }
     }
     sendNative(text);
   });

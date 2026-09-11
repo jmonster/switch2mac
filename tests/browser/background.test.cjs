@@ -101,3 +101,13 @@ test('wedged websocket is retired instead of buffering stale commands', () => {
   assert.equal(f.timers.size, 1);
   p.close();
 });
+
+
+test('active rumble owner can refresh its own effect', () => {
+  const f = fixture(), p = f.port(), ws = f.sockets[0]; ws.open();
+  p.send(JSON.stringify({t:'rumble',slot:0,strong:1,weak:0,phase:'start'}));
+  p.send(JSON.stringify({t:'rumble',slot:0,strong:1,weak:0,phase:'refresh'}));
+  assert.equal(ws.sent.length, 2, 'start and owning-port refresh must reach the native hub');
+  assert.equal(ws.sent[1].phase, 'refresh');
+  p.close();
+});

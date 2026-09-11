@@ -58,7 +58,7 @@ enum NetworkTests {
     static func aValues(_ packets: [Data]) -> [UInt16] { packets.filter { Switch2.u32($0, 4) == 1 && Switch2.u32($0, 12) == 8 }.map { Switch2.u16($0, 16) } }
     static func main() {
         let selected = CommandLine.arguments.last!
-        for name in ["wire", "tap", "refresh-release", "destination", "disable", "overflow", "mailbox-overload", "send-failure", "finite-axis", "axis-endpoints", "cancel-destination", "deadlines", "settings-wake", "paced-failure"] {
+        for name in ["wire", "tap", "refresh-release", "destination", "disable", "overflow", "mailbox-overload", "send-failure", "finite-axis", "axis-endpoints", "cancel-destination", "deadlines", "settings-wake", "paced-failure", "axis-fairness", "stale-edge"] {
             if selected != "all" && selected != name { continue }
             AppConfig.networkGamepadEnabled = true; AppConfig.networkGamepadBasePort = 55400
             let a = receiver(55400), b = receiver(55410), sink = NetworkGamepadSink()
@@ -115,7 +115,7 @@ enum NetworkTests {
                     p.edges = []; p.wantButtons = 0; p.sentButtons = 0
                     precondition(sink.nextPumpDeadline(now: 100.5) == 102,
                                  "Quiescent output should sleep until refresh, not poll at 60 Hz")
-                    p.edges = [(8, 1)]; p.nextSendAt = 101
+                    p.edges = [(8, 1, 100.5)]; p.nextSendAt = 101
                     precondition(sink.nextPumpDeadline(now: 100.5) == 101)
                     p.edges = []; p.connected = false; p.neutralPasses = 0
                     precondition(sink.nextPumpDeadline(now: 100.5) == nil)
@@ -142,7 +142,7 @@ enum NetworkTests {
                 sink.queue.sync {
                     let p = sink.players[0]
                     p.port = 0 // sendto rejects destination port zero on loopback
-                    p.edges = [(8, 1)]; p.nextSendAt = 0
+                    p.edges = [(8, 1, ProcessInfo.processInfo.systemUptime)]; p.nextSendAt = 0
                     sink.wasEnabled = true
                     let before = ProcessInfo.processInfo.systemUptime
                     sink.pump()
@@ -154,6 +154,28 @@ enum NetworkTests {
             case "axis-endpoints":
                 precondition(NetworkGamepadSink.axis(1) == 32767); precondition(NetworkGamepadSink.axis(-1) == -32767)
                 precondition(NetworkGamepadSink.axis(2) == 32767); precondition(NetworkGamepadSink.axis(-2) == -32767)
+            case "axis-fairness":
+                for i in 0..<12 {
+                    var s = ControllerState()
+                    s.leftStick = (i % 2 == 0 ? 0.8 : -0.8, 0)
+                    s.rightStick = (0.7, -0.7)
+                    sink.controllerState(slot: 0, state: s)
+                    sink.queue.sync {}
+                    tick(sink)
+                }
+                let out = packets(a)
+                let right = out.filter { Switch2.u32($0, 4) == 5 && Switch2.u32($0, 8) == 1 }
+                precondition(!right.isEmpty, "continuously dirty left stick starved right-stick delivery")
+            case "stale-edge":
+                sink.queue.sync {
+                    sink.acceptState(slot: 0, state: state(true))
+                    sink.timer?.cancel(); sink.timer = nil; sink.nextPumpAt = nil
+                    precondition(!sink.players[0].edges.isEmpty)
+                    sink.players[0].edges[0].enqueuedAt = ProcessInfo.processInfo.systemUptime - 1
+                }
+                tick(sink)
+                precondition(sink.queue.sync { sink.players[0].failed })
+                precondition(sink.queue.sync { logged.contains { $0.contains("edge queue exceeded") } })
             default: fatalError()
             }
             print("PASS \(name)")

@@ -82,14 +82,19 @@ struct OutputCapabilities: Sendable {
     var gameRumble: Bool { model.hasHDRumble && (backend == .sdl || backend == .browser) }
     var directRumble: Bool { model.hasHDRumble }
     var analogTravel: Bool { model.hasAnalogTriggers && backend != .retroarch }
+    /// The browser combines digital clicks with trigger values; CoreHID's
+    /// current descriptor omits the separate ZL/ZR click bits. Only the SDL
+    /// mapping exposes both the analog axes and independent click buttons.
+    var independentTriggerClicks: Bool { model.hasAnalogTriggers && backend == .sdl }
     var motion: Bool { backend == .sdl }
     var explanation: String {
         let rumble = gameRumble ? "Game rumble has a return path; verify it in the actual game."
             : (model == .nsoGameCube ? "GameCube preset rumble is unverified; HD-motor commands are not sent."
                : "This output has no game-rumble return path. The Dashboard pulse tests the controller directly, not game rumble.")
         let triggers = model.hasAnalogTriggers
-            ? (analogTravel ? "Analog trigger travel and digital clicks remain separate; test both in-game."
-                            : "GameCube trigger travel is reduced to digital L2/R2 on this output.")
+            ? (independentTriggerClicks ? "Analog trigger travel and digital clicks remain separate; test both in-game."
+               : (analogTravel ? "Analog trigger values are forwarded, but this output does not expose independent digital trigger clicks."
+                               : "GameCube trigger travel is reduced to digital L2/R2 on this output."))
             : "ZL/ZR are digital controls on this model."
         let sensors = motion ? "SDL motion is opt-in and uses nominal conversion; per-model orientation needs qualification."
                              : "This output does not forward motion sensors."
