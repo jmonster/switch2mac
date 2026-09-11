@@ -1,0 +1,55 @@
+name: Packaged macOS runtime qualification
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: runtime-qualification-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  runtime:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            xcode: /Applications/Xcode_26.3.app/Contents/Developer
+          - runner: macos-15-intel
+            xcode: /Applications/Xcode_26.3.app/Contents/Developer
+          - runner: macos-26
+            xcode: ''
+          - runner: macos-26-intel
+            xcode: ''
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Select supported Swift 6.2+ SDK and record actual runtime
+        env:
+          SELECTED_XCODE: ${{ matrix.xcode }}
+        run: |
+          if [ -n "$SELECTED_XCODE" ]; then
+            test -d "$SELECTED_XCODE"
+            echo "DEVELOPER_DIR=$SELECTED_XCODE" >> "$GITHUB_ENV"
+          fi
+          sw_vers
+          uname -m
+      - name: Run metadata and pure protocol qualification tests
+        run: bash tests/runtime-qualification/run.sh
+      - name: Build the actual app on the target runtime
+        run: bash scripts/build-app.sh
+      - name: Execute the packaged loader/protocol probe without starting Bluetooth
+        run: bash scripts/check-runtime.sh
+      - name: Preserve exact qualification result
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: runtime-${{ matrix.runner }}
+          path: build/runtime-qualification.json
+          if-no-files-found: error
+          retention-days: 14
