@@ -42,8 +42,8 @@ private enum ProControllerTests {
         return (session, radio, queue, delegate)
     }
     static func reply(_ session: ControllerSession, _ payload: Data = Data()) {
-        let id = session.pendingCommand!.id
-        session.handleCommandResponse(Data([id, 1, 0, 0, 0, 0, 0, 0]) + payload)
+        let request = session.pendingCommand!.frame
+        session.handleCommandResponse(Data([request[0], 1, request[2], request[3], 0x10, 0x78, 0, 0]) + payload)
     }
     static func memoryReply(_ session: ControllerSession, _ block: Data) {
         let request = session.pendingCommand!.frame

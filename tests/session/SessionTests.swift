@@ -125,16 +125,16 @@ enum SessionTests {
             let (s, _, _, d) = fixture(); defer { s.teardown(); _ = d }
             var calls = 0
             s.writeCommand(0x09, 0x07, Data()) { _ in calls += 1 }
-            s.handleCommandResponse(Data([2, 1, 0, 0, 0, 0, 0, 0]))
+            s.handleCommandResponse(Data([2, 1, 1, 7, 0x10, 0x78, 0, 0]))
             precondition(s.pendingCommand != nil && calls == 0, "Unrelated reply consumed the active command")
-            s.handleCommandResponse(Data([9, 1, 0, 0, 0, 0, 0, 0]))
+            s.handleCommandResponse(Data([9, 1, 1, 7, 0x10, 0x78, 0, 0]))
             precondition(calls == 1 && s.pendingCommand == nil)
         }
         run("memory-address") {
             let (s, _, _, d) = fixture(); defer { s.teardown(); _ = d }
             var succeeded = false
             s.readMemory(length: 1, address: 0x13000) { succeeded = $0 != nil }
-            let frame = Data([2, 1, 0, 0, 0, 0, 0, 0, 1, 0x7e, 0, 0, 0x42, 0x30, 1, 0, 0xaa])
+            let frame = Data([2, 1, 1, 4, 0x10, 0x78, 0, 0, 1, 0x7e, 0, 0, 0x42, 0x30, 1, 0, 0xaa])
             s.handleCommandResponse(frame)
             precondition(!succeeded, "A different memory address must not supply calibration/identity data")
         }

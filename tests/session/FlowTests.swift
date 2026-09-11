@@ -24,19 +24,19 @@ final class FailureRecorder: ControllerSessionDelegate {
                 session.writeCommand(UInt8(id), 7, Data()) { _ in replies.append(id) }
             }
             precondition(radio.writes.isEmpty && session.commandTimeout == nil)
-            session.handleCommandResponse(Data([1,1,0,0,0,0,0,0]))
+            session.handleCommandResponse(Data([1,1,1,7,0x10,0x78,0,0]))
             precondition(replies.isEmpty)
             radio.canSendWriteWithoutResponse = true
             session.peripheralIsReady(toSendWriteWithoutResponse: radio)
             precondition(radio.writes.count == 1 && session.commandTimeout != nil)
-            for id in 1...3 { session.handleCommandResponse(Data([UInt8(id),1,0,0,0,0,0,0])) }
+            for id in 1...3 { session.handleCommandResponse(Data([UInt8(id),1,1,7,0x10,0x78,0,0])) }
             precondition(replies == [1,2,3])
             precondition(radio.writes.map { $0.0.first! } == [1,2,3])
             print("PASS capacity, unsent-response rejection and command FIFO")
 
             var memory: Data?
             session.readMemory(length: 1, address: 0x13000) { memory = $0 }
-            var response = Data([2,1,0,0,0,0,0,0,1,0x7e,0,0,0x42,0x30,1,0,0xaa])
+            var response = Data([2,1,1,4,0x10,0x78,0,0,1,0x7e,0,0,0x42,0x30,1,0,0xaa])
             session.handleCommandResponse(response)
             precondition(memory == nil && session.pendingCommand != nil)
             response[12] = 0

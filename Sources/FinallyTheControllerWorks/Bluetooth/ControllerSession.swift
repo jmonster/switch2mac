@@ -71,12 +71,36 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     private var ended = false
     private var handshakeComplete = false
     private var readyReported = false
+    /// Command replies have no transaction sequence. Correlate all echoed
+    /// fields, and never treat the observed status/error class as success.
+    struct CommandResponse: Sendable {
+        enum Kind: UInt8, Sendable { case success = 0x01, status = 0x02 }
+        let kind: Kind
+        let header: Data
+        let payload: Data
+        var command: UInt8 { header[0] }
+        var transport: UInt8 { header[2] }
+        var subcommand: UInt8 { header[3] }
+
+        init?(_ frame: Data) {
+            guard frame.count >= 8, let kind = Kind(rawValue: frame[frame.startIndex + 1]) else { return nil }
+            self.kind = kind
+            self.header = Data(frame.prefix(8))
+            self.payload = Data(frame.dropFirst(8))
+        }
+    }
+    enum CommandFailure: Error, Sendable {
+        case retired, unavailable, payloadTooLarge, frameTooLarge, queueFull, timeout
+        case rejected(CommandResponse)
+    }
+    typealias CommandResult = Result<CommandResponse, CommandFailure>
+
     private struct CommandRequest {
         let token: UInt64
         let id: UInt8
         let frame: Data
         let accepts: ((Data) -> Bool)?
-        let completion: (Data?) -> Void
+        let completion: (CommandResult) -> Void
     }
     private var nextCommandToken: UInt64 = 0
     private var pendingCommand: CommandRequest?
@@ -173,7 +197,7 @@ final class ControllerSession: NSObject, @unchecked Sendable {
         commandSubmitted = false
         queuedCommands.removeAll()
         // Complete external command waiters after making retirement terminal.
-        for request in cancelled { request.completion(nil) }
+        for request in cancelled { request.completion(.failure(.retired)) }
         // A dead link must also stop any audio experiment: finish the
         // stream (releasing its closures — they retain self), stop
         // capture callbacks, and free the experiment guard.
@@ -308,7 +332,7 @@ final class ControllerSession: NSObject, @unchecked Sendable {
                 self.writeCommand(Switch2.Command.pair, Switch2.Subcommand.pairLTK2, Switch2.pairLTK2) { [weak self] resp in
                     guard let self, resp != nil else { done(false); return }
                     self.writeCommand(Switch2.Command.pair, Switch2.Subcommand.pairFinish, Data([0x00])) { resp in
-                        bridgeLog(.info, "session", "bonded controller to this Mac")
+                        if resp != nil { bridgeLog(.info, "session", "bonded controller to this Mac") }
                         done(resp != nil)
                     }
                 }
@@ -326,26 +350,39 @@ final class ControllerSession: NSObject, @unchecked Sendable {
 
     // MARK: - Commands
 
+    /// Normal callers receive a payload only for a correlated success reply.
+    /// An empty LED ACK is valid; memory additionally validates length/address.
     private func writeCommand(_ command: UInt8, _ subcommand: UInt8, _ data: Data,
                               flag: UInt8 = 0x01,
                               accepts: ((Data) -> Bool)? = nil,
                               completion: @escaping (Data?) -> Void) {
-        guard !ended, chars[Switch2.GATT.commandWrite] != nil else {
-            completion(nil); return
+        sendCommand(command, subcommand, data, flag: flag, accepts: accepts) { result in
+            if case .success(let response) = result { completion(response.payload) }
+            else { completion(nil) }
+        }
+    }
+
+    private func sendCommand(_ command: UInt8, _ subcommand: UInt8, _ data: Data,
+                             flag: UInt8 = 0x01,
+                             accepts: ((Data) -> Bool)? = nil,
+                             completion: @escaping (CommandResult) -> Void) {
+        guard !ended else { completion(.failure(.retired)); return }
+        guard chars[Switch2.GATT.commandWrite] != nil else {
+            completion(.failure(.unavailable)); return
         }
         guard data.count <= Int(UInt8.max) else {
             log(.warning, "command payload exceeds the protocol length field")
-            completion(nil); return
+            completion(.failure(.payloadTooLarge)); return
         }
         let frame = Switch2.buildCommand(command, subcommand, flag: flag, data: data)
         guard frame.count <= peripheral.maximumWriteValueLength(for: .withoutResponse) else {
             log(.warning, "command exceeds negotiated write size; not fragmenting protocol frames")
-            completion(nil); return
+            completion(.failure(.frameTooLarge)); return
         }
         guard queuedCommands.count + (pendingCommand == nil ? 0 : 1) < 32 else {
             log(.error, "command queue exhausted")
             fail("command queue exhausted")
-            completion(nil)
+            completion(.failure(.queueFull))
             return
         }
         nextCommandToken &+= 1
@@ -398,9 +435,11 @@ final class ControllerSession: NSObject, @unchecked Sendable {
                 self.pendingCommand = nil
                 self.commandSubmitted = false
                 self.commandTimeout = nil
-                self.log(.warning, "command \(String(format: "%#04x", request.id)) timed out")
-                request.completion(nil)
-                self.pumpWrites()
+                // There is no sequence field to distinguish a late response
+                // from a later identical command. Retire the stream before
+                // notifying waiters, rather than misattributing a delayed ACK.
+                self.fail("command \(String(format: "%#04x/%#04x", request.id, request.frame[3])) timed out")
+                request.completion(.failure(.timeout))
             }
             commandTimeout = timeout
             queue.asyncAfter(deadline: .now() + 2, execute: timeout)
@@ -424,26 +463,32 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     }
 
     private func handleCommandResponse(_ data: Data) {
-        // An unrelated notification must not consume the command or its timer.
-        guard !ended, commandSubmitted, let pending = pendingCommand, data.count >= 8,
-              data[data.startIndex] == pending.id,
-              data[data.startIndex + 1] == 0x01 || data[data.startIndex + 1] == 0x02 else { return }
-        let payload = data.subdata(in: data.startIndex + 8 ..< data.endIndex)
-        guard pending.accepts?(payload) ?? true else { return }
+        // A malformed, unrelated or not-yet-submitted reply must not consume
+        // the current command/deadline. Sliced Data need not start at index 0.
+        guard !ended, commandSubmitted, let pending = pendingCommand,
+              let response = CommandResponse(data),
+              response.command == pending.id,
+              response.transport == pending.frame[2],
+              response.subcommand == pending.frame[3] else { return }
+        // A rejection need not include a memory result/address. Deliver it
+        // immediately rather than leaving the request to time out. A success
+        // must satisfy any command-specific payload correlation predicate.
+        if response.kind == .success, !(pending.accepts?(response.payload) ?? true) { return }
         commandTimeout?.cancel()
         commandTimeout = nil
         pendingCommand = nil
         commandSubmitted = false
-        // NFC experiments: log the COMPLETE frame (header included) — the
-        // header status bytes distinguish "no data" from "error" replies.
         if pending.id == 0x01 {
             log(.debug, "nfc raw frame: \(data.map { String(format: "%02x", $0) }.joined(separator: " "))")
         }
-        // Byte 1 is the response class: 0x01 = success, 0x02 observed as a
-        // status/error reply (same shape, payload starts with a status code).
-        // Both correlate to our command — pass the payload up and let the
-        // caller interpret the status byte.
-        pending.completion(payload)
+        if response.kind == .success {
+            pending.completion(.success(response))
+        } else {
+            log(.warning, "command \(String(format: "%#04x/%#04x", pending.id, pending.frame[3])) returned status/error")
+            pending.completion(.failure(.rejected(response)))
+        }
+        // State was cleared before callback: teardown or a reentrant enqueue
+        // cannot be erased by completion of the preceding transaction.
         pumpWrites()
     }
 
@@ -510,13 +555,27 @@ final class ControllerSession: NSObject, @unchecked Sendable {
 
     // MARK: - Experiments (NFC probing, audio capture)
 
-    /// Raw command access for protocol experiments. Serialized with all
-    /// other commands; completion gets the response payload (post-header)
-    /// or nil on timeout/error. Runs on the Bluetooth queue.
+    /// Typed command access for protocol research. Rejections retain their
+    /// header and payload. Timeout retires this ambiguous command stream.
+    /// Like the session itself, this API is Bluetooth-queue confined.
+    func experimentalCommandResult(_ command: UInt8, _ subcommand: UInt8,
+                                   payload: Data, flag: UInt8 = 0x01,
+                                   completion: @escaping (CommandResult) -> Void) {
+        sendCommand(command, subcommand, payload, flag: flag, completion: completion)
+    }
+
+    /// Compatibility for existing NFC/audio probes: preserve status payloads
+    /// they intentionally inspect (e.g. "not ready"), but never use this raw
+    /// adapter for normal handshake success decisions. nil means no reply.
     func experimentalCommand(_ command: UInt8, _ subcommand: UInt8,
                              payload: Data, flag: UInt8 = 0x01,
                              completion: @escaping (Data?) -> Void) {
-        writeCommand(command, subcommand, payload, flag: flag, completion: completion)
+        experimentalCommandResult(command, subcommand, payload: payload, flag: flag) { result in
+            switch result {
+            case .success(let response), .failure(.rejected(let response)): completion(response.payload)
+            case .failure: completion(nil)
+            }
+        }
     }
 
     /// NFC experiments: subscribe every notify-capable characteristic we are

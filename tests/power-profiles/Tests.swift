@@ -43,9 +43,9 @@ final class PowerDelegate: ControllerSessionDelegate {
                 var completed = false
                 session.stepFeatures { completed = $0 }
                 precondition(radio.writes.count == 1 && !completed)
-                session.handleCommandResponse(Data([0x0C, 1, 0, 0, 0, 0, 0, 0]))
+                session.handleCommandResponse(Data([0x0C, 1, 1, 2, 0x10, 0x78, 0, 0, 0, 0, 0, 0]))
                 precondition(radio.writes.count == 2 && !completed)
-                session.handleCommandResponse(Data([0x0C, 1, 0, 0, 0, 0, 0, 0]))
+                session.handleCommandResponse(Data([0x0C, 1, 1, 4, 0x10, 0x78, 0, 0, 0, 0, 0, 0]))
                 precondition(completed)
                 let flags = Switch2.Feature.flags(for: model, profile: expected)
                 for (index, write) in radio.writes.enumerated() {
