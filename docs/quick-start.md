@@ -38,7 +38,7 @@ library. Check the dashboard log and the exact build before changing settings.
 |---|---|---|
 | Compatible SDL3 game or Gopher64 | [Corrected SDL library and separate game copy](../sdl/README.md) | The tracked historical dylib is not the corrected build; not a system-wide driver. |
 | RetroArch | [Network gamepad instructions](retroarch-integration.md) | No SDL replacement needed; no rumble return path or analog GameCube trigger travel. |
-| Supported Chromium web game | [Browser extension instructions](../browser/README.md) | Exact extension ID, opt-in listener, relaunch, and tab reload required; no Safari/Firefox package. |
+| Supported Chromium web game | [Browser extension instructions](../browser/README.md) | Exact extension ID, opt-in listener, Apply Changes, and tab reload required; no Safari/Firefox package. |
 
 For RetroArch, enable network gamepad input in RetroArch and the matching
 output in the app's Dashboard. The default base port is 55400. Use a trusted
@@ -46,8 +46,8 @@ network because RetroArch's unauthenticated receiver may listen beyond loopback.
 
 For browser games, **Browser Bridge Settings → Show bundled extension** opens
 the installed extension folder. Load it unpacked in the Chromium extension
-manager, copy its ID into Browser Bridge Settings, enable output, then quit and
-relaunch the app. Reload the game tab after installing or reloading the
+manager, copy its ID into Browser Bridge Settings, enable output, then
+click Apply Changes. Reload the game tab after installing or reloading the
 extension. Keep its folder stable; moving an unpacked extension can change its
 ID. The extension only injects into sites listed in its manifest.
 

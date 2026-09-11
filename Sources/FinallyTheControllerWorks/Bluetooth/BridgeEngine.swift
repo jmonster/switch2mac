@@ -4,7 +4,7 @@
 //
 // Two-level model:
 //  * Physical: up to 8 concurrent BLE sessions (8 Joy-Cons = 4 grips).
-//  * Logical: up to 4 player outputs (what sinks/games see). A logical
+//  * Logical: up to 4 player outputs (what games can see). A logical
 //    player is either one controller or a linked Joy-Con L+R pair.
 //  Links are persisted per serial pair, so grips re-form on reconnect.
 //  Player LEDs show the LOGICAL player number; both halves of a grip match.
@@ -57,7 +57,8 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
     @MainActor @Published private(set) var controllers: [ControllerStatus] = []
     /// Throttled (~10 Hz) live input per player, for the input visualizer.
     @MainActor @Published private(set) var liveStates: [Int: ControllerState] = [:]
-    private var lastVizPush: [Int: TimeInterval] = [:]   // btQueue
+    private let visualizer = VisualizerMailbox<ControllerState>(maxSlots: BridgeEngine.maxPlayers)
+    private var pointerActivity: [UUID: TimeInterval] = [:] // btQueue, accepted pointer output only
 
     @MainActor private var infoSnapshot: [String: Switch2.ControllerInfo] = [:]
     @MainActor private var participantSnapshot: [(id: String, name: String)] = []
@@ -116,13 +117,6 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
         super.init()
         central = CBCentralManager(delegate: self, queue: btQueue)
         btQueue.async { [weak self] in self?.reloadConfiguration() }
-        // Idle sweep: put controllers to sleep after the configured minutes
-        // without human input (0 = never). A button press wakes them back.
-        let timer = DispatchSource.makeTimerSource(queue: btQueue)
-        timer.schedule(deadline: .now() + 1, repeating: 1, leeway: .milliseconds(50))
-        timer.setEventHandler { [weak self] in self?.sweepIdleSessions() }
-        timer.resume()
-        idleSweepTimer = timer
         // The settings store posts this when a custom name changes; push the
         // new names to sinks so games can relabel their joysticks live.
         observers.append(NotificationCenter.default.addObserver(
@@ -196,12 +190,14 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
         deadlines.removeValue(forKey: id)?.cancel()
         connectedAt.removeValue(forKey: session.slot)
         mouseController.reset(serial: session.serialNumber)
+        pointerActivity.removeValue(forKey: id)
         if findingSession === session { stopFinding() }
         session.teardown()
         if cancel {
             disconnecting.insert(id)
             central.cancelPeripheralConnection(session.peripheral)
         }
+        updateIdleSweep()
         if recompute { recomputeLogical() }
     }
 
@@ -213,8 +209,8 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
         if !cancel { disconnecting.removeAll() }
         stopFinding()
         keyboardMapper.reset(); mouseController.reset(); gestureRecognizer.reset()
-        lastVizPush.removeAll(); lastButtonsByPlayer.removeAll(); captureLast.removeAll()
-        DispatchQueue.main.async { [weak self] in self?.liveStates.removeAll() }
+        lastButtonsByPlayer.removeAll(); captureLast.removeAll()
+        if visualizer.clearAll() { scheduleVisualizerDrain() }
     }
 
     private func armDeadline(_ session: ControllerSession, seconds: Double) {
@@ -231,6 +227,20 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
         btQueue.asyncAfter(deadline: .now() + seconds, execute: work)
     }
 
+    /// Only active, ready sessions require an idle/stale watchdog. Connecting
+    /// attempts already have their own deadlines; paused/empty engines do not poll.
+    private func updateIdleSweep() {
+        guard running, !suspended, !sessions.isEmpty else {
+            idleSweepTimer?.cancel(); idleSweepTimer = nil
+            return
+        }
+        guard idleSweepTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: btQueue)
+        timer.schedule(deadline: .now() + 1, repeating: 1, leeway: .milliseconds(100))
+        timer.setEventHandler { [weak self] in self?.sweepIdleSessions() }
+        timer.resume(); idleSweepTimer = timer
+    }
+
     /// btQueue. Disconnect sessions whose last human input is older than the
     /// configured idle timeout.
     private func sweepIdleSessions() {
@@ -241,7 +251,8 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
         for session in Array(sessions.values) {
             // Audio capture intentionally suppresses normal reports on some firmware.
             let stale = session.audioExperimentName == nil && now - session.lastReportAt > 5
-            let idle = minutes.isFinite && minutes > 0 && session.lastActivityAt < cutoff
+            let activity = max(session.lastActivityAt, pointerActivity[session.peripheral.identifier] ?? 0)
+            let idle = minutes.isFinite && minutes > 0 && activity < cutoff
             if stale || idle {
                 bridgeLog(.warning, "engine", "\(session.displayName): \(stale ? "input stream stopped" : "idle timeout")")
                 retire(session, cancel: true)
@@ -1150,10 +1161,9 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
                 if old != nil {
                     keyboardMapper.reset(player: player)
                     gestureRecognizer.reset(player: player)
-                    lastVizPush.removeValue(forKey: player)
                     lastButtonsByPlayer.removeValue(forKey: player)
                     captureLast.removeValue(forKey: player)
-                    DispatchQueue.main.async { [weak self] in self?.liveStates.removeValue(forKey: player) }
+                    if visualizer.clear(slot: player) { scheduleVisualizerDrain() }
                     for sink in sinks { sink.controllerDisconnected(slot: player) }
                 }
                 if let new {
@@ -1311,9 +1321,7 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
         // Mouse mode operates on PHYSICAL units (a linked pair's right
         // Joy-Con can be lifted off the grip and used as the mouse).
         if let session = sessions[slot] {
-            mouseController.handle(serial: session.serialNumber,
-                                   model: session.model, state: state,
-                                   configuration: configurations[session.serialNumber] ?? ControllerConfiguration())
+            handlePointerInput(session, state: state)
         }
         guard let (player, logical) = players.first(where: { $0.value.slots.contains(slot) })
         else { return }
@@ -1359,14 +1367,28 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
         }
         captureLast[player] = out.buttons
 
-        // Feed the dashboard visualizer at ~10 Hz.
-        let now = CFAbsoluteTimeGetCurrent()
-        if now - (lastVizPush[player] ?? 0) >= 0.1 {
-            lastVizPush[player] = now
-            let snapshot = out
-            DispatchQueue.main.async { [weak self] in
-                self?.liveStates[player] = snapshot
-            }
+        // Latest-only coalescing is UI-only. All game-output edges above
+        // keep their existing ordered delivery, even with no visible window.
+        if visualizer.submit(slot: player, state: out) { scheduleVisualizerDrain() }
+    }
+
+    private func handlePointerInput(_ session: ControllerSession, state: ControllerState) {
+        guard sessions[session.slot] === session, !session.isRetired else { return }
+        if mouseController.handle(serial: session.serialNumber, model: session.model, state: state,
+                                  configuration: configurations[session.serialNumber] ?? ControllerConfiguration()) {
+            pointerActivity[session.peripheral.identifier] = ProcessInfo.processInfo.systemUptime
+        }
+    }
+
+    @MainActor func setVisualizerVisible(_ visible: Bool, subscriber: UUID) {
+        visualizer.setSubscriber(subscriber, visible: visible)
+        if !visualizer.hasSubscribers { liveStates.removeAll() }
+    }
+
+    private func scheduleVisualizerDrain() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.liveStates = self.visualizer.take()
         }
     }
 
@@ -1580,6 +1602,7 @@ extension BridgeEngine: ControllerSessionDelegate {
         connecting.removeValue(forKey: id)
         sessions[session.slot] = session
         connectedAt[session.slot] = Date()
+        updateIdleSweep()
         session.onState = { [weak self, weak session] slot, state in
             guard let self, let session, self.sessions[slot] === session else { return }
             self.emitState(slot: slot, state: state)

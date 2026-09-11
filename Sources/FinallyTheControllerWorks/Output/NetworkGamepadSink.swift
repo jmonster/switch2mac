@@ -55,9 +55,28 @@ final class NetworkGamepadSink: ControllerOutputSink, @unchecked Sendable {
     private var timer: DispatchSourceTimer?
     private var lastSendErrorAt: TimeInterval = 0
     private var wasEnabled = false
+    private var nextPumpAt: TimeInterval?
+    private var settingsObserver: NSObjectProtocol?
+    private var observedConfiguration: (Bool, Int)?
 
-    init() { queue.async { [weak self] in self?.openSocket() } }
-    deinit { timer?.cancel(); if fd >= 0 { close(fd) } }
+    init() {
+        queue.async { [weak self] in self?.openSocket(); self?.configurationChanged() }
+        settingsObserver = NotificationCenter.default.addObserver(
+            forName: UserDefaults.didChangeNotification, object: nil, queue: nil) { [weak self] _ in
+                self?.queue.async { [weak self] in self?.configurationChanged() }
+            }
+    }
+    deinit {
+        if let settingsObserver { NotificationCenter.default.removeObserver(settingsObserver) }
+        timer?.cancel(); if fd >= 0 { close(fd) }
+    }
+    private func configurationChanged() {
+        let value = (AppConfig.networkGamepadEnabled, AppConfig.networkGamepadBasePort)
+        if let old = observedConfiguration, old == value { return }
+        observedConfiguration = value
+        // Settings changes must wake a sleeping pump even without input.
+        schedulePump(at: ProcessInfo.processInfo.systemUptime)
+    }
     private func openSocket() {
         fd = socket(AF_INET, SOCK_DGRAM, 0)
         guard fd >= 0 else {
@@ -71,6 +90,7 @@ final class NetworkGamepadSink: ControllerOutputSink, @unchecked Sendable {
         queue.sync { [weak self] in
             guard let self, self.players.indices.contains(slot) else { return }
             self.players[slot].connected = true
+            self.ensurePumping()
         }
     }
     func controllerName(slot: Int, name: String) {}
@@ -85,7 +105,7 @@ final class NetworkGamepadSink: ControllerOutputSink, @unchecked Sendable {
     }
 
     func controllerState(slot: Int, state: ControllerState) {
-        guard AppConfig.networkGamepadEnabled else { return }
+        guard (0..<BridgeEngine.maxPlayers).contains(slot), AppConfig.networkGamepadEnabled else { return }
         if stateMailbox.submit(slot: slot, state: state) {
             queue.async { [weak self] in self?.drainStates() }
         }
@@ -137,17 +157,59 @@ final class NetworkGamepadSink: ControllerOutputSink, @unchecked Sendable {
     private static func axis(_ value: Double) -> Int16 {
         guard value.isFinite else { return 0 }
         let clamped = max(-1, min(1, value))
+        // Preserve endpoints: quantization is traffic shaping, not a reason to
+        // make full stick travel unreachable in the consumer.
         if clamped >= 1 { return 32767 }
         if clamped <= -1 { return -32767 }
         let raw = Int32((clamped * 32767).rounded())
         return Int16(raw / analogQuantum * analogQuantum)
     }
     private func ensurePumping() {
-        guard timer == nil, fd >= 0 else { return }
-        let t = DispatchSource.makeTimerSource(queue: queue)
-        t.schedule(deadline: .now(), repeating: Self.sendInterval, leeway: .milliseconds(2))
-        t.setEventHandler { [weak self] in self?.pump() }
-        t.resume(); timer = t
+        schedulePump(at: nextPumpDeadline(now: ProcessInfo.processInfo.systemUptime))
+    }
+
+    /// One-shot timer: pending edges remain paced; otherwise sleep until a
+    /// full refresh is due. Failed sends are paced too, never a zero-delay loop.
+    private func schedulePump(at deadline: TimeInterval?) {
+        guard fd >= 0, let deadline else {
+            timer?.cancel(); timer = nil; nextPumpAt = nil
+            return
+        }
+        if timer != nil, let nextPumpAt, nextPumpAt <= deadline { return }
+        if timer == nil {
+            let source = DispatchSource.makeTimerSource(queue: queue)
+            source.setEventHandler { [weak self] in
+                guard let self else { return }
+                self.nextPumpAt = nil
+                self.pump()
+            }
+            source.resume(); timer = source
+        }
+        let delay = max(0, deadline - ProcessInfo.processInfo.systemUptime)
+        nextPumpAt = deadline
+        timer?.schedule(deadline: .now() + delay,
+                        leeway: .milliseconds(delay > 0.1 ? 50 : 2))
+    }
+
+    private func nextPumpDeadline(now: TimeInterval) -> TimeInterval? {
+        let base = AppConfig.networkGamepadBasePort
+        let enabled = AppConfig.networkGamepadEnabled && (1...65532).contains(base)
+        if enabled != wasEnabled { return now }
+        var deadline: TimeInterval?
+        for (slot, p) in players.enumerated() {
+            let target: UInt16? = enabled ? UInt16(base + slot) : nil
+            if p.port == nil && target == nil { continue }
+            let changingPort = target != nil && p.port != nil && target != p.port
+            let revertingPort = p.switchIndex != nil && target == p.port
+            let candidate: TimeInterval
+            if p.pending || changingPort || revertingPort {
+                candidate = max(now, p.nextSendAt)
+            } else if (enabled && p.connected) || p.neutralPasses > 0 {
+                candidate = max(now, p.nextSendAt, p.lastRefreshAt + Self.refreshInterval)
+            } else { continue }
+            deadline = min(deadline ?? candidate, candidate)
+        }
+        return deadline
     }
 
     private func pump() {
@@ -158,7 +220,6 @@ final class NetworkGamepadSink: ControllerOutputSink, @unchecked Sendable {
             for p in players { p.neutralize(); p.failed = false }
         }
         wasEnabled = enabled
-        var busy = false
         for (slot, p) in players.enumerated() {
             let target: UInt16? = enabled ? UInt16(basePort + slot) : nil
             if p.port == nil { p.port = target }
@@ -167,15 +228,20 @@ final class NetworkGamepadSink: ControllerOutputSink, @unchecked Sendable {
             if refreshing && now - p.lastRefreshAt >= Self.refreshInterval && p.refreshIndex >= 20 {
                 p.lastRefreshAt = now; p.refreshIndex = 0
             }
-            busy = busy || p.pending || refreshing || (target != nil && target != port)
             guard now >= p.nextSendAt else { continue }
+            // Set before attempting send, including failures, to bound retries.
+            p.nextSendAt = now + Self.sendInterval
 
+            // Reverting a port edit can leave a partially neutralized receiver.
+            // Reassert every button, then resume ordered edges for later reports.
             if p.switchIndex != nil && target == port {
                 p.switchIndex = nil
                 p.edges = (0..<16).map { ($0, (p.wantButtons >> $0) & 1, now) }
                 p.refreshIndex = 0
             }
 
+            // Configuration changes retire the old destination before any new
+            // state is sent. Reports during this reset establish the new state.
             if let target, target != port {
                 if p.switchIndex == nil { p.switchIndex = 0; p.edges.removeAll() }
                 let index = p.switchIndex!
@@ -187,7 +253,6 @@ final class NetworkGamepadSink: ControllerOutputSink, @unchecked Sendable {
                     p.edges = (0..<16).filter { p.wantButtons & (1 << $0) != 0 }.map { ($0, 1, now) }
                     p.refreshIndex = 0
                 }
-                p.nextSendAt = now + Self.sendInterval
                 continue
             }
             if let edge = p.edges.first {
@@ -226,9 +291,8 @@ final class NetworkGamepadSink: ControllerOutputSink, @unchecked Sendable {
                     p.preferRefresh = refreshPending
                 } else { continue }
             }
-            p.nextSendAt = now + Self.sendInterval
         }
-        if !busy { timer?.cancel(); timer = nil }
+        ensurePumping()
     }
 
     private static func refreshMessage(_ slot: Int, _ index: Int, buttons: UInt16, axes: [Int16]) -> [UInt8] {
@@ -246,6 +310,8 @@ final class NetworkGamepadSink: ControllerOutputSink, @unchecked Sendable {
         withUnsafeBytes(of: state.littleEndian) { d.append(contentsOf: $0) }
         d.append(contentsOf: [0, 0]); return d
     }
+    // sendto acceptance is NOT acknowledgement by RetroArch. Full refreshes
+    // include released/zero values so a lost release can converge later.
     private func send(_ bytes: [UInt8], port: UInt16, now: TimeInterval) -> Bool {
         var dest = sockaddr_in()
         dest.sin_family = sa_family_t(AF_INET)

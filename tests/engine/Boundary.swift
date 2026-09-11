@@ -7,9 +7,12 @@ final class Central {
 }
 final class Output {
     var resets = 0
+    var acceptsPointer = false
+    func handle(serial: String, model: Switch2.Model, state: ControllerState, configuration: ControllerConfiguration) -> Bool { acceptsPointer }
     func reset() { resets += 1 }
     func reset(serial: String) { resets += 1 }
 }
+enum AppConfig { static var idleSleepMinutes = 1.0 }
 final class BridgeEngine: ControllerSessionDelegate, @unchecked Sendable {
     enum State { case paused }
     let btQueue = DispatchQueue(label: "engine-tests")
@@ -22,9 +25,14 @@ final class BridgeEngine: ControllerSessionDelegate, @unchecked Sendable {
     var deadlines: [UUID: DispatchWorkItem] = [:]
     var connectedAt: [Int: Date] = [:]
     var retryAfter: [UUID: TimeInterval] = [:]
-    var lastVizPush: [Int: Double] = [:], lastButtonsByPlayer: [Int: Int] = [:], captureLast: [Int: Int] = [:]
+    var lastButtonsByPlayer: [Int: Int] = [:], captureLast: [Int: Int] = [:]
     @MainActor var liveStates: [Int: ControllerState] = [:]
     weak var findingSession: ControllerSession?
+    let visualizer = VisualizerMailbox<ControllerState>(maxSlots: 4)
+    var pointerActivity: [UUID: TimeInterval] = [:]
+    var configurations: [String: ControllerConfiguration] = [:]
+    var idleSweepTimer: DispatchSourceTimer?
+    func scheduleVisualizerDrain() {}
     var recomputes = 0, publishes = 0, emissions = 0
     func stopFinding() { findingSession = nil }
     func recomputeLogical() { recomputes += 1 }

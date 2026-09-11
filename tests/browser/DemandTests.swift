@@ -24,7 +24,7 @@ protocol ControllerOutputSink: AnyObject {
 extension WebSocketHub {
     static func verifyDemandBehavior() {
         let origins = origins(from: String(repeating: "a", count: 32))
-        // Both an opt-out and an incomplete opt-in must be completely inert.
+        // Disabled input is inert. Four small lifecycle records support live enablement.
         for hub in [WebSocketHub(enabled: false, allowedOrigins: origins),
                     WebSocketHub(enabled: true, allowedOrigins: [])] {
             hub.controllerConnected(slot: 0, model: .proController2)
@@ -32,7 +32,8 @@ extension WebSocketHub {
             for _ in 0..<1_000 { hub.controllerState(slot: 0, state: ControllerState()) }
             hub.queue.sync {
                 precondition(hub.listener == nil && hub.pingTimer == nil)
-                precondition(hub.connected.isEmpty && hub.lastState.isEmpty && hub.seq.isEmpty)
+                precondition(hub.connected.count == 1 && hub.connected[0]?.name == "disabled")
+                precondition(hub.lastState.isEmpty && hub.seq.isEmpty)
                 precondition(hub.stateMailbox.take().isEmpty)
                 precondition(TestJSON.states == 0, "disabled bridge encoded reports")
             }
@@ -67,8 +68,34 @@ extension WebSocketHub {
             hub.clients[id] = client
             hub.startPing()
             precondition(hub.pingTimer != nil)
-            hub.remove(id)
-            precondition(hub.pingTimer == nil)
+            hub.rumbleOwners[0] = id
+            let stops = Mutex(0)
+            hub.onRumble = { _, strong, weak in
+                if strong == 0 && weak == 0 { stops.withLock { $0 += 1 } }
+            }
+            let oldGeneration = hub.generation
+            hub.applyConfiguration(enabled: false, origins: origins)
+            precondition(hub.pingTimer == nil && hub.listener == nil && hub.clients.isEmpty)
+            precondition(stops.withLock { $0 } == 1 && hub.rumbleOwners.isEmpty)
+            precondition(hub.connected[0]?.name == "late join", "Live enable must not need re-pairing")
+            hub.applyConfiguration(enabled: true, origins: origins)
+            // Model a producer which read the old admission epoch immediately
+            // before a reconfiguration, then submitted after its clearAll().
+            hub.stateMailbox.submit(slot: 0, state: Input(generation: oldGeneration, state: state))
+            hub.drainStates()
+            precondition(hub.lastState.isEmpty, "A retired generation must not feed replacement clients")
+            hub.publishState(slot: 0, state: state)
+            precondition(hub.lastState[0]?.sequence == 1)
+            let current = hub.generation
+            hub.applyConfiguration(enabled: true, origins: origins)
+            precondition(hub.generation == current, "Unchanged settings must not restart clients")
+            hub.listener?.cancel(); hub.listener = nil
+            hub.scheduleRetry()
+            let retiredRetry = hub.retry!
+            hub.applyConfiguration(enabled: false, origins: origins)
+            retiredRetry.perform()
+            precondition(hub.listener == nil && hub.retry == nil)
+            precondition(hub.admission.withLock { !$0.enabled })
         }
         hub.controllerDisconnected(slot: 0)
         hub.queue.sync { precondition(hub.lastState.isEmpty && hub.connected.isEmpty) }

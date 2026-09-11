@@ -2,9 +2,15 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 node --test tests/browser/*.test.cjs
+portable=$(mktemp -d)
+trap 'rm -rf "$portable"' EXIT
+swiftc -swift-version 6 -warnings-as-errors \
+ Sources/FinallyTheControllerWorks/Runtime/BrowserBridgeConfiguration.swift \
+ tests/browser/ConfigurationTests.swift -o "$portable/config"
+"$portable/config"
 [ "$(uname -s)" = Darwin ] || exit 0
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+trap 'rm -rf "$work" "$portable"' EXIT
 python3 - "$work" <<'PY'
 from pathlib import Path
 import sys
@@ -20,10 +26,12 @@ out.joinpath('DemandHub.swift').write_text(s+'\n'+Path('tests/browser/DemandTest
 PY
 swiftc -swift-version 6 -warnings-as-errors Sources/FinallyTheControllerWorks/Protocol/Switch2Protocol.swift \
  Sources/FinallyTheControllerWorks/Runtime/BoundedStateMailbox.swift \
+ Sources/FinallyTheControllerWorks/Runtime/BrowserBridgeConfiguration.swift \
  "$work/State.swift" Sources/FinallyTheControllerWorks/Output/WebSocketHub.swift \
  tests/browser/BrowserServer.swift -o "$work/browser-server"
 python3 tests/browser/websocket_test.py "$work/browser-server"
 swiftc -swift-version 6 -warnings-as-errors Sources/FinallyTheControllerWorks/Protocol/Switch2Protocol.swift \
  Sources/FinallyTheControllerWorks/Runtime/BoundedStateMailbox.swift \
+ Sources/FinallyTheControllerWorks/Runtime/BrowserBridgeConfiguration.swift \
  "$work/State.swift" "$work/DemandHub.swift" -o "$work/browser-demand"
 "$work/browser-demand"

@@ -25,11 +25,14 @@ def method(marker):
 markers = ['func stop(completion:', 'func resume()', 'func setSuspended(',
            'private func owns(', 'private func retire(', 'private func resetConnections(',
            'private func armDeadline(', 'func sessionReady(', 'func sessionFailed(',
-           'func sessionDidUpdateState(']
+           'func sessionDidUpdateState(', 'private func updateIdleSweep()',
+           'private func sweepIdleSessions()', 'private func handlePointerInput(']
 Path(sys.argv[1], 'Engine.swift').write_text(Path('tests/engine/Boundary.swift').read_text()
     + '\n'.join(method(x) for x in markers) + '\n}\n')
 PY
 swiftc -swift-version 5 Sources/FinallyTheControllerWorks/Protocol/Switch2Protocol.swift \
+ Sources/FinallyTheControllerWorks/Runtime/ControllerConfiguration.swift \
+ Sources/FinallyTheControllerWorks/Runtime/VisualizerMailbox.swift \
  "$work/Session.swift" tests/session/FrameworkFakes.swift "$work/Engine.swift" \
  tests/engine/EngineTests.swift -o "$work/check"
 "$work/check"

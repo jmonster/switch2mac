@@ -8,7 +8,6 @@
 import SwiftUI
 import ServiceManagement
 
-@main
 struct FTCWApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
@@ -21,6 +20,7 @@ struct FTCWApp: App {
 
         Window("Finally the Controller Works", id: "dashboard") {
             DashboardView(engine: appDelegate.engine)
+                .background(VisualizerVisibility(engine: appDelegate.engine).frame(width: 0, height: 0))
                 .frame(minWidth: 560, minHeight: 480)
         }
         .defaultSize(width: 680, height: 620)
