@@ -13,7 +13,7 @@
 import Foundation
 import Darwin
 
-final class UDPHub: ControllerOutputSink, @unchecked Sendable {
+final class UDPHub: ControllerOutputSink, OutputHealthProviding, @unchecked Sendable {
 
     private static let basePort: UInt16 = 24800
     private static let peerTTL: TimeInterval = 30
@@ -42,6 +42,22 @@ final class UDPHub: ControllerOutputSink, @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.petersharma.ftcw.udphub")
     private let stateMailbox = BoundedStateMailbox<ControllerState>(
         perSlotCapacity: 64, maxAge: 0.25, batchLimit: 32)
+
+    var outputBackend: OutputBackend { .sdl }
+    func requestHealth(_ reply: @escaping @Sendable (OutputHealth) -> Void) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            let missing = (0..<BridgeEngine.maxPlayers).filter { self.slots[$0] == nil }
+            let now = ProcessInfo.processInfo.systemUptime
+            let peers = self.slots.values.reduce(0) { count, socket in
+                count + socket.peers.values.filter { now - $0 <= Self.peerTTL }.count
+            }
+            let state: OutputHealth.State = !missing.isEmpty
+                ? (self.slots.isEmpty ? .unavailable : .degraded)
+                : (peers > 0 ? .clientConnected : .listening)
+            reply(OutputHealth(backend: .sdl, state: state, activeCount: peers, affectedSlots: missing))
+        }
+    }
 
     init() {
         queue.async { [weak self] in self?.openSockets() }

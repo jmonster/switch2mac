@@ -6,7 +6,7 @@ import Foundation
 import Network
 import Synchronization
 
-final class WebSocketHub: ControllerOutputSink, @unchecked Sendable {
+final class WebSocketHub: ControllerOutputSink, OutputHealthProviding, @unchecked Sendable {
     static let port: UInt16 = 24810
     static let enabledKey = BrowserBridgeConfiguration.legacyEnabledKey
     static let extensionIDsKey = BrowserBridgeConfiguration.legacyIDsKey
@@ -35,6 +35,7 @@ final class WebSocketHub: ControllerOutputSink, @unchecked Sendable {
     private let admission = Mutex(Admission())
     private let stateMailbox = BoundedStateMailbox<Input>(
         perSlotCapacity: 64, maxAge: 0.25, batchLimit: 32)
+    private var requestedEnabled = false // queue confined
     private var enabled = false // queue confined
     private var allowedOrigins = Set<String>()
     private var generation: UInt64 = 0
@@ -48,6 +49,21 @@ final class WebSocketHub: ControllerOutputSink, @unchecked Sendable {
     private var lastState: [Int: (sequence: UInt32, state: ControllerState)] = [:]
     private var rumbleOwners: [Int: ObjectIdentifier] = [:]
     private var pingTimer: DispatchSourceTimer?
+
+    var outputBackend: OutputBackend { .browser }
+    func requestHealth(_ reply: @escaping @Sendable (OutputHealth) -> Void) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            let clients = self.clients.values.filter { $0.ready }.count
+            let state: OutputHealth.State
+            if !self.requestedEnabled { state = .disabled }
+            else if !self.enabled { state = .needsConfiguration }
+            else if clients > 0 { state = .clientConnected }
+            else if let listener = self.listener, case .ready = listener.state { state = .listening }
+            else { state = self.retry == nil ? .starting : .unavailable }
+            reply(OutputHealth(backend: .browser, state: state, activeCount: clients))
+        }
+    }
 
     static func origins(from ids: String) -> Set<String> {
         (try? BrowserBridgeConfiguration(enabled: false, extensionIDs: ids).origins) ?? []
@@ -74,6 +90,7 @@ final class WebSocketHub: ControllerOutputSink, @unchecked Sendable {
         let ids = allowedOrigins.map { $0.hasPrefix(prefix) ? String($0.dropFirst(prefix.count)) : "!" }
         let origins = Self.origins(from: ids.joined(separator: " "))
         self.allowedOrigins = origins
+        requestedEnabled = requested
         enabled = requested && !origins.isEmpty && origins == allowedOrigins
         admission.withLock { $0.enabled = enabled }
         if enabled { queue.async { [weak self] in self?.startListener() } }
@@ -101,6 +118,7 @@ final class WebSocketHub: ControllerOutputSink, @unchecked Sendable {
         let ids = requestedOrigins.map { $0.hasPrefix(prefix) ? String($0.dropFirst(prefix.count)) : "!" }
         let origins = Self.origins(from: ids.joined(separator: " "))
         let enabled = requested && !origins.isEmpty && origins == requestedOrigins
+        requestedEnabled = requested
         guard self.enabled != enabled || allowedOrigins != origins else { return }
         generation &+= 1
         admission.withLock { $0.enabled = false; $0.generation = generation }

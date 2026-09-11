@@ -19,7 +19,10 @@ struct FTCWApp: App {
         }
 
         Window("Finally the Controller Works", id: "dashboard") {
-            DashboardView(engine: appDelegate.engine)
+            VStack(spacing: 0) {
+                OutputStatusShortcut()
+                DashboardView(engine: appDelegate.engine)
+            }
                 .background(VisualizerVisibility(engine: appDelegate.engine).frame(width: 0, height: 0))
                 .frame(minWidth: 560, minHeight: 480)
         }
@@ -42,6 +45,9 @@ struct FTCWApp: App {
 
         Window("Browser Bridge", id: "browser-bridge") { BrowserBridgeSettings() }
             .windowResizability(.contentSize)
+
+        Window("Output Status", id: "output-status") { OutputStatusView(engine: appDelegate.engine) }
+            .defaultSize(width: 600, height: 650)
 
         Window("About", id: "about") { AboutView() }
             .windowResizability(.contentSize)
@@ -105,10 +111,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
                 engine?.setSuspended(suspended)
             })
         }
-        engine.addSink(UDPHub())
-        engine.addSink(WebSocketHub())
-        engine.addSink(NetworkGamepadSink())
-        engine.addSink(VirtualHIDSink())
+        engine.addSink(OutputStatusStore.shared.register(UDPHub()))
+        engine.addSink(OutputStatusStore.shared.register(WebSocketHub()))
+        engine.addSink(OutputStatusStore.shared.register(NetworkGamepadSink()))
+        engine.addSink(OutputStatusStore.shared.register(VirtualHIDSink()))
         notifications.attach(to: engine)
         // Daily auto-update check (only if a feed URL is configured); results
         // surface as an "Update Available" item in the menu-bar dropdown.
@@ -187,6 +193,7 @@ struct MenuContent: View {
         }
         .keyboardShortcut(".", modifiers: [.command, .shift])
         Button("Open Dashboard") { show("dashboard") }
+        Button("Output Status and Capabilities…") { show("output-status") }
         Button("Browser Bridge Settings…") { show("browser-bridge") }
 
         // Hidden for the beta (AppInfo.showPreReleaseFeatures documents

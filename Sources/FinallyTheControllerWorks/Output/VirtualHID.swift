@@ -20,11 +20,23 @@
 import Foundation
 import CoreHID
 
-final class VirtualHIDSink: ControllerOutputSink {
+final class VirtualHIDSink: ControllerOutputSink, OutputHealthProviding {
 
     // This descriptor has no rumble output report.
     var onRumble: ((Int, Double, Double) -> Void)? { get { nil } set {} }
     private let slots = (0..<4).map { Slot(index: $0) }
+
+    var outputBackend: OutputBackend { .hid }
+    func requestHealth(_ reply: @escaping @Sendable (OutputHealth) -> Void) {
+        let snapshots = slots.map { $0.healthSnapshot() }
+        let active = snapshots.filter { $0.active }.count
+        let failures = slots.indices.filter { snapshots[$0].failed }
+        let state: OutputHealth.State
+        if !failures.isEmpty { state = active > 0 ? .degraded : .unavailable }
+        else if snapshots.contains(where: { $0.pending }) { state = .starting }
+        else { state = active > 0 ? .deviceActive : .idle }
+        reply(OutputHealth(backend: .hid, state: state, activeCount: active, affectedSlots: failures))
+    }
 
     deinit { for slot in slots { slot.finish() } }
 
@@ -117,16 +129,26 @@ final class VirtualHIDSink: ControllerOutputSink {
         private var requested: (generation: UInt64, model: Switch2.Model)?
         private var generation: UInt64 = 0
         private var reports: [Report] = []
+        private var activeGeneration: UInt64?
+        private var healthFailed = false
         private var ended = false
         private var worker: Task<Void, Never>?
         private var waiting: (generation: UInt64?, reply: CheckedContinuation<Action, Never>)?
 
         init(index: Int) { self.index = index }
 
+        func healthSnapshot() -> (active: Bool, pending: Bool, failed: Bool) {
+            lock.withLock {
+                let active = requested != nil && activeGeneration == requested?.generation && !ended
+                return (active, requested != nil && !active && !ended, healthFailed)
+            }
+        }
+
         func connect(_ model: Switch2.Model) {
             lock.withLock {
                 guard !ended else { return }
                 generation &+= 1
+                healthFailed = false
                 requested = (generation, model)
                 reports.removeAll(keepingCapacity: true)
                 if worker == nil { worker = Task { await self.run() } }
@@ -136,6 +158,7 @@ final class VirtualHIDSink: ControllerOutputSink {
 
         func disconnect() {
             lock.withLock {
+                healthFailed = false
                 requested = nil
                 reports.removeAll(keepingCapacity: true)
                 wakeLocked()
@@ -145,6 +168,7 @@ final class VirtualHIDSink: ControllerOutputSink {
         func finish() {
             lock.withLock {
                 ended = true
+                healthFailed = false
                 requested = nil
                 reports.removeAll()
                 wakeLocked()
@@ -156,6 +180,7 @@ final class VirtualHIDSink: ControllerOutputSink {
                 guard !ended, requested != nil else { return false }
                 // Bound admission BEFORE scheduling work, not inside a queued closure.
                 guard reports.count < 128 else {
+                    healthFailed = true
                     requested = nil
                     reports.removeAll(keepingCapacity: true)
                     wakeLocked()
@@ -200,6 +225,7 @@ final class VirtualHIDSink: ControllerOutputSink {
             lock.withLock {
                 // An old operation's error must not discard its replacement's input.
                 if requested?.generation == current {
+                    healthFailed = true
                     requested = nil
                     reports.removeAll(keepingCapacity: true)
                 }
@@ -240,6 +266,9 @@ final class VirtualHIDSink: ControllerOutputSink {
                     }
                     device = created
                     await created.activate(delegate: NullHIDDelegate.shared)
+                    lock.withLock {
+                        if requested?.generation == token, !ended { activeGeneration = token }
+                    }
                     if isCurrent(token) {
                         bridgeLog(.info, "virtualhid", "slot \(index + 1): virtual gamepad activated")
                     }
