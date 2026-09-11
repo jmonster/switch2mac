@@ -184,9 +184,10 @@ final class UDPHub: ControllerOutputSink, @unchecked Sendable {
 
     func controllerDisconnected(slot: Int) {
         // Drop reports that have not reached this sink before ordering the
-        // neutral state on its serial queue.
+        // neutral state on its serial queue. This is a lifecycle barrier: a
+        // replacement report cannot overtake the old controller's neutral.
         stateMailbox.clear(slot: slot)
-        queue.async { [weak self] in
+        queue.sync { [weak self] in
             guard let self else { return }
             self.names.removeValue(forKey: slot)
             guard let s = self.slots[slot] else { return }
