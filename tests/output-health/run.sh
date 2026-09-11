@@ -12,6 +12,8 @@ python3 - <<'PY'
 from pathlib import Path
 app=Path('Sources/FinallyTheControllerWorks/FTCWApp.swift').read_text()
 view=Path('Sources/FinallyTheControllerWorks/UI/OutputStatusView.swift').read_text()
+dashboard=Path('Sources/FinallyTheControllerWorks/UI/DashboardView.swift').read_text()
+assert '.disabled(status.player < 0 || !status.model.hasHDRumble)' in dashboard
 assert 'id: "output-status"' in app
 assert 'Output Status and Capabilities' in app and 'Output Status and Capabilities' in view
 assert '.disabled(controller == nil || !OutputCapabilities(model: model, backend: backend).directRumble)' in view
@@ -44,3 +46,12 @@ for kind in UDP NETPAD; do
     tests/output-health/Probe.swift tests/output-health/SinkTests.swift -o "$work/$kind"
   "$work/$kind"
 done
+
+if [ "$(uname -s)" = Darwin ]; then
+  swiftc -swift-version 6 -warnings-as-errors \
+    Sources/FinallyTheControllerWorks/Protocol/Switch2Protocol.swift \
+    Sources/FinallyTheControllerWorks/Runtime/OutputHealth.swift \
+    Sources/FinallyTheControllerWorks/UI/OutputStatusStore.swift \
+    tests/output-health/StoreTests.swift -o "$work/store"
+  "$work/store"
+fi

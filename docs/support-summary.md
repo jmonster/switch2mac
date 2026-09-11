@@ -23,3 +23,13 @@ same-directory rename preserve the previous destination if writing fails.
 Symbolic-link and non-regular destinations are refused. Save onto a trusted local
 filesystem; this is not secure deletion, encryption, or a guarantee against other
 software running as the same user. Review the preview before sharing it yourself.
+
+Saving pins the chosen parent directory, stages a private regular file there,
+handles short/interrupted writes, synchronizes the file, validates the destination
+without following a symbolic link, and renames relative to that same directory.
+Tests inject partial-write, synchronization and promotion failures and verify
+that previous bytes survive and temporary files are removed. The UI shows an
+explicit success message and cannot be dismissed interactively while saving.
+Atomic replacement means complete-file visibility, not power-loss durability or
+protection against a hostile process running as the same user. A renamed parent
+keeps the saved file in the originally opened directory, not a replacement path.

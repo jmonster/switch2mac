@@ -9,6 +9,7 @@ struct SupportSummaryView: View {
     @State private var preview: Data?
     @State private var saving = false
     @State private var failure: String?
+    @State private var saved = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -20,13 +21,15 @@ struct SupportSummaryView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             if let failure { Text(failure).foregroundStyle(.secondary) }
+            if saved { Text("Saved the previewed summary. Nothing was uploaded.").font(.caption) }
             HStack {
-                Button("Close") { dismiss() }.disabled(saving)
+                Button("Close") { dismiss() }.disabled(saving).keyboardShortcut(.cancelAction)
                 Spacer()
                 Button("Save Previewed JSON…", action: save).disabled(preview == nil || saving)
             }
         }.padding(20).frame(width: 620, height: 540)
         .task { prepare() }
+        .interactiveDismissDisabled(saving)
     }
 
     @MainActor private func prepare() {
@@ -68,12 +71,13 @@ struct SupportSummaryView: View {
         panel.allowedContentTypes = [.json]
         panel.nameFieldStringValue = "switch2mac-support.json"
         saving = true
+        saved = false; failure = nil
         panel.begin { result in
             Task { @MainActor in
                 guard result == .OK, let url = panel.url else { saving = false; return }
                 do {
                     try await Task.detached(priority: .utility) { try SupportSummary.save(data, to: url) }.value
-                    failure = nil
+                    failure = nil; saved = true
                 } catch { failure = "Could not save the summary. Choose a writable, regular-file destination. Nothing was uploaded." }
                 saving = false
             }

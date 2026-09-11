@@ -8,6 +8,7 @@ import Foundation
                 precondition(caps.directRumble == (model != .nsoGameCube))
                 precondition(caps.gameRumble == (model != .nsoGameCube && [.sdl, .browser].contains(backend)))
                 precondition(caps.analogTravel == (model == .nsoGameCube && backend != .retroarch))
+                precondition(caps.independentTriggerClicks == (model == .nsoGameCube && backend == .sdl))
                 precondition(caps.motion == (backend == .sdl))
                 precondition(caps.explanation.contains("experiments"))
             }

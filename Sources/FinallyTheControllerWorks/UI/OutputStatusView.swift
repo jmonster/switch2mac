@@ -1,46 +1,5 @@
 import SwiftUI
 
-/// No polling or per-report publication. A refresh asks each sink on its own
-/// queue; a wedged queue times out rather than freezing the main actor.
-@MainActor
-final class OutputStatusStore: ObservableObject {
-    static let shared = OutputStatusStore()
-    @Published private(set) var reports: [OutputBackend: OutputHealth] = [:]
-    @Published private(set) var pending = Set<OutputBackend>()
-    @Published private(set) var updatedAt: Date?
-    private var providers: [OutputBackend: any OutputHealthProviding] = [:]
-    private var generation: UInt64 = 0
-    private var timeout: Task<Void, Never>?
-
-    func register<T: ControllerOutputSink & OutputHealthProviding>(_ sink: T) -> T {
-        providers[sink.outputBackend] = sink
-        return sink
-    }
-    func refresh() {
-        guard pending.isEmpty else { return }
-        generation &+= 1
-        let token = generation
-        reports.removeAll(); pending = Set(providers.keys); updatedAt = Date()
-        for (backend, provider) in providers {
-            provider.requestHealth { [weak self] report in
-                Task { @MainActor in
-                    guard let self, self.generation == token, self.pending.contains(backend) else { return }
-                    self.reports[backend] = report
-                    self.pending.remove(backend)
-                    if self.pending.isEmpty { self.timeout?.cancel(); self.timeout = nil }
-                }
-            }
-        }
-        guard !pending.isEmpty else { return }
-        timeout = Task { [weak self] in
-            do { try await Task.sleep(for: .seconds(3)) } catch { return }
-            guard let self, self.generation == token else { return }
-            // Missing reports stay visibly unknown, never reuse a stale success.
-            self.pending.removeAll(); self.timeout = nil
-        }
-    }
-}
-
 struct OutputStatusView: View {
     @ObservedObject var engine: BridgeEngine
     @ObservedObject private var store = OutputStatusStore.shared

@@ -69,24 +69,63 @@ enum SupportSummary {
         return data
     }
 
-    /// Saves exactly the previewed bytes. Same-directory staging and rename
-    /// preserve an existing file on failure; a completed export is mode 0600.
-    /// Nothing is uploaded, and no parent directories are created.
-    static func save(_ preview: Data, to destination: URL) throws {
+    /// The real writer's three fallible stages are replaceable so regressions
+    /// can prove preservation after partial writes, fsync and rename errors.
+    struct SaveIO: Sendable {
+        var writeAll: @Sendable (Int32, Data) throws -> Void
+        var synchronize: @Sendable (Int32) throws -> Void
+        var replace: @Sendable (Int32, String, String) throws -> Void
+        static let system = SaveIO(writeAll: { fd, data in
+            try data.withUnsafeBytes { bytes in
+                var offset = 0
+                while offset < bytes.count {
+                    let count = write(fd, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
+                    if count < 0 && errno == EINTR { continue }
+                    guard count > 0 else { throw Failure.writeFailed }
+                    offset += count
+                }
+            }
+        }, synchronize: { fd in
+            while fsync(fd) != 0 {
+                guard errno == EINTR else { throw Failure.writeFailed }
+            }
+        }, replace: { directory, temporary, destination in
+            guard renameat(directory, temporary, directory, destination) == 0 else { throw Failure.writeFailed }
+        })
+    }
+
+    /// Saves exactly the previewed bytes; no parent creation or network I/O.
+    /// Pin the parent directory once: staging, inspection, cleanup and promotion
+    /// stay on the same directory even if its pathname changes during the save.
+    static func save(_ preview: Data, to destination: URL, using io: SaveIO = .system) throws {
         guard preview.count <= maximumBytes else { throw Failure.oversized }
-        guard destination.isFileURL else { throw Failure.invalidDestination }
-        let fm = FileManager.default
-        if let type = try? fm.attributesOfItem(atPath: destination.path)[.type] as? FileAttributeType,
-           type != .typeRegular { throw Failure.invalidDestination }
-        let temporary = destination.deletingLastPathComponent()
-            .appendingPathComponent(".switch2mac-support-" + UUID().uuidString + ".tmp")
-        let fd = open(temporary.path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0o600)
+        guard destination.isFileURL, !destination.path.utf8.contains(0),
+              destination.host == nil || destination.host == "" || destination.host == "localhost"
+        else { throw Failure.invalidDestination }
+        let name = destination.lastPathComponent
+        guard !name.isEmpty, name != ".", name != "..", !name.contains("/") else { throw Failure.invalidDestination }
+        let directory = open(destination.deletingLastPathComponent().path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard directory >= 0 else { throw Failure.writeFailed }
+        defer { close(directory) }
+        func validateDestination() throws {
+            var info = stat()
+            if fstatat(directory, name, &info, AT_SYMLINK_NOFOLLOW) == 0 {
+                guard info.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG) else { throw Failure.invalidDestination }
+            } else if errno != ENOENT { throw Failure.invalidDestination }
+        }
+        try validateDestination()
+        let temporary = ".switch2mac-support-" + UUID().uuidString + ".tmp"
+        var fd = openat(directory, temporary, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0o600)
         guard fd >= 0 else { throw Failure.writeFailed }
-        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
-        defer { try? handle.close(); try? fm.removeItem(at: temporary) }
-        try handle.write(contentsOf: preview)
-        try handle.synchronize()
-        try handle.close()
-        guard rename(temporary.path, destination.path) == 0 else { throw Failure.writeFailed }
+        defer {
+            if fd >= 0 { close(fd) }
+            _ = unlinkat(directory, temporary, 0)
+        }
+        try io.writeAll(fd, preview)
+        try io.synchronize(fd)
+        let closed = close(fd); fd = -1
+        guard closed == 0 else { throw Failure.writeFailed }
+        try validateDestination()
+        try io.replace(directory, temporary, name)
     }
 }

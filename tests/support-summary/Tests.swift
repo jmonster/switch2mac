@@ -43,9 +43,44 @@ import Foundation
         do { try SupportSummary.save(data, to: root.appendingPathComponent("missing/file")); fatalError("created parent") }
         catch {}
         precondition(tryRead(url) == minimal)
+        // Inject failures into the production save path, not a separate model.
+        // Every stage must preserve existing bytes and remove its private stage.
+        for phase in 0..<3 {
+            var io = SupportSummary.SaveIO.system
+            switch phase {
+            case 0: io.writeAll = { fd, bytes in
+                try SupportSummary.SaveIO.system.writeAll(fd, Data(bytes.prefix(17)))
+                throw SupportSummary.Failure.writeFailed
+            }
+            case 1: io.synchronize = { _ in throw SupportSummary.Failure.writeFailed }
+            default: io.replace = { _, _, _ in throw SupportSummary.Failure.writeFailed }
+            }
+            do { try SupportSummary.save(data, to: url, using: io); fatalError("injected failure was ignored") }
+            catch SupportSummary.Failure.writeFailed {}
+            precondition(tryRead(url) == minimal, "failure changed previous summary")
+            let stages = try FileManager.default.contentsOfDirectory(atPath: root.path)
+            precondition(!stages.contains { $0.hasPrefix(".switch2mac-support-") })
+        }
+        let broken = root.appendingPathComponent("broken.json")
+        try FileManager.default.createSymbolicLink(atPath: broken.path, withDestinationPath: root.appendingPathComponent("absent").path)
+        do { try SupportSummary.save(data, to: broken); fatalError("accepted dangling symbolic link") }
+        catch SupportSummary.Failure.invalidDestination {}
+        // Pinning survives parent renames without writing into a replacement
+        // directory that appears at the user's original pathname.
+        let parent = root.appendingPathComponent("parent"), moved = root.appendingPathComponent("moved")
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: false)
+        var movedIO = SupportSummary.SaveIO.system
+        movedIO.synchronize = { fd in
+            try SupportSummary.SaveIO.system.synchronize(fd)
+            try FileManager.default.moveItem(at: parent, to: moved)
+            try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: false)
+        }
+        try SupportSummary.save(data, to: parent.appendingPathComponent("summary.json"), using: movedIO)
+        precondition(tryRead(moved.appendingPathComponent("summary.json")) == data)
+        precondition(!FileManager.default.fileExists(atPath: parent.appendingPathComponent("summary.json").path))
         let files = try FileManager.default.contentsOfDirectory(atPath: root.path)
         precondition(!files.contains { $0.hasPrefix(".switch2mac-support-") })
-        print("PASS allowlisted bounded summary, identifier exclusion, preview fidelity, private atomic replacement and failure preservation")
+        print("PASS injected write/fsync/rename failures, pinned-parent replacement, allowlisted bounded summary, identifier exclusion, preview fidelity, private atomic replacement and failure preservation")
     }
     static func tryRead(_ url: URL) -> Data { try! Data(contentsOf: url) }
 }
