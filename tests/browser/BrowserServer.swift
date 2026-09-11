@@ -28,7 +28,14 @@ enum BrowserServer {
         server.controllerName(slot: 0, name: "test pad")
         var state = ControllerState(); state.buttons = [.a]; state.leftStick = (0.5, 0)
         server.controllerState(slot: 0, state: state)
-        while let command = readLine(), command != "quit" {}
+        while let command = readLine(), command != "quit" {
+            let nextOrigins = command == "replace" ? WebSocketHub.origins(from: String(repeating: "b", count: 32)) : origins
+            server.reconfigure(enabled: command != "disable", allowedOrigins: nextOrigins) {
+                var next = ControllerState(); next.buttons = [.b]
+                server.controllerState(slot: 0, state: next)
+                FileHandle.standardOutput.write(Data("APPLIED\n".utf8))
+            }
+        }
         withExtendedLifetime(server) {}
     }
 }

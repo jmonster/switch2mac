@@ -143,3 +143,29 @@ with server() as proc:
     finally:
         s.close()
     print('PASS native message size bound')
+
+with server() as proc:
+    active, accepted = connect(); assert accepted
+    for _ in range(3): frame(active)
+    send(active, {'t':'rumble','slot':0,'strong':1,'weak':0})
+    assert line(proc) == 'RUMBLE 0 1.0 0.0'
+    proc.stdin.write(b'disable\n'); proc.stdin.flush()
+    assert line(proc) == 'RUMBLE 0 0.0 0.0'
+    assert line(proc) == 'APPLIED'
+    try:
+        opcode, _ = frame(active)
+        assert opcode == 8
+    except (EOFError, ConnectionResetError):
+        pass
+    active.close()
+    proc.stdin.write(b'replace\n'); proc.stdin.flush()
+    events = {line(proc), line(proc)}
+    assert events == {'APPLIED', 'READY'}
+    denied, accepted = connect(); denied.close()
+    assert not accepted, 'Revoked Origin still accepted'
+    active, accepted = connect('chrome-extension://' + 'b' * 32); assert accepted
+    messages = [json.loads(frame(active)[1]) for _ in range(3)]
+    assert [m['t'] for m in messages] == ['hello', 'connected', 'state']
+    assert messages[1]['name'] == 'test pad' and messages[2]['b'] == 4
+    active.close()
+    print('PASS live disable, rumble stop, Origin revocation and reconnect without controller re-pairing')

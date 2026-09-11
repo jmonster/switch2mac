@@ -24,7 +24,7 @@ Controller ──BLE──> menu-bar app ──ws://127.0.0.1:24810──> exten
 2. In a Chromium browser open `chrome://extensions`, enable **Developer mode**,
    click **Load unpacked**, and select `browser/extension`. Copy its 32-letter ID.
 3. Open **Browser Bridge Settings** in the menu-bar app. Enter that extension
-   ID, enable the bridge, and quit/relaunch the app. Empty/invalid IDs do not
+   ID, enable the bridge, and click **Apply Changes**. Empty/invalid IDs do not
    open a listener. Moving the unpacked extension can change its ID.
 4. Open <https://hardwaretester.com/gamepad> and verify every control, then
    test the intended game. Reload the extension after editing its files.
@@ -43,10 +43,26 @@ GameCube HD rumble is intentionally not forwarded; verified preset rumble
 remains unavailable. Other models' effects refresh only for their requested
 lifetime, within the native session's existing 0.5-second intent timeout.
 
+## Live settings
+
+Applying changes closes existing clients, stops their owned rumble, invalidates
+queued input from the previous configuration, and restarts the loopback listener.
+The extension reconnects without re-pairing the controller. Unchanged settings
+do not restart it. Bind failures retry while enabled; disabling cancels retries.
+No input reports are queued or encoded when disabled. Four small lifecycle/name
+records are retained so enabling does not require a controller reconnect.
+
+The settings window validates the entire entry (at most eight IDs), rather than
+silently keeping valid IDs from an invalid list. Enabled state and IDs are saved
+as one `browserBridgeConfiguration` preference dictionary. Legacy preferences
+are read only until this new value exists. Malformed new settings disable access
+rather than restoring an older allowlist. A saved setting is not proof that a
+listener bound, the extension connected, or a game received input.
+
 ## Troubleshooting
 
 Check the dashboard log for `opt-in browser bridge on 127.0.0.1:24810`.
-Verify the toggle and allowed extension ID, then relaunch. A second running
+Verify the toggle and exact extension ID, then click **Apply Changes**. A second running
 copy can occupy the port. The controller must separately appear connected in
 the dashboard before its input can reach the browser.
 
@@ -99,7 +115,7 @@ hub → page   {"t":"hello","v":1}
              {"t":"connected","slot":0,"model":"Pro Controller 2","name":"…"}
              {"t":"name","slot":0,"name":"…"}
              {"t":"state","slot":0,"seq":123,"b":<buttons u32>,
-              "lx":…,"ly":…,"rx":…,"ry":…,"lt":0-255,"rt":0-255}   (+y = up)
+              "lx":…, "ly":…, "rx":…, "ry":…, "lt":0-255,"rt":0-255}   (+y = up)
              {"t":"disconnected","slot":0}
              {"t":"ping"}
 page → hub   {"t":"rumble","slot":0,"strong":0…1,"weak":0…1}
