@@ -1,61 +1,95 @@
 # The SDL bridge (S2UDP)
 
-This folder is how you use Switch 2 controllers **in games and
-emulators today**, while the app's virtual-controller entitlement waits
-on Apple.
+Use this output for a **compatible SDL3 game or emulator**. It is not a
+system-wide controller driver, and a successful bridge connection does not
+establish compatibility with every game. RetroArch and Chromium have
+[separate setup paths](../docs/quick-start.md).
 
-| File | What it is |
-|---|---|
-| `libSDL3.0.dylib` | SDL 3.4.14 with our added **S2UDP joystick backend** — reads the menu-bar app's UDP controller streams and presents them as normal SDL gamepads, rumble included. Apple Silicon (arm64) only. |
-| `sdl3-3.4.14-s2udp.patch` | The complete source patch against SDL `release-3.4.14` (commit `147a8ee`), for provenance and for anyone who wants to rebuild or port it. |
-| `make-gopher64-both.sh` | Assembles **Gopher64-Both.app** from an installed Gopher64 + this dylib (details below). |
+## Choose the corrected library, not the historical binary
 
-## How it works
+The tracked `sdl/libSDL3.0.dylib` is a historical upstream binary. It does
+**not** incorporate later input-edge, USB identity, or Pro Controller source
+repairs. Editing a patch does not rebuild that binary.
 
-The menu-bar app broadcasts each connected controller on
-`udp://127.0.0.1:24800–24803` (one port per player). The patched SDL
-adds a joystick backend that subscribes to those ports:
-
-- State packets (bridge → SDL, 44 bytes LE): magic `S2B1`, sequence,
-  buttons, stick floats, triggers, battery, gyro, accel.
-- Rumble packets (SDL → bridge, 6 bytes): magic `S2R1`, strong, weak —
-  so game rumble reaches the real controller.
-- Controllers hot-plug in SDL as their UDP streams start and stop.
-- Escape hatch: set `SDL_S2UDP_DISABLE=1` to turn the backend off.
-
-## Using it with Gopher64
-
-Gopher64 statically links SDL, but SDL ships an official override hook
-(`SDL3_DYNAMIC_API`) that redirects every SDL call into an external
-dylib. The script wraps that up:
+The current build uses pinned SDL commit
+`147a8ee32dbf9ac02f3794964490687b6bbda1bc` (`release-3.4.14`) plus all four
+patches applied by [build-sdl.sh](build-sdl.sh). To build on macOS, install
+the required C/C++ build tools, CMake, and libusb, then provide an SDL git
+checkout containing that commit:
 
 ```sh
-./sdl/make-gopher64-both.sh
+git clone --branch release-3.4.14 https://github.com/libsdl-org/SDL.git /path/to/SDL
+bash sdl/build-sdl.sh /path/to/SDL
 ```
 
-It copies your installed `/Applications/Gopher64.app` to
-`~/Applications/Gopher64-Both.app`, drops the dylib into the bundle's
-`Frameworks/`, sets `SDL3_DYNAMIC_API` via `LSEnvironment`, and
-re-signs the copy ad-hoc (required: hardened-runtime library validation
-would otherwise reject the outside dylib). Your original Gopher64 app
-is never touched. Launch **Gopher64-Both** from Finder — the
-`LSEnvironment` injection only applies to Finder/`open` launches.
+Run the build command from the switch2mac checkout. Its output is
+`build/sdl/libSDL3.0.dylib`; it leaves the historical tracked file untouched
+and prints the new library's SHA-256. Alternatively, a successful **SDL input
+regressions** workflow provides a `corrected-sdl-arm64` artifact. Check the
+workflow's tested source commit and all job results before selecting an
+artifact. Neither path implies physical-controller or real-game acceptance.
 
-## Using it with any other SDL3 app
+## Gopher64: keep the original app
+
+The helper expects `/Applications/Gopher64.app` and defaults to the newly
+built library, not the historical one:
 
 ```sh
-SDL3_DYNAMIC_API=/path/to/libSDL3.0.dylib ./the-game
+bash sdl/make-gopher64-both.sh
 ```
 
-Works for any program whose statically-linked SDL3 is at or below the
-3.4.14 ABI. For bundled `.app`s, replicate what the script does
-(Frameworks/ + LSEnvironment + ad-hoc re-sign).
+It creates `~/Applications/Gopher64-Both.app` with the library bundled inside
+and an `SDL3_DYNAMIC_API` override. `SDL3_LIBRARY=/absolute/path/to/libSDL3.0.dylib`
+can explicitly select another compatible library. The helper refuses to
+continue when the selected library does not exist.
 
-## License
+The copy is **ad-hoc re-signed without hardened runtime/library validation**;
+this changes its security properties and does not preserve notarization.
+The original `/Applications/Gopher64.app` is not modified. The helper replaces
+an existing `~/Applications/Gopher64-Both.app`, so preserve any wanted changes
+to that generated copy before rebuilding it. Launch the copy using Finder or
+`open`, not a bare executable, so its `LSEnvironment` setting is applied.
 
-Based on **SDL 3.4.14** (`release-3.4.14`, commit `147a8ee`) by Sam
-Lantinga and the SDL contributors, under the
+Check controls in the actual emulator. To stop using the integration, quit
+the generated copy and launch the original app. Delete only the generated
+copy when removing this integration; do not replace libraries in your original
+game or disable system-wide security policy.
+
+## Other SDL3 applications
+
+For an application that supports SDL's dynamic API override and can load a
+compatible library of the correct architecture:
+
+```sh
+SDL3_DYNAMIC_API=/absolute/path/to/build/sdl/libSDL3.0.dylib ./the-game
+```
+
+This is not a guarantee for arbitrary SDL3 apps, SDL2 games, anti-cheat
+software, or signed applications that reject external libraries. Validate the
+actual application's SDL version, architecture, loading policy, and controls.
+Do not re-sign or modify an original game just to experiment. For an application
+that already loads this backend, `SDL_S2UDP_DISABLE=1` disables S2UDP; remove
+any library override to return to the application's original SDL.
+
+## Protocol and acceptance
+
+The menu-bar app serves logical players on loopback UDP ports 24800–24803.
+The patched SDL backend subscribes and exposes SDL joystick/gamepad events.
+`S2B1` state packets contain 44 bytes: sequence, buttons, sticks, triggers,
+battery, gyro, and accelerometer. `S2R1` rumble requests contain six bytes.
+Controller appearance and disappearance follow the input stream.
+
+The corrected input-edge handling is documented in [INPUT-DELIVERY.md](INPUT-DELIVERY.md),
+wired-device selection in [USB-IDENTITY.md](USB-IDENTITY.md), and model-specific
+limits in the [Pro Controller guide](../docs/pro-controller-support.md).
+Synthetic regression results do not establish gameplay latency, netplay,
+firmware coverage, or every controller's rumble behavior.
+
+## License and provenance
+
+Based on SDL 3.4.14 by Sam Lantinga and the SDL contributors, under the
 [zlib license](https://github.com/libsdl-org/SDL/blob/main/LICENSE.txt).
-This build is **modified** — it adds the S2UDP joystick backend and
-macOS wired-USB handling for Switch 2 pads — and is **not an official
-SDL build**. The full modification is `sdl3-3.4.14-s2udp.patch`.
+This is a modified SDL build, not an official SDL release. The original
+`sdl3-3.4.14-s2udp.patch` and the three follow-up patches remain separately
+tracked; [build-sdl.sh](build-sdl.sh) is the authoritative application order.
+Application-wide licensing is a separate unresolved upstream question.
