@@ -8,7 +8,6 @@
 import SwiftUI
 import ServiceManagement
 
-@main
 struct FTCWApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
