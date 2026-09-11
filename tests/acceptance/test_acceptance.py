@@ -46,7 +46,7 @@ class Tests(unittest.TestCase):
             with self.assertRaises(a.Invalid): a.compare(fixture(), candidate)
 
     def test_numeric_bounds_and_units(self):
-        for value in (float('nan'), float('inf'), -1, True, '10', 1_000_001):
+        for value in (float('nan'), float('inf'), -1, True, '10', 1_000_001, 10**1000):
             r = fixture(); r['trials'][0]['host_watts'] = value
             with self.assertRaises(a.Invalid): a.validate(r)
         for key in ('model', 'revision', 'architecture', 'output'):
@@ -64,6 +64,10 @@ class Tests(unittest.TestCase):
             for malformed in ('{"schema":1,"schema":2}', '{"value":NaN}'):
                 path.write_text(malformed)
                 with self.assertRaises(a.Invalid): a.load(path)
+            path.write_text('['*2000 + ']'*2000)
+            result = subprocess.run([sys.executable, 'scripts/check-acceptance.py', 'check', str(path)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertNotIn('Traceback', result.stderr)
             path.write_bytes(b' '*(a.MAX_BYTES+1))
             with self.assertRaises(a.Invalid): a.load(path)
             result = subprocess.run([sys.executable, 'scripts/check-acceptance.py', 'check', str(path)], capture_output=True, text=True)

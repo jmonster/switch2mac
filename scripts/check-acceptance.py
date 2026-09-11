@@ -71,7 +71,7 @@ def validate(record):
         require(isinstance(trial, dict) and set(trial) == {'duration_seconds', *METRICS}, 'Unknown measurement fields/units')
         for key, value in trial.items():
             require((key in METRICS and value is None) or
-                    (type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 1_000_000), 'Invalid finite measurement')
+                    (type(value) in (int, float) and 0 <= value <= 1_000_000 and math.isfinite(value)), 'Invalid finite measurement')
         require(trial['duration_seconds'] > 0, 'Trial duration must be positive')
     status = 'reported-failure' if failures else ('incomplete' if missing else 'reported-complete')
     return {'status': status, 'missing': missing, 'failed': failures, 'trials': len(trials),
@@ -128,7 +128,7 @@ def main():
         result = template() if args.command == 'template' else (
             validate(load(args.record)) if args.command == 'check' else compare(load(args.baseline), load(args.candidate)))
         print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
-    except (OSError, ValueError, TypeError) as error:
+    except (OSError, ValueError, TypeError, RecursionError) as error:
         parser.exit(2, 'Invalid acceptance evidence: ' + str(error) + '\n')
     return 0
 
