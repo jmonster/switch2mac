@@ -48,7 +48,7 @@ enum NetworkTests {
     static func aValues(_ packets: [Data]) -> [UInt16] { packets.filter { Switch2.u32($0, 4) == 1 && Switch2.u32($0, 12) == 8 }.map { Switch2.u16($0, 16) } }
     static func main() {
         let selected = CommandLine.arguments.last!
-        for name in ["wire", "tap", "refresh-release", "destination", "disable", "overflow", "mailbox-overload", "send-failure", "finite-axis", "axis-endpoints", "cancel-destination"] {
+        for name in ["wire", "tap", "refresh-release", "destination", "disable", "overflow", "mailbox-overload", "send-failure", "finite-axis", "axis-endpoints", "cancel-destination", "axis-fairness", "stale-edge"] {
             if selected != "all" && selected != name { continue }
             AppConfig.networkGamepadEnabled = true; AppConfig.networkGamepadBasePort = 55400
             let a = receiver(55400), b = receiver(55410), sink = NetworkGamepadSink()
@@ -101,6 +101,27 @@ enum NetworkTests {
             case "axis-endpoints":
                 precondition(NetworkGamepadSink.axis(1) == 32767); precondition(NetworkGamepadSink.axis(-1) == -32767)
                 precondition(NetworkGamepadSink.axis(2) == 32767); precondition(NetworkGamepadSink.axis(-2) == -32767)
+            case "axis-fairness":
+                for i in 0..<12 {
+                    var s = ControllerState()
+                    s.leftStick = (i % 2 == 0 ? 0.8 : -0.8, 0)
+                    s.rightStick = (0.7, -0.7)
+                    sink.controllerState(slot: 0, state: s)
+                    sink.queue.sync {}
+                    tick(sink)
+                }
+                let out = packets(a)
+                let right = out.filter { Switch2.u32($0, 4) == 5 && Switch2.u32($0, 8) == 1 }
+                precondition(!right.isEmpty, "continuously dirty left stick starved right-stick delivery")
+            case "stale-edge":
+                sink.controllerState(slot: 0, state: state(true)); sink.queue.sync {}
+                sink.queue.sync {
+                    precondition(!sink.players[0].edges.isEmpty)
+                    sink.players[0].edges[0].enqueuedAt = ProcessInfo.processInfo.systemUptime - 1
+                }
+                tick(sink)
+                precondition(sink.queue.sync { sink.players[0].failed })
+                precondition(sink.queue.sync { logged.contains { $0.contains("edge queue exceeded") } })
             default: fatalError()
             }
             print("PASS \(name)")

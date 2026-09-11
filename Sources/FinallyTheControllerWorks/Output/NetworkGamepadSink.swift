@@ -10,6 +10,7 @@ final class NetworkGamepadSink: ControllerOutputSink, @unchecked Sendable {
     private static let refreshInterval: TimeInterval = 2.0
     private static let analogQuantum: Int32 = 512
     private static let maxEdges = 256
+    private static let maxEdgeAge: TimeInterval = 0.5
     private static let buttonMap: [(Switch2.Buttons, Int)] = [
         (.b, 0), (.y, 1), (.minus, 2), (.plus, 3),
         (.dpadUp, 4), (.dpadDown, 5), (.dpadLeft, 6), (.dpadRight, 7),
@@ -23,7 +24,9 @@ final class NetworkGamepadSink: ControllerOutputSink, @unchecked Sendable {
         var sentButtons: UInt16 = 0
         var wantAxes = [Int16](repeating: 0, count: 4)
         var sentAxes = [Int16](repeating: 0, count: 4)
-        var edges: [(id: Int, state: UInt16)] = []
+        var edges: [(id: Int, state: UInt16, enqueuedAt: TimeInterval)] = []
+        var axisCursor = 0
+        var preferRefresh = false
         var connected = false
         var failed = false
         var port: UInt16?
@@ -35,7 +38,8 @@ final class NetworkGamepadSink: ControllerOutputSink, @unchecked Sendable {
 
         func neutralize() {
             wantButtons = 0; wantAxes = [0, 0, 0, 0]
-            edges = (0..<16).filter { sentButtons & (1 << $0) != 0 }.map { ($0, 0) }
+            let now = ProcessInfo.processInfo.systemUptime
+            edges = (0..<16).filter { sentButtons & (1 << $0) != 0 }.map { ($0, 0, now) }
             switchIndex = nil
             refreshIndex = 0
             neutralPasses = 2 // best-effort repeat; UDP acceptance is not receipt
@@ -64,7 +68,7 @@ final class NetworkGamepadSink: ControllerOutputSink, @unchecked Sendable {
 
     func controllerConnected(slot: Int, model: Switch2.Model) {
         stateMailbox.clear(slot: slot)
-        queue.async { [weak self] in
+        queue.sync { [weak self] in
             guard let self, self.players.indices.contains(slot) else { return }
             self.players[slot].connected = true
         }
@@ -72,7 +76,7 @@ final class NetworkGamepadSink: ControllerOutputSink, @unchecked Sendable {
     func controllerName(slot: Int, name: String) {}
     func controllerDisconnected(slot: Int) {
         stateMailbox.clear(slot: slot)
-        queue.async { [weak self] in
+        queue.sync { [weak self] in
             guard let self, self.players.indices.contains(slot) else { return }
             let p = self.players[slot]
             p.connected = false; p.neutralize()
@@ -114,7 +118,8 @@ final class NetworkGamepadSink: ControllerOutputSink, @unchecked Sendable {
         if state.leftTrigger >= 128 { buttons |= 1 << 12 }
         if state.rightTrigger >= 128 { buttons |= 1 << 13 }
         let changed = p.wantButtons ^ buttons
-        let edges = (0..<16).filter { changed & (1 << $0) != 0 }.map { ($0, (buttons >> $0) & 1) }
+        let now = ProcessInfo.processInfo.systemUptime
+        let edges = (0..<16).filter { changed & (1 << $0) != 0 }.map { ($0, (buttons >> $0) & 1, now) }
         if p.switchIndex == nil {
             guard p.edges.count + edges.count <= Self.maxEdges else {
                 p.failed = true; p.neutralize(); ensurePumping()
@@ -132,8 +137,6 @@ final class NetworkGamepadSink: ControllerOutputSink, @unchecked Sendable {
     private static func axis(_ value: Double) -> Int16 {
         guard value.isFinite else { return 0 }
         let clamped = max(-1, min(1, value))
-        // Preserve endpoints: quantization is traffic shaping, not a reason to
-        // make full stick travel unreachable in the consumer.
         if clamped >= 1 { return 32767 }
         if clamped <= -1 { return -32767 }
         let raw = Int32((clamped * 32767).rounded())
@@ -167,16 +170,12 @@ final class NetworkGamepadSink: ControllerOutputSink, @unchecked Sendable {
             busy = busy || p.pending || refreshing || (target != nil && target != port)
             guard now >= p.nextSendAt else { continue }
 
-            // Reverting a port edit can leave a partially neutralized receiver.
-            // Reassert every button, then resume ordered edges for later reports.
             if p.switchIndex != nil && target == port {
                 p.switchIndex = nil
-                p.edges = (0..<16).map { ($0, (p.wantButtons >> $0) & 1) }
+                p.edges = (0..<16).map { ($0, (p.wantButtons >> $0) & 1, now) }
                 p.refreshIndex = 0
             }
 
-            // Configuration changes retire the old destination before any new
-            // state is sent. Reports during this reset establish the new state.
             if let target, target != port {
                 if p.switchIndex == nil { p.switchIndex = 0; p.edges.removeAll() }
                 let index = p.switchIndex!
@@ -185,25 +184,48 @@ final class NetworkGamepadSink: ControllerOutputSink, @unchecked Sendable {
                 if p.switchIndex == 20 {
                     p.port = target; p.switchIndex = nil
                     p.sentButtons = 0; p.sentAxes = [0, 0, 0, 0]
-                    p.edges = (0..<16).filter { p.wantButtons & (1 << $0) != 0 }.map { ($0, 1) }
+                    p.edges = (0..<16).filter { p.wantButtons & (1 << $0) != 0 }.map { ($0, 1, now) }
                     p.refreshIndex = 0
                 }
                 p.nextSendAt = now + Self.sendInterval
                 continue
             }
             if let edge = p.edges.first {
+                guard now - edge.enqueuedAt <= Self.maxEdgeAge else {
+                    p.failed = true; p.neutralize(); ensurePumping()
+                    bridgeLog(.error, "netpad",
+                              "player \(slot + 1) edge queue exceeded \(Int(Self.maxEdgeAge * 1000)) ms; neutralizing. Disable/re-enable network output to retry.")
+                    continue
+                }
                 guard send(Self.message(slot: slot, device: 1, index: 0, id: Int32(edge.id), state: edge.state), port: port, now: now) else { continue }
                 p.edges.removeFirst()
                 let mask = UInt16(1) << edge.id
                 if edge.state == 0 { p.sentButtons &= ~mask } else { p.sentButtons |= mask }
-            } else if let axis = (0..<4).first(where: { p.wantAxes[$0] != p.sentAxes[$0] }) {
-                guard send(Self.message(slot: slot, device: 5, index: Int32(axis / 2), id: Int32(axis % 2), state: UInt16(bitPattern: p.wantAxes[axis])), port: port, now: now) else { continue }
-                p.sentAxes[axis] = p.wantAxes[axis]
-            } else if p.refreshIndex < 20 {
-                guard send(Self.refreshMessage(slot, p.refreshIndex, buttons: p.wantButtons, axes: p.wantAxes), port: port, now: now) else { continue }
-                p.refreshIndex += 1
-                if p.refreshIndex == 20 && p.neutralPasses > 0 { p.neutralPasses -= 1 }
-            } else { continue }
+            } else {
+                let dirtyAxis = (0..<4).map { (p.axisCursor + $0) % 4 }
+                    .first(where: { p.wantAxes[$0] != p.sentAxes[$0] })
+                let refreshPending = p.refreshIndex < 20
+                if refreshPending && (dirtyAxis == nil || p.preferRefresh) {
+                    let index = p.refreshIndex
+                    guard send(Self.refreshMessage(slot, index, buttons: p.wantButtons, axes: p.wantAxes), port: port, now: now) else { continue }
+                    if index < 16 {
+                        let mask = UInt16(1) << index
+                        if p.wantButtons & mask == 0 { p.sentButtons &= ~mask } else { p.sentButtons |= mask }
+                    } else {
+                        let axis = index - 16
+                        p.sentAxes[axis] = p.wantAxes[axis]
+                        p.axisCursor = (axis + 1) % 4
+                    }
+                    p.refreshIndex += 1
+                    p.preferRefresh = false
+                    if p.refreshIndex == 20 && p.neutralPasses > 0 { p.neutralPasses -= 1 }
+                } else if let axis = dirtyAxis {
+                    guard send(Self.message(slot: slot, device: 5, index: Int32(axis / 2), id: Int32(axis % 2), state: UInt16(bitPattern: p.wantAxes[axis])), port: port, now: now) else { continue }
+                    p.sentAxes[axis] = p.wantAxes[axis]
+                    p.axisCursor = (axis + 1) % 4
+                    p.preferRefresh = refreshPending
+                } else { continue }
+            }
             p.nextSendAt = now + Self.sendInterval
         }
         if !busy { timer?.cancel(); timer = nil }
@@ -224,8 +246,6 @@ final class NetworkGamepadSink: ControllerOutputSink, @unchecked Sendable {
         withUnsafeBytes(of: state.littleEndian) { d.append(contentsOf: $0) }
         d.append(contentsOf: [0, 0]); return d
     }
-    // sendto acceptance is NOT acknowledgement by RetroArch. Full refreshes
-    // include released/zero values so a lost release can converge later.
     private func send(_ bytes: [UInt8], port: UInt16, now: TimeInterval) -> Bool {
         var dest = sockaddr_in()
         dest.sin_family = sa_family_t(AF_INET)
