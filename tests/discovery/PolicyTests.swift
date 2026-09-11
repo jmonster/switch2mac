@@ -1,12 +1,14 @@
 import Foundation
 import Synchronization
+final class ChangeCounter: Sendable { let value = Mutex(0) }
+
 @main enum PolicyTests {
     static func main() {
         let suite = "discovery-policy-" + UUID().uuidString
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
-        let queue = DispatchQueue(label: "policy-test"), changes = Mutex(0)
-        let policy = DiscoveryPolicy(queue: queue, defaults: defaults) { changes.withLock { $0 += 1 } }
+        let queue = DispatchQueue(label: "policy-test"), changes = ChangeCounter()
+        let policy = DiscoveryPolicy(queue: queue, defaults: defaults) { changes.value.withLock { $0 += 1 } }
         queue.sync {
             let a = UUID(), b = UUID()
             precondition(policy.shouldScan(readyIDs: [a], now: 0))
@@ -25,9 +27,9 @@ import Synchronization
             let stale = policy.work!
             policy.openWindow(now: 63)
             stale.perform()
-            precondition(changes.withLock { $0 } == 0 && policy.windowIsOpen(now: 70))
+            precondition(changes.value.withLock { $0 } == 0 && policy.windowIsOpen(now: 70))
             policy.work!.perform()
-            precondition(changes.withLock { $0 } == 1 && policy.work == nil)
+            precondition(changes.value.withLock { $0 } == 1 && policy.work == nil)
             precondition(!policy.windowIsOpen(now: 70))
             policy.useConnected([a])
             precondition(!policy.shouldScan(readyIDs: [a], now: 100))
