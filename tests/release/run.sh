@@ -1,7 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")/../.."
-PYTHONDONTWRITEBYTECODE=1 python3 tests/release/test_release.py
+# Every Python child, including the macOS-only import below, must leave
+# the checkout clean for build provenance and development packaging.
+export PYTHONDONTWRITEBYTECODE=1
+python3 tests/release/test_release.py
 if [ "$(uname -s)" = Darwin ]; then
   work=$(mktemp -d)
   trap 'rm -rf "$work"' EXIT
