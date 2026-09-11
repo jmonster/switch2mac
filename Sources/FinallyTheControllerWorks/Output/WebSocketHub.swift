@@ -4,11 +4,12 @@
 // not authenticate native processes already running as the local user.
 import Foundation
 import Network
+import Synchronization
 
 final class WebSocketHub: ControllerOutputSink, @unchecked Sendable {
     static let port: UInt16 = 24810
-    static let enabledKey = "browserBridgeEnabled"
-    static let extensionIDsKey = "browserBridgeExtensionIDs"
+    static let enabledKey = BrowserBridgeConfiguration.legacyEnabledKey
+    static let extensionIDsKey = BrowserBridgeConfiguration.legacyIDsKey
     private static let maxMessageBytes = 65536
     private static let maxClients = 8
     var onRumble: ((Int, Double, Double) -> Void)?
@@ -23,10 +24,22 @@ final class WebSocketHub: ControllerOutputSink, @unchecked Sendable {
         init(_ connection: NWConnection) { self.connection = connection }
     }
     private let queue = DispatchQueue(label: "com.petersharma.ftcw.wshub")
-    private let stateMailbox = BoundedStateMailbox<ControllerState>(
+    private struct Input: Sendable {
+        let generation: UInt64
+        let state: ControllerState
+    }
+    private struct Admission {
+        var enabled = false
+        var generation: UInt64 = 0
+    }
+    private let admission = Mutex(Admission())
+    private let stateMailbox = BoundedStateMailbox<Input>(
         perSlotCapacity: 64, maxAge: 0.25, batchLimit: 32)
-    private let enabled: Bool
-    private let allowedOrigins: Set<String>
+    private var enabled = false // queue confined
+    private var allowedOrigins = Set<String>()
+    private var generation: UInt64 = 0
+    private var retry: DispatchWorkItem?
+    private var settingsObserver: NSObjectProtocol?
     private var listener: NWListener?
     private var clients: [ObjectIdentifier: Client] = [:]
     private var connected: [Int: (model: String, name: String, rumble: Bool)] = [:]
@@ -37,25 +50,81 @@ final class WebSocketHub: ControllerOutputSink, @unchecked Sendable {
     private var pingTimer: DispatchSourceTimer?
 
     static func origins(from ids: String) -> Set<String> {
-        Set(ids.split(whereSeparator: { $0.isWhitespace || $0 == "," }).compactMap { id in
-            guard id.utf8.count == 32, id.utf8.allSatisfy({ (97...112).contains($0) }) else { return nil }
-            return "chrome-extension://\(id)"
-        })
+        (try? BrowserBridgeConfiguration(enabled: false, extensionIDs: ids).origins) ?? []
     }
 
-    init(enabled: Bool = UserDefaults.standard.bool(forKey: WebSocketHub.enabledKey),
-         allowedOrigins: Set<String> = WebSocketHub.origins(from:
-            UserDefaults.standard.string(forKey: WebSocketHub.extensionIDsKey) ?? "")) {
-        self.allowedOrigins = allowedOrigins
-        self.enabled = enabled && !allowedOrigins.isEmpty
-        guard self.enabled else { return }
-        queue.async { [weak self] in self?.startListener() }
+    convenience init() {
+        let config = BrowserBridgeConfiguration.load()
+        self.init(enabled: config.enabled, allowedOrigins: config.origins)
+        settingsObserver = NotificationCenter.default.addObserver(
+            forName: UserDefaults.didChangeNotification, object: nil, queue: nil) { [weak self] _ in
+                let config = BrowserBridgeConfiguration.load()
+                self?.reconfigure(enabled: config.enabled, allowedOrigins: config.origins)
+            }
+        // Close the read/observer-registration race without restarting an
+        // unchanged listener; settings are read again on its own queue.
+        queue.async { [weak self] in
+            let config = BrowserBridgeConfiguration.load()
+            self?.applyConfiguration(enabled: config.enabled, origins: config.origins)
+        }
+    }
+
+    init(enabled requested: Bool, allowedOrigins: Set<String>) {
+        let prefix = "chrome-extension://"
+        let ids = allowedOrigins.map { $0.hasPrefix(prefix) ? String($0.dropFirst(prefix.count)) : "!" }
+        let origins = Self.origins(from: ids.joined(separator: " "))
+        self.allowedOrigins = origins
+        enabled = requested && !origins.isEmpty && origins == allowedOrigins
+        admission.withLock { $0.enabled = enabled }
+        if enabled { queue.async { [weak self] in self?.startListener() } }
     }
 
     deinit {
-        pingTimer?.cancel()
-        listener?.cancel()
+        if let settingsObserver { NotificationCenter.default.removeObserver(settingsObserver) }
+        retry?.cancel(); pingTimer?.cancel(); listener?.cancel()
         for client in clients.values { client.connection.cancel() }
+    }
+
+    /// Completion runs on the sink queue after teardown/configuration, not
+    /// after a new listener becomes ready or a browser reconnects.
+    func reconfigure(enabled: Bool, allowedOrigins: Set<String>,
+                     completion: (@Sendable () -> Void)? = nil) {
+        queue.async { [weak self] in
+            self?.applyConfiguration(enabled: enabled, origins: allowedOrigins)
+            completion?()
+        }
+    }
+
+    private func applyConfiguration(enabled requested: Bool, origins requestedOrigins: Set<String>) {
+        dispatchPrecondition(condition: .onQueue(queue))
+        let prefix = "chrome-extension://"
+        let ids = requestedOrigins.map { $0.hasPrefix(prefix) ? String($0.dropFirst(prefix.count)) : "!" }
+        let origins = Self.origins(from: ids.joined(separator: " "))
+        let enabled = requested && !origins.isEmpty && origins == requestedOrigins
+        guard self.enabled != enabled || allowedOrigins != origins else { return }
+        generation &+= 1
+        admission.withLock { $0.enabled = false; $0.generation = generation }
+        stateMailbox.clearAll()
+        retry?.cancel(); retry = nil
+        listener?.cancel(); listener = nil
+        for id in Array(clients.keys) { remove(id) } // stops owned rumble
+        pingTimer?.cancel(); pingTimer = nil
+        lastState.removeAll(); seq.removeAll()
+        self.enabled = enabled; allowedOrigins = origins
+        admission.withLock { $0.enabled = enabled }
+        if enabled { startListener() }
+    }
+
+    private func scheduleRetry() {
+        guard enabled, retry == nil else { return }
+        let expected = generation
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.enabled, self.generation == expected else { return }
+            self.retry = nil
+            self.startListener()
+        }
+        retry = work
+        queue.asyncAfter(deadline: .now() + 5, execute: work)
     }
 
     private func startListener() {
@@ -83,7 +152,7 @@ final class WebSocketHub: ControllerOutputSink, @unchecked Sendable {
                 case .failed(let error):
                     bridgeLog(.warning, "wshub", "listener failed: \(error)")
                     owner.cancel(); self.listener = nil
-                    self.queue.asyncAfter(deadline: .now() + 5) { [weak self] in self?.startListener() }
+                    self.scheduleRetry()
                 default: break
                 }
             }
@@ -94,6 +163,7 @@ final class WebSocketHub: ControllerOutputSink, @unchecked Sendable {
             owner.start(queue: queue)
         } catch {
             bridgeLog(.warning, "wshub", "cannot create listener: \(error)")
+            scheduleRetry()
         }
     }
 
@@ -106,7 +176,7 @@ final class WebSocketHub: ControllerOutputSink, @unchecked Sendable {
     }
 
     private func accept(_ connection: NWConnection) {
-        guard clients.count < Self.maxClients else { connection.cancel(); return }
+        guard enabled, clients.count < Self.maxClients else { connection.cancel(); return }
         dispatchPrecondition(condition: .onQueue(queue))
         let id = ObjectIdentifier(connection)
         let client = Client(connection)
@@ -173,7 +243,8 @@ final class WebSocketHub: ControllerOutputSink, @unchecked Sendable {
 
     private func handle(_ data: Data, from id: ObjectIdentifier) {
         dispatchPrecondition(condition: .onQueue(queue))
-        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        guard enabled, clients[id]?.ready == true,
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let type = object["t"] as? String else { return }
         if type == "rumble" {
             guard let slot = object["slot"] as? Int, (0..<4).contains(slot), connected[slot]?.rumble == true,
@@ -223,60 +294,66 @@ final class WebSocketHub: ControllerOutputSink, @unchecked Sendable {
     }
 
     func controllerConnected(slot: Int, model: Switch2.Model) {
-        guard enabled, (0..<4).contains(slot) else { return }
+        guard (0..<4).contains(slot) else { return }
         stateMailbox.clear(slot: slot)
         queue.async { [weak self] in
             guard let self, (0..<4).contains(slot) else { return }
             self.connected[slot] = (model.displayName, model.displayName, model.hasHDRumble)
             self.lastState.removeValue(forKey: slot)
             self.rumbleOwners.removeValue(forKey: slot)
-            self.seq[slot] = 0
-            self.broadcast(Self.connectionMessage(slot, model.displayName, model.displayName))
+            self.seq.removeValue(forKey: slot)
+            if self.enabled { self.broadcast(Self.connectionMessage(slot, model.displayName, model.displayName)) }
         }
     }
     func controllerDisconnected(slot: Int) {
-        guard enabled, (0..<4).contains(slot) else { return }
+        guard (0..<4).contains(slot) else { return }
         stateMailbox.clear(slot: slot)
         queue.async { [weak self] in
             guard let self, self.connected.removeValue(forKey: slot) != nil else { return }
             self.lastState.removeValue(forKey: slot)
+            self.seq.removeValue(forKey: slot)
             if self.rumbleOwners.removeValue(forKey: slot) != nil {
                 self.onRumble?(slot, 0, 0)
             }
-            self.broadcast(#"{"t":"disconnected","slot":\#(slot)}"#)
+            if self.enabled { self.broadcast(#"{"t":"disconnected","slot":\#(slot)}"#) }
         }
     }
     func controllerName(slot: Int, name: String) {
-        guard enabled, (0..<4).contains(slot) else { return }
+        guard (0..<4).contains(slot) else { return }
+        let name = String(name.prefix(256))
         queue.async { [weak self] in
             guard let self, let info = self.connected[slot], info.name != name else { return }
             self.connected[slot] = (info.model, name, info.rumble)
-            if let text = Self.json(["t":"name", "slot":slot, "name":name]) { self.broadcast(text) }
+            if self.enabled, let text = Self.json(["t":"name", "slot":slot, "name":name]) { self.broadcast(text) }
         }
     }
     func controllerState(slot: Int, state: ControllerState) {
-        guard enabled, (0..<4).contains(slot) else { return }
-        if stateMailbox.submit(slot: slot, state: state) {
+        guard (0..<4).contains(slot) else { return }
+        let epoch = admission.withLock { $0.enabled ? $0.generation : nil }
+        guard let epoch else { return }
+        if stateMailbox.submit(slot: slot, state: Input(generation: epoch, state: state)) {
             queue.async { [weak self] in self?.drainStates() }
         }
     }
 
     private func drainStates() {
         let batch = stateMailbox.take()
-        for recovery in batch.recoveries {
+        for recovery in batch.recoveries where enabled && recovery.latest.generation == generation {
             publishState(slot: recovery.slot, state: ControllerState())
-            publishState(slot: recovery.slot, state: recovery.latest)
+            publishState(slot: recovery.slot, state: recovery.latest.state)
             bridgeLog(.warning, "wshub",
                       "slot \(recovery.slot + 1): output backlog recovered with neutral state")
         }
-        for item in batch.items { publishState(slot: item.slot, state: item.state) }
+        for item in batch.items where enabled && item.state.generation == generation {
+            publishState(slot: item.slot, state: item.state.state)
+        }
         if stateMailbox.completeDrain() {
             queue.async { [weak self] in self?.drainStates() }
         }
     }
 
     private func publishState(slot: Int, state: ControllerState) {
-        guard connected[slot] != nil else { return }
+        guard enabled, connected[slot] != nil else { return }
         let next = (seq[slot] ?? 0) &+ 1
         seq[slot] = next
         lastState[slot] = (next, state)

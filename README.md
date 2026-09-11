@@ -62,7 +62,7 @@ The About window identifies the source revision and locally modified builds.
   digital L2/R2. Enable the unauthenticated receiver only on a trusted network.
 - **Chromium web games:** the [browser bridge](browser/README.md) is disabled
   by default. Load the supplied extension, allow its exact ID in Browser Bridge
-  Settings, then relaunch the app. No Safari/Firefox package is provided.
+  Settings, then click Apply Changes. No Safari/Firefox package is provided.
 
 CoreHID virtual-controller output requires Apple's restricted entitlement;
 this fork has not established approval or universal game compatibility.
