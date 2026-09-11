@@ -48,3 +48,22 @@ frames. It does not prove that any controller firmware accepts reduced masks,
 that every omitted sensor powers down, or that current consumption decreases.
 Promoting automatic demand negotiation requires physical acceptance and a
 consumer-capability signal; the legacy SDL wire format does not supply one.
+
+## Inspect the actual process selection before connecting
+
+Append `--sensor-profile` to the executable command above to print the effective
+profile, all four model masks, requested sensors and source revision as JSON.
+This mode exits before application construction, Bluetooth, output listeners or
+permission prompts. It is safe to use without a controller. Extra arguments are
+rejected. Unknown/missing acknowledgment still reports compatibility. Normal
+launches with a reduced profile emit one warning in the application log.
+
+The packaged runtime CI executes this command with all four profiles on macOS
+15/26, Intel/Apple silicon. It verifies the actual masks used by the handshake;
+its output explicitly says hardware qualification and energy measurements were
+**not run**. This completes the opt-in software tool, not physical qualification.
+
+## Record and validate hardware and energy acceptance
+
+See [acceptance records](acceptance-records.md) for an executable template,
+validation and paired-comparison workflow. No measured records ship in this PR.

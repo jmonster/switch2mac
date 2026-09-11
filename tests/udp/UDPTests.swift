@@ -48,8 +48,6 @@ enum UDPTests {
         return Data(bytes.prefix(n))
     }
     static func sendAndDrain(_ hub: UDPHub, slot: Int, fd: Int32, bytes: [UInt8]) {
-        // Hold the hub's serial queue so its dispatch source cannot consume
-        // the packet between poll() and the explicit production drain call.
         hub.queue.sync {
             sendBytes(fd, bytes)
             var ready = pollfd(fd: hub.slots[slot]!.fd, events: Int16(POLLIN), revents: 0)
@@ -80,8 +78,6 @@ enum UDPTests {
             let descriptors = hub!.queue.sync { hub!.slots.values.map(\.fd) }
             precondition(descriptors.count == 4)
             hub = nil
-            // Dispatch source cancellation is asynchronous. Wait for the
-            // actual production cancel handlers, not a replacement test hook.
             var closed = false
             for _ in 0..<200 {
                 closed = retired == nil && descriptors.allSatisfy { fd in
@@ -105,7 +101,6 @@ enum UDPTests {
         hub.queue.sync {}
         close(first); close(second)
         hub.queue.sync {
-            // Exercise the production retry operation without sleeping 5 s.
             hub.openMissingSockets()
             precondition(hub.slots.count == 4)
             precondition(hub.slots[0]!.name == "waiting controller", "Retry lost the live controller name")
@@ -124,7 +119,6 @@ enum UDPTests {
 
     static func main() {
         let selected = CommandLine.arguments.last!
-        // These own all four ports and run in their own process invocation.
         if selected == "lifecycle" { lifecycle(); return }
         if selected == "late-bind" { lateBind(); return }
         let hub = UDPHub()
@@ -175,19 +169,12 @@ enum UDPTests {
             hub.queue.sync {
                 precondition(hub.slots[3]!.peers.count == 64, "Peer table must stay bounded")
             }
-            // Expired peers must not block a new subscriber even without state traffic.
             hub.queue.sync { hub.slots[3]!.peers = hub.slots[3]!.peers.mapValues { _ in -100 } }
             sendAndDrain(hub, slot: 3, fd: c, bytes: [])
-            hub.queue.sync {
-                precondition(hub.slots[3]!.peers.count == 1)
-            }
+            hub.queue.sync { precondition(hub.slots[3]!.peers.count == 1) }
             print("PASS peer cap and expiry without input")
         }
-
         if selected == "all" || selected == "backlog" {
-            // Stall the sink queue and flood reports. Admission stays bounded;
-            // once the consumer catches up it must neutralize before reasserting
-            // the newest state rather than replaying stale transitions.
             let gate = DispatchSemaphore(value: 0)
             hub.queue.async { gate.wait() }
             for i in 0..<200 {
@@ -200,6 +187,28 @@ enum UDPTests {
             precondition(Switch2.u32(neutral, 8) == 0)
             precondition(Switch2.u32(latest, 8) == Switch2.Buttons.a.rawValue)
             print("PASS bounded backlog recovery")
+        }
+        if selected == "all" || selected == "replacement-order" {
+            let gate = DispatchSemaphore(value: 0)
+            hub.queue.async { gate.wait() }
+            var old = ControllerState(); old.buttons = [.a]
+            var next = ControllerState(); next.buttons = [.b]
+            let replacement = next
+            hub.controllerState(slot: 0, state: old)
+            let done = DispatchSemaphore(value: 0)
+            DispatchQueue.global().async {
+                hub.controllerDisconnected(slot: 0)
+                hub.controllerConnected(slot: 0, model: .proController2)
+                hub.controllerState(slot: 0, state: replacement)
+                done.signal()
+            }
+            Thread.sleep(forTimeInterval: 0.02)
+            gate.signal()
+            precondition(done.wait(timeout: .now() + 2) == .success)
+            let first = receive(a), second = receive(a)
+            precondition(Switch2.u32(first, 8) == 0, "Replacement input overtook disconnect neutralization")
+            precondition(Switch2.u32(second, 8) == Switch2.Buttons.b.rawValue)
+            print("PASS replacement lifecycle ordering")
         }
         if selected == "all" || selected == "finite" {
             var weird = ControllerState()
