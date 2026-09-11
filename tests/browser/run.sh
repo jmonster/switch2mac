@@ -25,12 +25,14 @@ s=s.replace(needle, '        TestJSON.record(object)\n'+needle)
 out.joinpath('DemandHub.swift').write_text(s+'\n'+Path('tests/browser/DemandTests.swift').read_text())
 PY
 swiftc -swift-version 6 -warnings-as-errors Sources/FinallyTheControllerWorks/Protocol/Switch2Protocol.swift \
+ tests/output-health/Probe.swift Sources/FinallyTheControllerWorks/Runtime/OutputHealth.swift \
  Sources/FinallyTheControllerWorks/Runtime/BoundedStateMailbox.swift \
  Sources/FinallyTheControllerWorks/Runtime/BrowserBridgeConfiguration.swift \
  "$work/State.swift" Sources/FinallyTheControllerWorks/Output/WebSocketHub.swift \
  tests/browser/BrowserServer.swift -o "$work/browser-server"
 python3 tests/browser/websocket_test.py "$work/browser-server"
 swiftc -swift-version 6 -warnings-as-errors Sources/FinallyTheControllerWorks/Protocol/Switch2Protocol.swift \
+ tests/output-health/Probe.swift Sources/FinallyTheControllerWorks/Runtime/OutputHealth.swift \
  Sources/FinallyTheControllerWorks/Runtime/BoundedStateMailbox.swift \
  Sources/FinallyTheControllerWorks/Runtime/BrowserBridgeConfiguration.swift \
  "$work/State.swift" "$work/DemandHub.swift" -o "$work/browser-demand"

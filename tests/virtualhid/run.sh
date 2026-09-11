@@ -19,7 +19,8 @@ library="$work/libCoreHID.so"
 swiftc -swift-version 6 -warnings-as-errors -emit-library -emit-module -module-name CoreHID \
   tests/virtualhid/CoreHID.swift -emit-module-path "$work/CoreHID.swiftmodule" -o "$library"
 swiftc -swift-version 6 -warnings-as-errors -I "$work" \
-  Sources/FinallyTheControllerWorks/Protocol/Switch2Protocol.swift "$work/Types.swift" \
+  Sources/FinallyTheControllerWorks/Protocol/Switch2Protocol.swift \
+  tests/output-health/Probe.swift Sources/FinallyTheControllerWorks/Runtime/OutputHealth.swift "$work/Types.swift" \
   "${HID_SOURCE:-Sources/FinallyTheControllerWorks/Output/VirtualHID.swift}" \
   tests/virtualhid/LifecycleTests.swift "$library" -Xlinker -rpath -Xlinker "$work" -o "$work/tests"
 if [ -n "${HID_CASE:-}" ]; then "$work/tests" "$HID_CASE"; exit; fi

@@ -5,7 +5,7 @@
 import Foundation
 import Darwin
 
-final class NetworkGamepadSink: ControllerOutputSink, @unchecked Sendable {
+final class NetworkGamepadSink: ControllerOutputSink, OutputHealthProviding, @unchecked Sendable {
     private static let sendInterval: TimeInterval = 1.0 / 60.0
     private static let refreshInterval: TimeInterval = 2.0
     private static let analogQuantum: Int32 = 512
@@ -58,6 +58,21 @@ final class NetworkGamepadSink: ControllerOutputSink, @unchecked Sendable {
     private var nextPumpAt: TimeInterval?
     private var settingsObserver: NSObjectProtocol?
     private var observedConfiguration: (Bool, Int)?
+
+    var outputBackend: OutputBackend { .retroarch }
+    func requestHealth(_ reply: @escaping @Sendable (OutputHealth) -> Void) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            let failed = self.players.indices.filter { self.players[$0].failed }
+            let state: OutputHealth.State
+            if !AppConfig.networkGamepadEnabled { state = .disabled }
+            else if !(1...65532).contains(AppConfig.networkGamepadBasePort) { state = .needsConfiguration }
+            else if self.fd < 0 { state = .unavailable }
+            else if !failed.isEmpty { state = .degraded }
+            else { state = .sendingUnconfirmed }
+            reply(OutputHealth(backend: .retroarch, state: state, affectedSlots: failed))
+        }
+    }
 
     init() {
         queue.async { [weak self] in self?.openSocket(); self?.configurationChanged() }
