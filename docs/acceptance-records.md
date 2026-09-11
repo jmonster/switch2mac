@@ -1,5 +1,10 @@
 # Controller, discovery and energy acceptance records
 
+For hash-matched local artifacts, recomputed CSV power means, and generated
+compatibility matrices, use the [evidence-backed workflow](hardware-evidence.md).
+The description-only schema below remains supported and is not silently promoted
+to an evidence-backed hardware pass.
+
 The validator records what a tester reports; it does not certify it independently
 or manufacture measurements. It never launches a bridge, changes configuration,
 collects logs, reads a controller or uploads data. Keep files local until reviewed.
