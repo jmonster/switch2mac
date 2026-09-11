@@ -35,10 +35,12 @@ final class MouseController: @unchecked Sendable {
     private static func wrapDiff(_ current: UInt16, _ previous: UInt16) -> Int {
         Int(Int16(bitPattern: current &- previous))
     }
+    /// True only when permitted, valid optical input posts a nonzero motion event.
+    @discardableResult
     func handle(serial: String, model: Switch2.Model, state: ControllerState,
-                configuration: ControllerConfiguration) {
+                configuration: ControllerConfiguration) -> Bool {
         guard configuration.mouseEnabled, permission,
-              model == .joyCon2Left || model == .joyCon2Right else { reset(serial: serial); return }
+              model == .joyCon2Left || model == .joyCon2Right else { reset(serial: serial); return false }
         let left = model == .joyCon2Left ? state.buttons.contains(.slL) : state.buttons.contains(.slR)
         let right = model == .joyCon2Left ? state.buttons.contains(.srL) : state.buttons.contains(.srR)
         var buttons = Set<Int>()
@@ -48,14 +50,17 @@ final class MouseController: @unchecked Sendable {
         defer { units[serial] = unit }
         let dx = Self.wrapDiff(state.mouseX, unit.lastX), dy = Self.wrapDiff(state.mouseY, unit.lastY)
         unit.lastX = state.mouseX; unit.lastY = state.mouseY
-        guard unit.primed else { unit.primed = true; return }
-        guard state.liftDistance != 0 && state.liftDistance < 1000 && state.surfaceQuality < 4000 else { return }
+        guard unit.primed else { unit.primed = true; return false }
+        guard state.liftDistance != 0 && state.liftDistance < 1000 && state.surfaceQuality < 4000 else {
+            unit.residualX = 0; unit.residualY = 0
+            return false
+        }
         let scale = 0.35 * configuration.mouseSensitivity
         let x = Double(dx) * scale + unit.residualX, y = Double(dy) * scale + unit.residualY
         let moveX = x.rounded(.towardZero), moveY = y.rounded(.towardZero)
         unit.residualX = x - moveX; unit.residualY = y - moveY
-        guard moveX != 0 || moveY != 0 else { return }
-        postMove(dx: moveX, dy: moveY)
+        guard moveX != 0 || moveY != 0 else { return false }
+        return postMove(dx: moveX, dy: moveY)
     }
     private func postButton(_ button: Int, down: Bool) {
         let left = button == 0
@@ -65,7 +70,7 @@ final class MouseController: @unchecked Sendable {
                 mouseCursorPosition: CGEvent(source: nil)?.location ?? .zero,
                 mouseButton: left ? .left : .right)?.post(tap: .cghidEventTap)
     }
-    private func postMove(dx: Double, dy: Double) {
+    private func postMove(dx: Double, dy: Double) -> Bool {
         let current = CGEvent(source: nil)?.location ?? .zero
         var target = CGPoint(x: current.x + dx, y: current.y + dy)
         if !screens.isEmpty && !screens.contains(where: { $0.contains(target) }) {
@@ -84,6 +89,8 @@ final class MouseController: @unchecked Sendable {
             event.setIntegerValueField(.mouseEventDeltaX, value: Int64(dx))
             event.setIntegerValueField(.mouseEventDeltaY, value: Int64(dy))
             event.post(tap: .cghidEventTap)
+            return true
         }
+        return false
     }
 }
