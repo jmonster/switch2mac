@@ -5,6 +5,7 @@ struct OutputStatusView: View {
     @ObservedObject private var store = OutputStatusStore.shared
     @State private var backend = OutputBackend.sdl
     @State private var model = Switch2.Model.proController2
+    @State private var showSupport = false
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
@@ -42,6 +43,8 @@ struct OutputStatusView: View {
                         }.frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
+                Button("Preview Support Summary…") { showSupport = true }
+                    .disabled(!store.pending.isEmpty)
                 Divider()
                 Text("What can this model and output do?").font(.headline)
                 Picker("Output to inspect", selection: $backend) {
@@ -63,6 +66,9 @@ struct OutputStatusView: View {
         }
         .frame(minWidth: 560, minHeight: 500)
         .onAppear { store.refresh() }
+        .sheet(isPresented: $showSupport) {
+            SupportSummaryView(engine: engine, outputs: Array(store.reports.values), snapshotAt: store.updatedAt)
+        }
     }
 }
 
