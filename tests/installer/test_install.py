@@ -33,6 +33,10 @@ class InstallerTests(unittest.TestCase):
         self.original = {str(p.relative_to(self.source)): p.read_bytes() for p in self.source.rglob("*") if p.is_file()}
 
     def runner(self, args):
+        if args[0] == "lipo":
+            self.assertTrue(Path(args[1]).is_file())
+            self.assertEqual(args[2], "-verify_arch")
+            self.assertEqual(len(args), 4)
         return subprocess.CompletedProcess(args, 0, "", "flags=0x2(adhoc)\n")
 
     def install(self, runner=None):

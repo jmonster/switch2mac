@@ -81,7 +81,7 @@ def install(source: Path, destination: Path, library: Path, runner: Callable = r
     arch = platform.machine()
     for binary in (source / "Contents/MacOS/gopher64", source / "Contents/MacOS/gopher64-cli",
                    source / "Contents/Frameworks/libMoltenVK.dylib", library):
-        runner(["lipo", "-verify_arch", arch, str(binary)])
+        runner(["lipo", str(binary), "-verify_arch", arch])
     runner(["codesign", "--verify", "--deep", "--strict", str(source)])
     destination.parent.mkdir(parents=True, exist_ok=True)
     lock = destination.parent / ("." + destination.name + ".install-lock")
@@ -169,6 +169,8 @@ def main():
         result = install(args.source, args.destination, args.library)
     except (OSError, ValueError, plistlib.InvalidFileException, InstallError, subprocess.CalledProcessError) as error:
         print("Installation failed: " + str(error), file=__import__("sys").stderr)
+        if isinstance(error, subprocess.CalledProcessError) and error.stderr:
+            print(error.stderr[:2048].strip(), file=__import__("sys").stderr)
         return 1
     print("Installed and signature-verified: " + str(result))
     print("Original app unchanged. Generated copy is ad-hoc signed without hardened runtime.")
