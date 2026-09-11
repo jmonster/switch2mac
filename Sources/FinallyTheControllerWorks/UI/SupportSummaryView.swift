@@ -50,6 +50,7 @@ struct SupportSummaryView: View {
         case .scanning: state = "scanning"
         case .connecting: state = "connecting"
         case .idle: state = "idle"
+        case .ready: state = "ready"
         }
         let events = LogStore.shared.entries.suffix(SupportSummary.maximumEvents).map {
             SupportSummary.Event(level: $0.level.rawValue, subsystem: $0.subsystem)

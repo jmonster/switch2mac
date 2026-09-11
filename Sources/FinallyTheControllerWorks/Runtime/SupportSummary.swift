@@ -30,7 +30,7 @@ enum SupportSummary {
             (48...57).contains($0) || (97...102).contains($0)
         }) ? revision : "unknown"
         func bounded(_ value: Int, _ maximum: Int = 999) -> Int { max(0, min(maximum, value)) }
-        let states: Set<String> = ["paused", "off", "unauthorized", "scanning", "connecting", "idle"]
+        let states: Set<String> = ["paused", "off", "unauthorized", "scanning", "connecting", "idle", "ready"]
         var counts: [String: Int] = [:]
         for event in events.suffix(maximumEvents) {
             let category = subsystems.contains(event.subsystem) ? event.subsystem : "other"

@@ -49,6 +49,9 @@ struct FTCWApp: App {
         Window("Output Status", id: "output-status") { OutputStatusView(engine: appDelegate.engine) }
             .defaultSize(width: 600, height: 650)
 
+        Window("Controller Discovery", id: "discovery") { DiscoverySettings(engine: appDelegate.engine) }
+            .windowResizability(.contentSize)
+
         Window("About", id: "about") { AboutView() }
             .windowResizability(.contentSize)
 
@@ -195,6 +198,7 @@ struct MenuContent: View {
         Button("Open Dashboard") { show("dashboard") }
         Button("Output Status and Capabilities…") { show("output-status") }
         Button("Browser Bridge Settings…") { show("browser-bridge") }
+        Button("Controller Discovery…") { show("discovery") }
 
         // Hidden for the beta (AppInfo.showPreReleaseFeatures documents
         // the defaults key that brings them back).

@@ -43,6 +43,7 @@ enum EngineState: String, Sendable {
     case scanning = "Scanning for controllers…"
     case connecting = "Connecting…"
     case idle = "All controller slots full"
+    case ready = "Remembered controllers connected — discovery paused"
 }
 
 final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
@@ -112,6 +113,7 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
             .filter { (0..<4).contains($0.value) }
 
     private var idleSweepTimer: DispatchSourceTimer?
+    private lazy var discovery = DiscoveryPolicy(queue: btQueue) { [weak self] in self?.updateScanning() }
 
     @MainActor override init() {
         super.init()
@@ -149,6 +151,7 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
         let savedLinks = UserDefaults.standard.dictionary(forKey: "joyConLinks") as? [String: String] ?? [:]
         if savedLinks != links { links = savedLinks; recomputeLogical() }
         else { pushNames() }
+        updateScanning()
     }
 
     func stop(completion: (@Sendable () -> Void)? = nil) {
@@ -198,10 +201,11 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
             central.cancelPeripheralConnection(session.peripheral)
         }
         updateIdleSweep()
-        if recompute { recomputeLogical() }
+        if recompute { recomputeLogical(); updateScanning() }
     }
 
     private func resetConnections(cancel: Bool) {
+        discovery.cancelWindow()
         central.stopScan()
         let current = Array(sessions.values) + connecting.values.map { $0.session }
         for session in current { retire(session, cancel: cancel, recompute: false) }
@@ -1419,16 +1423,33 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
         guard running, !suspended else { central.stopScan(); publishState(.paused); return }
         guard central.state == .poweredOn else { return }
         let occupied = sessions.count + connecting.count
-        if occupied < Self.maxSessions {
+        let scan = discovery.shouldScan(readyIDs: sessions.values.map { $0.peripheral.identifier })
+        if occupied < Self.maxSessions && scan {
             if !central.isScanning {
                 central.scanForPeripherals(withServices: nil, options: [
                     CBCentralManagerScanOptionAllowDuplicatesKey: false
                 ])
                 publishState(.scanning)
             }
-        } else if central.isScanning {
-            central.stopScan()
-            publishState(.idle)
+        } else {
+            if central.isScanning { central.stopScan() }
+            publishState(occupied >= Self.maxSessions ? .idle : .ready)
+        }
+    }
+
+    func requestDiscoveryWindow() {
+        btQueue.async { [weak self] in
+            guard let self, self.running, !self.suspended else { return }
+            self.discovery.openWindow()
+            self.updateScanning()
+        }
+    }
+
+    func useConnectedForDiscovery() {
+        btQueue.async { [weak self] in
+            guard let self, self.running, !self.suspended else { return }
+            self.discovery.useConnected(self.sessions.values.map { $0.peripheral.identifier })
+            self.updateScanning()
         }
     }
 
@@ -1525,7 +1546,7 @@ extension BridgeEngine: CBCentralManagerDelegate {
                         didDiscover peripheral: CBPeripheral,
                         advertisementData: [String: Any],
                         rssi RSSI: NSNumber) {
-        guard running, !suspended, central.state == .poweredOn,
+        guard running, !suspended, central.state == .poweredOn, central.isScanning,
               !disconnecting.contains(peripheral.identifier),
               ProcessInfo.processInfo.systemUptime >= (retryAfter[peripheral.identifier] ?? 0),
               let manu = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data,
