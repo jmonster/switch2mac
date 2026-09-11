@@ -23,7 +23,9 @@ def line(proc):
 
 @contextlib.contextmanager
 def server():
-    proc = subprocess.Popen([sys.argv[1]], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    # select() must observe the same bytes readline() consumes. A buffered
+    # reader can prefetch APPLIED after RUMBLE and hide it from the next select.
+    proc = subprocess.Popen([sys.argv[1]], stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
     try:
         assert line(proc) == 'READY'
         yield proc
