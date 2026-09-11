@@ -221,6 +221,26 @@ final class LogPipeline: @unchecked Sendable {
     }
 
     private func write(_ entries: [LogEntry]) {
+        // Batch disk writes as well as UI delivery. Keep complete lines on
+        // either side of rotation and cap ordinary chunks at 64 KiB. submit()
+        // already bounds each message to 16 KiB (plus its small header).
+        let chunkLimit = 64 * 1024
+        var pending = Data(capacity: min(chunkLimit, maxFileBytes))
+        func flushPending() {
+            guard !pending.isEmpty else { return }
+            let data = pending
+            pending.removeAll(keepingCapacity: true)
+            guard let handle = fileHandle else { return }
+            do {
+                try handle.write(contentsOf: data)
+                fileBytes += data.count
+            } catch {
+                // A partial write may have reached disk. Reopen to refresh the
+                // byte count; do not retry the chunk and duplicate its prefix.
+                try? handle.close(); fileHandle = nil
+                openFile()
+            }
+        }
         for entry in entries {
             let message = entry.message.replacingOccurrences(of: "\n", with: "\\n")
                 .replacingOccurrences(of: "\r", with: "\\r")
@@ -228,17 +248,17 @@ final class LogPipeline: @unchecked Sendable {
             var data = Data(line.utf8.prefix(maxFileBytes - 1))
             while String(data: data, encoding: .utf8) == nil { data.removeLast() }
             data.append(10)
-            rotateIfNeeded(incoming: data.count)
-            guard let handle = fileHandle, fileBytes + data.count <= maxFileBytes else { continue }
-            do {
-                try handle.write(contentsOf: data)
-                fileBytes += data.count
-            } catch {
-                try? handle.close(); fileHandle = nil
-                openFile()
+            if !pending.isEmpty && (pending.count + data.count > chunkLimit
+                || fileBytes + pending.count + data.count > maxFileBytes) {
+                flushPending()
             }
+            if pending.isEmpty { rotateIfNeeded(incoming: data.count) }
+            guard fileHandle != nil, fileBytes + pending.count + data.count <= maxFileBytes else { continue }
+            pending.append(data)
         }
+        flushPending()
     }
+
 }
 
 func bridgeLog(_ level: LogLevel, _ subsystem: String, _ message: String) {
