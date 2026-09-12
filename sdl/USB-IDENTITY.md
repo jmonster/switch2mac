@@ -1,10 +1,10 @@
 # Wired USB command ownership
 
-The upstream SDL addition selected the first openable device with the same
-VID/PID. With identical controllers this can initialize or send feedback to
-the wrong controller while HID input comes from another one.
+Selecting a USB device by VID/PID alone can send initialization or feedback
+to the wrong controller when identical devices are connected. Command output
+and HID input must resolve to the same physical device.
 
-The added s2usb-device-identity.patch resolves the exact HID DevSrvsID path
+The s2usb-device-identity.patch resolves the exact HID DevSrvsID path
 through IOKit to its USB device ancestor. It reads locationID and USB Address
 (or USBDeviceAddress), matches both libusb bus and device address plus VID/PID,
 and opens only a unique match. Registry entries and properties are released.
@@ -25,5 +25,5 @@ failed-claim, alternate-property, malformed-path and cleanup tests. The existing
 real SDL/UDP edge test also runs against the combined rebuilt library.
 
 Build with sdl/build-sdl.sh as documented in INPUT-DELIVERY.md. The tracked
-upstream dylib is not updated; the builder applies all three patches and
+dylib is not updated; the builder applies all four patches and
 produces build/sdl/libSDL3.0.dylib. No controller command bytes are changed.

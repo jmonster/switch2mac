@@ -16,8 +16,7 @@ matter on macOS in particular.
 > not yet identified). Everything else below is implemented and observed on
 > real hardware.
 
-Prior community reverse-engineering that this builds on is credited at the
-end. Byte offsets are into the decrypted input report / command payloads.
+Byte offsets are into the decrypted input report / command payloads.
 
 ---
 
@@ -344,12 +343,3 @@ advanced. The console re-sends at ~5 ms; ~20–50 ms suffices to sustain a
 steady tone.
 
 ---
-
-## Credits
-
-Protocol groundwork by the open-source community, including
-ndeadly's Switch 2 controller research, the Nadeflore/Switch2Connect protocol
-code, coffincolors' Joy-Con 2 mouse driver, trevlars' Linux bridge, and
-darthcloud's BlueRetro. The macOS-specific findings (§6 right-Joy-Con
-calibration split, §9 keep-alive requirement and interval note) and the
-CoreBluetooth implementation are contributions of this project.

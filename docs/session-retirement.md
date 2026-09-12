@@ -17,7 +17,7 @@ announced. Readiness is announced once, before delivering the first usable
 state, allowing the engine to attach output without losing that state.
 
 Eleven production-session tests pass with fake CoreBluetooth boundaries. Five
-new selected failure cases were first run against the prior PR #3 source and
+new selected failure cases were first run against the earlier implementation and
 failed: retired notifications, retired input/commands, false readiness,
 disabled notifications, and reentrant completion. Additional tests check early
 input and stopped keep-alives. The complete app is compiled separately with

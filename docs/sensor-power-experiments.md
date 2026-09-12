@@ -1,7 +1,7 @@
 # Opt-in sensor-demand experiments (not qualified defaults)
 
 Normal app launches retain the existing `0xB7` Joy-Con / `0xA7` other-model
-feature masks. This change adds explicit **process-scoped experiments**, not an
+feature masks. Reduced profiles are explicit **process-scoped experiments**, not an
 automatic low-power mode and not a measured battery-life improvement.
 
 The real connection handshake uses one selected profile for both feature init
@@ -21,13 +21,13 @@ by a profile must not be expected to work in SDL motion, gestures, the optical
 mouse or sensor dashboards. Do not run NFC/audio experiments concurrently.
 Unknown profiles or missing acknowledgment revert to compatibility, never `0xFF`.
 
-Quit every running bridge copy. After building the reviewed branch, deliberately
+Quit every running bridge copy. After building the application, explicitly
 launch the bundled executable from Terminal for the desired test:
 
 ```sh
 SWITCH2MAC_ACKNOWLEDGE_UNQUALIFIED_POWER=1 \
 SWITCH2MAC_EXPERIMENTAL_SENSORS=gamepad \
-'build/Finally the Controller Works (jmonster).app/Contents/MacOS/FinallyTheControllerWorks'
+'build/GameCubed.app/Contents/MacOS/GameCubed'
 ```
 
 Both environment variables are required. No preferences, firmware or bonding
@@ -42,7 +42,7 @@ writes or a rough voltage percentage. Include active input, stationary input,
 long held controls, rumble, sleep/wake and reconnection. Check both trigger travel
 and digital clicks where supported. Record failures, not just mean power.
 
-The new automated suite executes the real session command writer with a fake
+The automated suite executes the real session command writer with a fake
 CoreBluetooth boundary, checking all model/profile masks and both handshake
 frames. It does not prove that any controller firmware accepts reduced masks,
 that every omitted sensor powers down, or that current consumption decreases.
@@ -66,4 +66,4 @@ its output explicitly says hardware qualification and energy measurements were
 ## Record and validate hardware and energy acceptance
 
 See [acceptance records](acceptance-records.md) for an executable template,
-validation and paired-comparison workflow. No measured records ship in this PR.
+validation and paired-comparison workflow. No measured records are included.

@@ -2,7 +2,7 @@
 
 *A format-identification study of a 30-second BLE capture from a Pro
 Controller 2 (firmware 2.0+), 2026-08-09. Part of the
-[FinallyTheControllerWorks research series](README.md).*
+[controller research notes](README.md).*
 
 **Capture setup:** the host subscribed to the audio input characteristic
 `7492866C-EC3E-4619-8258-32755FFCC0F9` after sending audio config
@@ -123,8 +123,3 @@ or two. Fixed fields at fixed offsets = plaintext structure.
    for mode transitions.
 4. Per-packet timestamps (capture v2 already records them) to nail the
    notification interval directly.
-
-## Credits
-
-Layout cross-validation: [ndeadly/switch2_controller_research](https://github.com/ndeadly/switch2_controller_research).
-Analysis: the FinallyTheControllerWorks project, 2026-08-09.

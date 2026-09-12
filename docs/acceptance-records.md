@@ -54,7 +54,7 @@ Bluetooth off/on and Mac sleep. Record reconnect latency, failed attempts,
 unintended connections and scan/CPU wakeup observations in evidence. Any future
 scan-window or known-device retrieval change needs a separate reviewed revision
 and the same tests; lower apparent wakeups do not justify missed button wakes.
-This PR supplies the record/check discipline, not an unqualified discovery policy.
+These records validate acceptance evidence; they do not qualify a discovery policy.
 
 ## Power comparisons
 
