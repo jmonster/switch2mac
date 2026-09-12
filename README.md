@@ -44,8 +44,10 @@ controller at a time.
 The [Pro Controller guide](docs/pro-controller-support.md) covers buttons,
 calibration, rumble, motion sensors, and output capabilities. NFC and
 headphone/microphone audio are experimental. The browser output does not forward
-GameCube HD-motor commands; GameCube preset rumble still needs hardware
-verification. Check trigger travel and digital clicks separately in the game.
+GameCube HD-motor commands. The Dashboard offers a direct GameCube preset test,
+not GameCube rumble from games; physical vibration still needs hardware
+verification. See [rumble tests and limits](docs/rumble.md). Check trigger travel
+and digital clicks separately in the game.
 
 ## Testing and reporting problems
 

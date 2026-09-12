@@ -116,7 +116,7 @@ struct DashboardView: View {
             pairing: pairingInfo(for: controller),
             live: player >= 0 ? engine.liveStates[player] : nil,
             findRSSI: engine.findingSerial == serial ? engine.findRSSI : nil,
-            onTestRumble: { engine.testRumble(player: player) },
+            onTestRumble: { engine.testRumble(serial: serial) },
             onNFCProbe: { engine.nfcProbe(serial: serial) },
             onAudioCapture: { engine.audioCapture(serial: serial) },
             onAudioTone: { engine.audioToneTest(serial: serial) },
@@ -388,12 +388,16 @@ struct ControllerCard: View {
                             .monospacedDigit()
                             .frame(width: 44, alignment: .trailing)
                             .foregroundStyle(.secondary)
-                        Button("Test") { onTestRumble() }
-                            .disabled(status.player < 0 || !status.model.hasHDRumble)
-                            .help("Direct controller pulse, not a test of game-output rumble")
+                        Button(status.model == .nsoGameCube ? "Test preset" : "Test") { onTestRumble() }
+                            .disabled(!status.model.hasDirectRumbleTest)
+                            .help("Test this controller directly, even without a player slot. Check Logs if it stays silent.")
                     }
-                    if !status.model.hasHDRumble {
-                        Text("GameCube preset rumble is not verified. HD-motor tests are unavailable for this model.")
+                    if settings.rumbleIntensity(forSerial: status.serial) <= 0 {
+                        Text("Rumble is muted. Raise the slider above 0% to feel the test.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    if status.model == .nsoGameCube {
+                        Text("Direct preset test: below 50% selects soft, 50–100% strong. The clip finishes on its own; this is not game-rumble support. Check Logs for the command result.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     if AppInfo.showPreReleaseFeatures {
@@ -616,7 +620,7 @@ struct ControllerCard: View {
                                             Button("Read NFC tag") { onNFCProbe() }
                                                 .help("Detects an amiibo or NTAG on the touchpoint and dumps it; NDEF text is decoded")
                                             Button("Capture audio 30 s") { onAudioCapture() }
-                                                .help("Records the headset-audio lane to ~/Documents. Plug in a headset WITH a mic and speak to capture real codec data. Buttons freeze during capture.")
+                                                .help("Records the headset-audio lane to ~/Documents. Plug in a headset WITH A mic and speak to capture real codec data. Buttons freeze during capture.")
                                             Button("Play tone (real-time)") { onAudioPlayTone() }
                                                 .help("4 s of 440 Hz at the full configured PCM rate with backpressure — the honest test of the output format")
                                             Button("Format probe (4 phases)") { onAudioTone() }

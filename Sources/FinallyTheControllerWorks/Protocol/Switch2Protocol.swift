@@ -43,9 +43,13 @@ enum Switch2 {
         /// right unit → second).
         var hasSecondStick: Bool { self == .proController2 || self == .nsoGameCube }
 
-        /// The GameCube pad has no HD-rumble actuator (writing its motor
-        /// characteristic powers it off) — it plays built-in presets instead.
+        /// GameCube cannot accept these Pro/Joy-Con HD motor packets.
+        /// Its direct test uses built-in command presets instead.
         var hasHDRumble: Bool { self != .nsoGameCube }
+
+        /// A direct hardware test does not require a game-output return path.
+        /// GameCube uses a finite preset command, never an HD motor packet.
+        var hasDirectRumbleTest: Bool { hasHDRumble || self == .nsoGameCube }
     }
 
     // MARK: - GATT characteristics
@@ -87,6 +91,24 @@ enum Switch2 {
         static let pairLTK1: UInt8 = 0x04
         static let pairLTK2: UInt8 = 0x02
         static let pairFinish: UInt8 = 0x03
+    }
+
+    /// Known finite GameCube clips, sent on the command characteristic with
+    /// command 0x0A/subcommand 0x02, not on an HD-rumble characteristic.
+    /// Wire format/preset IDs: trevlars/switch2-controllers-linux ngc/device.py
+    /// (commit a0a36e6b88ed5500f60cac29815aabad0d8956bd). See docs/rumble.md.
+    enum GameCubeRumblePreset: UInt8 {
+        case soft = 3
+        case strong = 2
+
+        var payload: Data { Data([rawValue, 0, 0, 0]) }
+
+        /// The 50% split is our test UI policy, not a continuous motor gain.
+        /// Zero/non-finite intensity is silent; no undocumented stop preset.
+        static func forTest(intensity: Double) -> Self? {
+            guard intensity.isFinite, intensity > 0 else { return nil }
+            return intensity < 0.5 ? .soft : .strong
+        }
     }
 
     enum Feature {

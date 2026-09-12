@@ -125,6 +125,7 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     private var rumbleSetAt: TimeInterval = 0
     private var rumbleActive = false
     private var rumbleGeneration: UInt64 = 0
+    private var lastRumbleTestAt: TimeInterval = -.infinity
 
     /// Latest decoded state. All reads and writes belong to the Bluetooth
     /// queue; consumers receive a Sendable value snapshot, never this storage.
@@ -785,15 +786,65 @@ final class ControllerSession: NSObject, @unchecked Sendable {
         maintainTick()
     }
 
-    func pulseRumble(strong: Double, duration: Double) {
+    /// Direct diagnostic, independent of player assignment or game output.
+    /// GameCube clips finish in firmware: they are not duration-controlled
+    /// effects and must not be advertised as general game-rumble support.
+    func testRumble(intensity: Double) {
         queue.async { [weak self] in
-            guard let self, !self.ended, duration.isFinite else { return }
-            self.applyRumble(strong: strong, weak: 0)
-            let generation = self.rumbleGeneration
-            self.queue.asyncAfter(deadline: .now() + max(0, min(5, duration))) { [weak self] in
-                guard let self, !self.ended, self.rumbleGeneration == generation else { return }
-                self.applyRumble(strong: 0, weak: 0)
+            guard let self, !self.ended, self.readyReported else { return }
+            let level = intensity.isFinite ? max(0, min(1, intensity)) : 0
+            guard level > 0 else {
+                self.log(.info, "rumble test muted: raise Rumble above 0%")
+                return
             }
+            let now = ProcessInfo.processInfo.systemUptime
+            guard now - self.lastRumbleTestAt >= 0.5 else { return }
+            if self.model.hasHDRumble {
+                self.lastRumbleTestAt = now
+                // Pro has independent left/strong and right/weak actuators.
+                // A test must exercise BOTH, unlike a single-motor effect.
+                self.applyRumblePulse(strong: level, weak: self.model == .proController2 ? level : 0,
+                                      duration: 0.4)
+                self.log(.info, "direct rumble test requested: verify vibration by touch")
+            } else if self.model == .nsoGameCube,
+                      let preset = Switch2.GameCubeRumblePreset.forTest(intensity: level) {
+                // A preset cannot be cancelled after submission. Never let a
+                // test accumulate behind commands or radio backpressure and
+                // buzz unexpectedly later. Retry is an explicit user action.
+                guard self.pendingCommand == nil, self.queuedCommands.isEmpty,
+                      self.peripheral.canSendWriteWithoutResponse else {
+                    self.log(.warning, "rumble test not sent: Bluetooth is busy; press Test again")
+                    return
+                }
+                self.lastRumbleTestAt = now
+                self.sendCommand(Switch2.Command.vibration, Switch2.Subcommand.vibrationPlayPreset,
+                                 preset.payload) { [weak self] result in
+                    switch result {
+                    case .success:
+                        self?.log(.info, "GameCube rumble preset acknowledged: verify vibration by touch")
+                    case .failure(let reason):
+                        self?.log(.warning, "GameCube rumble test failed: \(reason)")
+                    }
+                }
+            }
+        }
+    }
+
+    func pulseRumble(strong: Double, weak: Double = 0, duration: Double) {
+        queue.async { [weak self] in
+            self?.applyRumblePulse(strong: strong, weak: weak, duration: duration)
+        }
+    }
+
+    /// Queue-confined so a direct test cannot jump ahead of a newer game
+    /// request by enqueueing a second hop onto the same Bluetooth queue.
+    private func applyRumblePulse(strong: Double, weak: Double, duration: Double) {
+        guard !ended, duration.isFinite else { return }
+        applyRumble(strong: strong, weak: weak)
+        let generation = rumbleGeneration
+        queue.asyncAfter(deadline: .now() + max(0, min(5, duration))) { [weak self] in
+            guard let self, !self.ended, self.rumbleGeneration == generation else { return }
+            self.applyRumble(strong: 0, weak: 0)
         }
     }
 

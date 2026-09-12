@@ -55,12 +55,12 @@ struct OutputStatusView: View {
                 }
                 Text("These selectors inspect capabilities; they do not switch outputs or change your controller settings.").font(.caption)
                 Text(OutputCapabilities(model: model, backend: backend).explanation)
-                let controller = engine.controllers.first { $0.model == model && $0.player >= 0 }
-                Button(controller.map { "Test P\($0.player + 1) rumble directly" } ?? "No matching assigned controller") {
-                    if let controller { engine.testRumble(player: controller.player) }
+                let controller = engine.controllers.first { $0.model == model }
+                Button(controller.map { "Test \($0.name) rumble directly" } ?? "No matching connected controller") {
+                    if let controller { engine.testRumble(serial: controller.serial) }
                 }
                 .disabled(controller == nil || !OutputCapabilities(model: model, backend: backend).directRumble)
-                Text("Direct tests bypass the selected game output. GameCube preset rumble is not verified; its HD-motor test is disabled here.").font(.caption)
+                Text("Direct tests bypass the selected game output and honor the Dashboard intensity, including mute. GameCube uses a finite soft/strong preset; Pro tests both motors. Check Logs if no vibration is felt.").font(.caption)
                 Link("Full model and hardware-acceptance limits", destination: URL(string: "https://github.com/jmonster/switch2mac/blob/main/docs/pro-controller-support.md")!)
             }.padding(20)
         }

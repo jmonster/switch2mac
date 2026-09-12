@@ -17,7 +17,7 @@ enum OutputBackend: String, CaseIterable, Codable, Sendable {
         case .sdl: path = "sdl/README.md"
         case .browser: path = "browser/README.md"
         case .retroarch: path = "docs/retroarch-integration.md"
-        case .hid: path = "docs/fork-identity.md"
+        case .hid: path = "docs/app-identity.md"
         }
         return URL(string: "https://github.com/jmonster/switch2mac/blob/main/" + path)!
     }
@@ -80,7 +80,7 @@ struct OutputCapabilities: Sendable {
     let model: Switch2.Model
     let backend: OutputBackend
     var gameRumble: Bool { model.hasHDRumble && (backend == .sdl || backend == .browser) }
-    var directRumble: Bool { model.hasHDRumble }
+    var directRumble: Bool { model.hasDirectRumbleTest }
     var analogTravel: Bool { model.hasAnalogTriggers && backend != .retroarch }
     /// The browser combines digital clicks with trigger values; CoreHID's
     /// current descriptor omits the separate ZL/ZR click bits. Only the SDL
@@ -89,7 +89,7 @@ struct OutputCapabilities: Sendable {
     var motion: Bool { backend == .sdl }
     var explanation: String {
         let rumble = gameRumble ? "Game rumble has a return path; verify it in the actual game."
-            : (model == .nsoGameCube ? "GameCube preset rumble is unverified; HD-motor commands are not sent."
+            : (model == .nsoGameCube ? "GameCube has a direct finite-preset test, not game-rumble support. HD-motor commands are never sent to this model."
                : "This output has no game-rumble return path. The Dashboard pulse tests the controller directly, not game rumble.")
         let triggers = model.hasAnalogTriggers
             ? (independentTriggerClicks ? "Analog trigger travel and digital clicks remain separate; test both in-game."
