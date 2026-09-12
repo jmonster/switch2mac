@@ -12,7 +12,7 @@ import Foundation
         let models = value["models"] as! [[String: Any]]
         precondition(models.count == Switch2.Model.allCases.count)
         for (model, output) in zip(Switch2.Model.allCases, models) {
-            precondition(output["feature_mask"] as? String == String(format: "%02x", Switch2.Feature.flags(for: model)))
+            precondition(output["feature_mask"] as? String == String(format: "%02x", Switch2.Feature.flags(for: model, profile: ApplicationSensorPolicy.selectedProfile)))
         }
         print("PASS configuration-only profile description " + expected)
     }

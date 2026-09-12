@@ -1,38 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+source tests/support/kit-sources.sh
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-# Change visibility/imports only, not method bodies. Fake CoreBluetooth objects
-# allow the production session callbacks to run without a radio or permission.
-python3 - "$work/ControllerSession.swift" <<'PY'
-from pathlib import Path
-import os, re, sys
-source = Path(os.environ.get('SESSION_SOURCE', 'Sources/FinallyTheControllerWorks/Bluetooth/ControllerSession.swift')).read_text()
-source = re.sub(r'^import (CoreBluetooth|IOBluetooth)$', '', source, flags=re.M)
-source = re.sub(r'\b(?:fileprivate|private)(?:\(set\))?\s+', '', source)
-Path(sys.argv[1]).write_text('import CoreFoundation\n' + source)
-PY
-swiftc -swift-version 5 \
-  Sources/FinallyTheControllerWorks/Protocol/Switch2Protocol.swift \
-  "$work/ControllerSession.swift" tests/session/FrameworkFakes.swift \
-  tests/session/SessionTests.swift -o "$work/session-tests"
-"$work/session-tests" "${SESSION_CASE:-all}"
-
-swiftc -swift-version 5 \
-  Sources/FinallyTheControllerWorks/Protocol/Switch2Protocol.swift \
-  "$work/ControllerSession.swift" tests/session/FrameworkFakes.swift \
-  tests/session/FlowTests.swift -o "$work/flow-tests"
-"$work/flow-tests" "${SESSION_CASE:-all}"
-
-swiftc -swift-version 5 \
-  Sources/FinallyTheControllerWorks/Protocol/Switch2Protocol.swift \
-  "$work/ControllerSession.swift" tests/session/FrameworkFakes.swift \
-  tests/session/ResponseTests.swift -o "$work/response-tests"
-"$work/response-tests" "${SESSION_CASE:-all}"
-
-swiftc -swift-version 5 \
-  Sources/FinallyTheControllerWorks/Protocol/Switch2Protocol.swift \
-  "$work/ControllerSession.swift" tests/session/FrameworkFakes.swift \
-  tests/session/ResultTests.swift -o "$work/result-tests"
-"$work/result-tests"
+prepare_session_sources "$work"
+for suite in SessionTests FlowTests ResponseTests ResultTests; do
+  swiftc -swift-version 5 "${kit_flags[@]}" "${kit_session_sources[@]}" \
+    "tests/session/$suite.swift" -o "$work/$suite"
+  "$work/$suite" "${SESSION_CASE:-all}"
+done

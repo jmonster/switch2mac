@@ -2,7 +2,7 @@ import Foundation
 
 @main enum CooldownRegression {
     static func main() {
-        let engine = BridgeEngine(), peripheral = CBPeripheral()
+        let engine = BridgeEngine.fixture(), peripheral = CBPeripheral()
         var advertisement = Data(repeating: 0, count: 18)
         advertisement[0] = 0x53; advertisement[1] = 0x05
         advertisement[5] = 0x7e; advertisement[6] = 0x05

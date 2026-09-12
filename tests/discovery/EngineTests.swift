@@ -1,10 +1,10 @@
 import Foundation
 @main enum DiscoveryEngineTests {
     static func main() {
-        let engine = BridgeEngine()
+        let engine = BridgeEngine.fixture()
         engine.btQueue.sync {
             engine.updateScanning()
-            precondition(engine.central.isScanning, "continuous discovery must remain the default")
+            precondition(engine.central.isScanning, "the dashboard explicitly selects automatic discovery")
             func connect(_ slot: Int) -> ControllerSession {
                 let s = ControllerSession(peripheral: CBPeripheral(), slot: slot, wasPairingMode: false,
                                           queue: engine.btQueue, delegate: engine)
@@ -14,11 +14,11 @@ import Foundation
             }
             let first = connect(0), second = connect(1)
             precondition(engine.central.isScanning)
-            engine.discoveryDefaults.set(true, forKey: DiscoveryPolicy.enabledKey)
+            engine.discovery.configure(mode: .quietWhenReady, remembered: [])
             engine.updateScanning()
             precondition(engine.central.isScanning && engine.discovery.windowIsOpen())
             engine.discovery.cancelWindow(); engine.updateScanning()
-            precondition(!engine.central.isScanning && engine.lastState == .ready)
+            precondition(!engine.central.isScanning && engine.discoveryState == .paused)
             precondition(engine.sessions[0] === first && engine.sessions[1] === second)
             // An advertisement already queued before stopScan must not initiate
             // a new connection while the remembered-ready set is intentionally quiet.
@@ -35,7 +35,7 @@ import Foundation
             engine.discovery.useConnected([first.peripheral.identifier]); engine.updateScanning()
             precondition(!engine.central.isScanning)
         }
-        engine.requestDiscoveryWindow()
+        engine.requestDiscoveryWindow(seconds: 60)
         engine.btQueue.sync {
             precondition(engine.central.isScanning && engine.discovery.windowIsOpen())
             precondition(engine.sessions.count == 1, "opening discovery must not interrupt active input")
@@ -46,9 +46,9 @@ import Foundation
         engine.btQueue.sync {
             precondition(!engine.central.isScanning && !engine.discovery.windowIsOpen())
             precondition(engine.sessions.isEmpty && engine.deadlines.isEmpty)
-            engine.discoveryDefaults.set(false, forKey: DiscoveryPolicy.enabledKey)
+            engine.discovery.configure(mode: .automatic, remembered: [])
         }
-        engine.resume()
+        engine.start()
         engine.btQueue.sync { precondition(engine.central.isScanning) }
         print("PASS real engine discovery gating, missing-controller recovery, stale advertisements, manual window and stop/resume")
     }

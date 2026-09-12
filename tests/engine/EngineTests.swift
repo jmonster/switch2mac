@@ -1,8 +1,15 @@
 import Foundation
+import Synchronization
 
 @main enum EngineTests {
     static func main() {
-        let engine = BridgeEngine()
+        let engine = BridgeEngine.fixture()
+        let deliveredInputs = Mutex(0)
+        let outputQueue = DispatchQueue(label: "test.transport.observer")
+        let observation = try! engine.hub.observe(queue: outputQueue, capacity: 256) { event in
+            if case .input = event { deliveredInputs.withLock { $0 += 1 } }
+        }
+        defer { observation.cancel() }
         engine.btQueue.sync {
             engine.updateIdleSweep()
             precondition(engine.idleSweepTimer == nil, "An empty engine must not poll")
@@ -23,7 +30,8 @@ import Foundation
             precondition(engine.idleSweepTimer != nil, "A ready session requires a watchdog")
             let callback = replacement.onState
             callback?(0, ControllerState())
-            precondition(engine.emissions == 1)
+            outputQueue.sync {}
+            precondition(deliveredInputs.withLock { $0 } == 1)
             engine.retire(replacement, cancel: true)
             precondition(replacement.isRetired && engine.sessions[1] === other)
             precondition(engine.disconnecting.contains(replacement.peripheral.identifier))
@@ -32,10 +40,11 @@ import Foundation
             engine.connecting[newest.peripheral.identifier] = (newest, 0)
             engine.sessionReady(newest)
             callback?(0, ControllerState())
-            precondition(engine.emissions == 1, "Old input closure reached replacement output")
+            outputQueue.sync {}
+            precondition(deliveredInputs.withLock { $0 } == 1, "Old input closure reached replacement output")
             engine.sessionFailed(replacement, reason: "late failure")
             engine.sessionDidUpdateState(replacement)
-            precondition(engine.central.cancelled.count == 1 && engine.publishes == 0)
+            precondition(engine.central.cancelled.count == 1 && engine.hub.snapshot.controllers.contains { $0.id.rawValue == newest.peripheral.identifier })
             engine.retire(replacement, cancel: true)
             precondition(engine.sessions[0] === newest && engine.central.cancelled.count == 1)
             print("PASS engine stale ready/failure/input ownership and unrelated controller preservation")
@@ -50,24 +59,18 @@ import Foundation
             precondition(engine.sessions[0] === newest && engine.sessions[1] === other)
             print("PASS engine pending deadline retires its own session")
             let now = ProcessInfo.processInfo.systemUptime
-            newest.lastActivityAt = now - 120; newest.lastReportAt = now
-            other.lastActivityAt = now - 120; other.lastReportAt = now
-            engine.mouseController.acceptsPointer = true
-            engine.handlePointerInput(newest, state: ControllerState())
-            engine.mouseController.acceptsPointer = false
-            engine.handlePointerInput(other, state: ControllerState())
+            newest.lastReportAt = now
+            other.lastReportAt = now
             engine.sweepIdleSessions()
-            precondition(engine.sessions[0] === newest && engine.sessions[1] == nil,
-                         "Accepted pointer input must prevent idle retirement; rejected input must not")
+            precondition(engine.sessions.count == 2, "Fresh physical input must not be retired by application idle policy")
             newest.lastReportAt = now - 10
             engine.sweepIdleSessions()
-            precondition(engine.sessions.isEmpty && engine.idleSweepTimer == nil,
-                         "Pointer activity must not bypass the stale report watchdog")
-            precondition(engine.pointerActivity.isEmpty, "Retirement must drop pointer ownership")
-            engine.mouseController.acceptsPointer = true
-            engine.handlePointerInput(newest, state: ControllerState())
-            precondition(engine.pointerActivity.isEmpty, "Late pointer input must not revive a retired owner")
-            print("PASS pointer-only activity, stale input recovery and empty maintenance")
+            precondition(newest.isRetired && engine.sessions[0] == nil && engine.sessions[1] === other,
+                         "The physical stale-input watchdog must retire only the stale attempt")
+            other.lastReportAt = now - 10
+            engine.sweepIdleSessions()
+            precondition(engine.sessions.isEmpty && engine.idleSweepTimer == nil)
+            print("PASS physical stale-input recovery and empty maintenance")
         }
         let done = DispatchSemaphore(value: 0)
         engine.stop { done.signal() }
@@ -75,14 +78,13 @@ import Foundation
         engine.btQueue.sync {
             precondition(!engine.running && engine.sessions.isEmpty && engine.connecting.isEmpty)
             precondition(engine.idleSweepTimer == nil)
-            precondition(engine.deadlines.isEmpty && engine.keyboardMapper.resets == 1)
-            precondition(engine.mouseController.resets >= 3 && engine.gestureRecognizer.resets == 1)
+            precondition(engine.deadlines.isEmpty && engine.currentControllers.isEmpty)
             print("PASS engine stop releases input and clears sessions/deadlines")
         }
-        engine.resume(); engine.setSuspended(true)
-        engine.btQueue.sync { precondition(engine.running && engine.suspended) }
-        engine.setSuspended(false)
-        engine.btQueue.sync { precondition(engine.running && !engine.suspended) }
-        print("PASS engine pause/resume and sleep state")
+        engine.start()
+        engine.btQueue.sync { precondition(engine.running) }
+        engine.stop()
+        engine.btQueue.sync { precondition(!engine.running && engine.sessions.isEmpty) }
+        print("PASS transport start/stop and terminal retirement")
     }
 }

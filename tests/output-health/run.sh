@@ -1,10 +1,11 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+source tests/support/kit-sources.sh
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-swiftc -swift-version 6 -warnings-as-errors \
- Sources/FinallyTheControllerWorks/Protocol/Switch2Protocol.swift \
+swiftc "${kit_flags[@]}" -swift-version 6 -warnings-as-errors \
+ "${kit_sources[@]}" \
  Sources/FinallyTheControllerWorks/Runtime/OutputHealth.swift \
  tests/output-health/PolicyTests.swift -o "$work/policy"
 "$work/policy"
@@ -32,9 +33,7 @@ python3 - "$work" <<'PY'
 from pathlib import Path
 import re, sys
 out=Path(sys.argv[1]);base=Path('Sources/FinallyTheControllerWorks')
-s=(base/'Bluetooth/ControllerSession.swift').read_text()
-a=s.index('struct ControllerState:');b=s.index('/// Called on the Bluetooth queue.',a)
-(out/'State.swift').write_text('import Foundation\n'+s[a:b])
+(out/'State.swift').write_text('// ControllerState is compiled from the production Switch2Kit target.\n')
 for kind, source, fixture in [('UDP','UDPHub','tests/udp/UDPTests.swift'),('NETPAD','NetworkGamepadSink','tests/retroarch/NetworkTests.swift')]:
     s=(base/f'Output/{source}.swift').read_text()
     if sys.platform!='darwin':
@@ -43,8 +42,8 @@ for kind, source, fixture in [('UDP','UDPHub','tests/udp/UDPTests.swift'),('NETP
     (out/f'{kind}Types.swift').write_text(Path(fixture).read_text().split('@main')[0])
 PY
 for kind in UDP NETPAD; do
-  swiftc -swift-version 5 -D "HEALTH_$kind" \
-    Sources/FinallyTheControllerWorks/Protocol/Switch2Protocol.swift \
+  swiftc "${kit_flags[@]}" -swift-version 5 -D "HEALTH_$kind" \
+    "${kit_sources[@]}" \
     Sources/FinallyTheControllerWorks/Runtime/BoundedStateMailbox.swift \
     Sources/FinallyTheControllerWorks/Runtime/OutputHealth.swift \
     "$work/State.swift" "$work/$kind.swift" "$work/${kind}Types.swift" \
@@ -53,8 +52,8 @@ for kind in UDP NETPAD; do
 done
 
 if [ "$(uname -s)" = Darwin ]; then
-  swiftc -swift-version 6 -warnings-as-errors \
-    Sources/FinallyTheControllerWorks/Protocol/Switch2Protocol.swift \
+  swiftc "${kit_flags[@]}" -swift-version 6 -warnings-as-errors \
+    "${kit_sources[@]}" \
     Sources/FinallyTheControllerWorks/Runtime/OutputHealth.swift \
     Sources/FinallyTheControllerWorks/UI/OutputStatusStore.swift \
     tests/output-health/StoreTests.swift -o "$work/store"
