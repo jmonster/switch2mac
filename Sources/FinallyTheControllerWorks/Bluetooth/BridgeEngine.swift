@@ -68,6 +68,17 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
     private var disconnecting = Set<UUID>()
     private var deadlines: [UUID: DispatchWorkItem] = [:]
     private var retryAfter: [UUID: TimeInterval] = [:]
+    private struct RetryAdvertisement {
+        let peripheral: CBPeripheral
+        let wasPairingMode: Bool
+        let expiresAt: TimeInterval
+    }
+    private var retryAdvertisements: [UUID: RetryAdvertisement] = [:]
+    private var retryWake: DispatchWorkItem?
+    private var retryWakeAt: TimeInterval?
+    private var retryWakeGeneration: UInt64 = 0
+    private var retryBlockedUntil: TimeInterval = 0
+
     private var observers: [NSObjectProtocol] = []
     private var configurations: [String: ControllerConfiguration] = [:]
     private var configurationSource: NSDictionary = [:]
@@ -194,6 +205,7 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
         connectedAt.removeValue(forKey: session.slot)
         mouseController.reset(serial: session.serialNumber)
         pointerActivity.removeValue(forKey: id)
+        retryAdvertisements.removeValue(forKey: id)
         if findingSession === session { stopFinding() }
         session.teardown()
         if cancel {
@@ -205,6 +217,7 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
     }
 
     private func resetConnections(cancel: Bool) {
+        resetConnectionRetries()
         discovery.cancelWindow()
         central.stopScan()
         let current = Array(sessions.values) + connecting.values.map { $0.session }
@@ -223,12 +236,93 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
         let work = DispatchWorkItem { [weak self, weak session] in
             guard let self, let session, self.connecting[id]?.session === session else { return }
             bridgeLog(.warning, "engine", "connection phase timed out; retiring attempt")
-            self.retryAfter[id] = ProcessInfo.processInfo.systemUptime + 2
+            self.noteConnectionFailure(id)
             self.retire(session, cancel: true)
             self.updateScanning()
         }
         deadlines[id] = work
         btQueue.asyncAfter(deadline: .now() + seconds, execute: work)
+    }
+
+    /// Record failure before retirement invokes updateScanning. No radio work
+    /// occurs here. Saturation keeps existing cooldowns instead of erasing them.
+    private func noteConnectionFailure(_ id: UUID) {
+        let now = ProcessInfo.processInfo.systemUptime
+        retryAfter = retryAfter.filter { $0.value > now || disconnecting.contains($0.key) }
+        retryAdvertisements = retryAdvertisements.filter { $0.value.expiresAt > now }
+        retryAdvertisements.removeValue(forKey: id)
+        if retryAfter[id] == nil && retryAfter.count >= Self.maxSessions * 8 {
+            // Fail closed under exceptional churn: one global two-second
+            // cooldown, no unbounded dictionary and no per-device timers.
+            retryBlockedUntil = max(retryBlockedUntil, now + 2)
+        } else {
+            retryAfter[id] = now + 2
+        }
+    }
+
+    private func cancelRetryWake() {
+        retryWakeGeneration &+= 1
+        retryWake?.cancel(); retryWake = nil; retryWakeAt = nil
+    }
+
+    private func resetConnectionRetries() {
+        cancelRetryWake()
+        retryAfter.removeAll(); retryAdvertisements.removeAll()
+        retryBlockedUntil = 0
+    }
+
+    /// Arm only the earliest future deadline. Expired entries waiting on a
+    /// terminal cancellation callback cannot create a zero-delay timer loop.
+    private func armRetryWake() {
+        guard running, !suspended, central.state == .poweredOn,
+              connecting.isEmpty, central.isScanning else { cancelRetryWake(); return }
+        let now = ProcessInfo.processInfo.systemUptime
+        let future = Array(retryAfter.values) + [retryBlockedUntil]
+        guard let deadline = future.filter({ $0 > now }).min() else { cancelRetryWake(); return }
+        guard retryWake == nil || retryWakeAt != deadline else { return }
+        cancelRetryWake()
+        let generation = retryWakeGeneration
+        let work = DispatchWorkItem { [weak self] in self?.wakeConnectionRetries(generation: generation) }
+        retryWake = work; retryWakeAt = deadline
+        btQueue.asyncAfter(deadline: .now() + max(0, deadline - now), execute: work)
+    }
+
+    private func wakeConnectionRetries(generation: UInt64) {
+        guard generation == retryWakeGeneration, retryWake != nil else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        let deadline = retryWakeAt
+        retryWake = nil; retryWakeAt = nil
+        guard running, !suspended, central.state == .poweredOn else { resetConnectionRetries(); return }
+        if let deadline, now < deadline { armRetryWake(); return }
+        retryAfter = retryAfter.filter { $0.value > now || disconnecting.contains($0.key) }
+        if retryBlockedUntil <= now { retryBlockedUntil = 0 }
+        // Duplicate filtering may have consumed the only wake advertisement.
+        // Cached, validated advertisements are retried directly below. Without
+        // one, a single fresh scan permits rediscovery; duplicates stay disabled.
+        if central.isScanning { central.stopScan() }
+        updateScanning()
+    }
+
+    /// Shared admission for fresh discovery and a deferred advertisement. A
+    /// terminal callback must release cancellation ownership before slot reuse.
+    private func beginConnection(_ peripheral: CBPeripheral, wasPairingMode: Bool) -> Bool {
+        let id = peripheral.identifier
+        let now = ProcessInfo.processInfo.systemUptime
+        guard running, !suspended, central.state == .poweredOn, connecting.isEmpty,
+              !disconnecting.contains(id), now >= retryBlockedUntil,
+              now >= (retryAfter[id] ?? 0),
+              !sessions.values.contains(where: { $0.peripheral.identifier == id }),
+              let slot = freeSlot() else { return false }
+        retryAfter.removeValue(forKey: id); retryAdvertisements.removeValue(forKey: id)
+        cancelRetryWake()
+        let session = ControllerSession(peripheral: peripheral, slot: slot,
+                                        wasPairingMode: wasPairingMode, queue: btQueue, delegate: self)
+        connecting[id] = (session, slot)
+        central.stopScan()
+        publishState(.connecting)
+        central.connect(peripheral, options: nil)
+        armDeadline(session, seconds: 10)
+        return true
     }
 
     /// Only active, ready sessions require an idle/stale watchdog. Connecting
@@ -945,8 +1039,8 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
                 let data = phases[phaseIndex].make(frameInPhase, &sinePhase)
                 frameInPhase += 1
                 if frameInPhase >= phases[phaseIndex].frames {
-                    frameInPhase = 0
                     phaseIndex += 1
+                    frameInPhase = 0
                 }
                 return data
             } done: { stats in
@@ -1420,19 +1514,37 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
     // MARK: - Scan control (btQueue)
 
     private func updateScanning() {
-        guard running, !suspended else { central.stopScan(); publishState(.paused); return }
-        guard central.state == .poweredOn else { return }
-        let occupied = sessions.count + connecting.count
-        let scan = discovery.shouldScan(readyIDs: sessions.values.map { $0.peripheral.identifier })
-        if occupied < Self.maxSessions && scan {
+        guard running, !suspended else {
+            central.stopScan(); resetConnectionRetries(); publishState(.paused); return
+        }
+        guard central.state == .poweredOn else { resetConnectionRetries(); return }
+        let now = ProcessInfo.processInfo.systemUptime
+        retryAdvertisements = retryAdvertisements.filter { $0.value.expiresAt > now }
+        // Complete one connection/handshake before admitting another. Existing
+        // ready sessions continue delivering input while a retry waits.
+        guard connecting.isEmpty else {
+            central.stopScan(); cancelRetryWake(); publishState(.connecting); return
+        }
+        let occupied = sessions.count
+        let shouldDiscover = discovery.shouldScan(readyIDs: sessions.values.map { $0.peripheral.identifier })
+        if occupied < Self.maxSessions && shouldDiscover {
+            for (id, advertisement) in retryAdvertisements.sorted(by: {
+                if $0.value.expiresAt != $1.value.expiresAt { return $0.value.expiresAt < $1.value.expiresAt }
+                return $0.key.uuidString < $1.key.uuidString
+            }) where now >= (retryAfter[id] ?? 0) && !disconnecting.contains(id) {
+                if beginConnection(advertisement.peripheral, wasPairingMode: advertisement.wasPairingMode) { return }
+            }
             if !central.isScanning {
                 central.scanForPeripherals(withServices: nil, options: [
                     CBCentralManagerScanOptionAllowDuplicatesKey: false
                 ])
                 publishState(.scanning)
             }
+            armRetryWake()
         } else {
             if central.isScanning { central.stopScan() }
+            if !shouldDiscover { retryAdvertisements.removeAll() }
+            cancelRetryWake()
             publishState(occupied >= Self.maxSessions ? .idle : .ready)
         }
     }
@@ -1547,28 +1659,30 @@ extension BridgeEngine: CBCentralManagerDelegate {
                         advertisementData: [String: Any],
                         rssi RSSI: NSNumber) {
         guard running, !suspended, central.state == .poweredOn, central.isScanning,
-              !disconnecting.contains(peripheral.identifier),
-              ProcessInfo.processInfo.systemUptime >= (retryAfter[peripheral.identifier] ?? 0),
               let manu = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data,
               manu.count > 2,
               Switch2.u16(manu, 0) == Switch2.nintendoCompanyID,
               let adv = Switch2.parseAdvertisement(manufacturerData: manu.dropFirst(2)),
               connecting[peripheral.identifier] == nil,
-              !sessions.values.contains(where: { $0.peripheral.identifier == peripheral.identifier }),
-              let slot = freeSlot()
+              !sessions.values.contains(where: { $0.peripheral.identifier == peripheral.identifier })
         else { return }
 
+        let id = peripheral.identifier
+        let now = ProcessInfo.processInfo.systemUptime
+        if let notBefore = retryAfter[id], now < notBefore || disconnecting.contains(id) {
+            // Retain only the validated identity and pairing flag, not arbitrary
+            // advertisement data. Never reuse observations older than 10 seconds.
+            if retryAdvertisements[id] != nil || retryAdvertisements.count < Self.maxSessions * 8 {
+                retryAdvertisements[id] = RetryAdvertisement(peripheral: peripheral,
+                    wasPairingMode: adv.isPairing, expiresAt: now + 10)
+            }
+            armRetryWake()
+            return
+        }
+        guard !disconnecting.contains(id), now >= retryBlockedUntil else { armRetryWake(); return }
         bridgeLog(.info, "engine",
                   "found \(adv.model.displayName) rssi=\(RSSI) \(adv.isPairing ? "(pairing mode)" : "(wake)")")
-        let session = ControllerSession(peripheral: peripheral, slot: slot,
-                                        wasPairingMode: adv.isPairing,
-                                        queue: btQueue, delegate: self)
-        connecting[peripheral.identifier] = (session, slot)
-        central.stopScan()
-        publishState(.connecting)
-        central.connect(peripheral, options: nil)
-
-        armDeadline(session, seconds: 10)
+        _ = beginConnection(peripheral, wasPairingMode: adv.isPairing)
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
@@ -1584,11 +1698,14 @@ extension BridgeEngine: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager,
                         didFailToConnect peripheral: CBPeripheral,
                         error: Error?) {
-        disconnecting.remove(peripheral.identifier)
+        if disconnecting.remove(peripheral.identifier) != nil, central.isScanning {
+            // A deferred advertisement may have expired while cancellation was
+            // pending. Refresh duplicate filtering once at the terminal event.
+            central.stopScan()
+        }
         if let pending = connecting[peripheral.identifier], pending.session.peripheral === peripheral {
+            noteConnectionFailure(peripheral.identifier)
             retire(pending.session, cancel: false)
-            if retryAfter.count > 64 { retryAfter.removeAll() }
-            retryAfter[peripheral.identifier] = ProcessInfo.processInfo.systemUptime + 2
             bridgeLog(.warning, "engine", "connect failed (\(error?.localizedDescription ?? "unknown"))")
         }
         updateScanning()
@@ -1597,8 +1714,13 @@ extension BridgeEngine: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager,
                         didDisconnectPeripheral peripheral: CBPeripheral,
                         error: Error?) {
-        disconnecting.remove(peripheral.identifier)
+        if disconnecting.remove(peripheral.identifier) != nil, central.isScanning {
+            // A deferred advertisement may have expired while cancellation was
+            // pending. Refresh duplicate filtering once at the terminal event.
+            central.stopScan()
+        }
         if let pending = connecting[peripheral.identifier], pending.session.peripheral === peripheral {
+            noteConnectionFailure(peripheral.identifier)
             retire(pending.session, cancel: false)
         }
         if let session = sessions.values.first(where: { $0.peripheral === peripheral }) {
@@ -1634,6 +1756,7 @@ extension BridgeEngine: ControllerSessionDelegate {
 
     func sessionFailed(_ session: ControllerSession, reason: String) {
         guard owns(session) else { return }
+        noteConnectionFailure(session.peripheral.identifier)
         retire(session, cancel: true)
         updateScanning()
     }
