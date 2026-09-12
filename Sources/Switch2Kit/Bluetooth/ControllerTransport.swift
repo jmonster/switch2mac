@@ -184,7 +184,7 @@ package final class ControllerTransport: NSObject, @unchecked Sendable {
     private func controllerSnapshot(_ session: ControllerSession) -> Switch2Controller {
         let info = session.info
         return Switch2Controller(id: .init(rawValue: session.peripheral.identifier), model: session.model,
-            state: session.state.snapshot(model: session.model, receivedAt: session.lastReportAt, sensorProfile: session.sensorProfile),
+            state: session.state.snapshot(model: session.model, receivedAt: session.lastReportAt, sensorProfile: session.sensorProfile, sequence: session.reportCount),
             connectedAt: connectedAt[session.slot] ?? Date(),
             bodyColor: info.map { .init(red: $0.bodyColor.0, green: $0.bodyColor.1, blue: $0.bodyColor.2) },
             buttonColor: info.map { .init(red: $0.buttonColor.0, green: $0.buttonColor.1, blue: $0.buttonColor.2) },
@@ -412,7 +412,7 @@ package final class ControllerTransport: NSObject, @unchecked Sendable {
 
 extension ControllerTransport: CBCentralManagerDelegate {
 
-    func centralManagerDidUpdateState(_ central: CBCentralManager) {
+    package func centralManagerDidUpdateState(_ central: CBCentralManager) {
         guard central === self.central else { return }
         switch central.state {
         case .unknown: bluetoothState = .unknown
@@ -442,10 +442,11 @@ extension ControllerTransport: CBCentralManagerDelegate {
         }
     }
 
-    func centralManager(_ central: CBCentralManager,
+    package func centralManager(_ central: CBCentralManager,
                         didDiscover peripheral: CBPeripheral,
                         advertisementData: [String: Any],
                         rssi RSSI: NSNumber) {
+        guard central === self.central else { return }
         guard running, !suspended, central.state == .poweredOn, central.isScanning,
               let manu = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data,
               manu.count > 2,
@@ -473,7 +474,8 @@ extension ControllerTransport: CBCentralManagerDelegate {
         _ = beginConnection(peripheral, wasPairingMode: adv.isPairing)
     }
 
-    func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+    package func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        guard central === self.central else { return }
         guard !disconnecting.contains(peripheral.identifier), running, !suspended,
               let pending = connecting[peripheral.identifier], pending.session.peripheral === peripheral else {
             central.cancelPeripheralConnection(peripheral); return
@@ -485,9 +487,10 @@ extension ControllerTransport: CBCentralManagerDelegate {
         pending.session.begin()
     }
 
-    func centralManager(_ central: CBCentralManager,
+    package func centralManager(_ central: CBCentralManager,
                         didFailToConnect peripheral: CBPeripheral,
                         error: Error?) {
+        guard central === self.central else { return }
         if disconnecting.remove(peripheral.identifier) != nil, central.isScanning {
             // A deferred advertisement may have expired while cancellation was
             // pending. Refresh duplicate filtering once at the terminal event.
@@ -502,9 +505,10 @@ extension ControllerTransport: CBCentralManagerDelegate {
         updateScanning()
     }
 
-    func centralManager(_ central: CBCentralManager,
+    package func centralManager(_ central: CBCentralManager,
                         didDisconnectPeripheral peripheral: CBPeripheral,
                         error: Error?) {
+        guard central === self.central else { return }
         if disconnecting.remove(peripheral.identifier) != nil, central.isScanning {
             // A deferred advertisement may have expired while cancellation was
             // pending. Refresh duplicate filtering once at the terminal event.

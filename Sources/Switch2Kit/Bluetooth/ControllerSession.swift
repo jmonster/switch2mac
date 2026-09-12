@@ -737,7 +737,7 @@ package final class ControllerSession: NSObject, @unchecked Sendable {
 
 extension ControllerSession: CBPeripheralDelegate {
 
-    func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+    package func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         guard !ended else { return }
         if error != nil { fail("service discovery failed"); return }
         for service in peripheral.services ?? [] {
@@ -745,7 +745,7 @@ extension ControllerSession: CBPeripheralDelegate {
         }
     }
 
-    func peripheral(_ peripheral: CBPeripheral,
+    package func peripheral(_ peripheral: CBPeripheral,
                     didDiscoverCharacteristicsFor service: CBService,
                     error: Error?) {
         guard !ended else { return }
@@ -766,7 +766,7 @@ extension ControllerSession: CBPeripheralDelegate {
         }
     }
 
-    func peripheral(_ peripheral: CBPeripheral,
+    package func peripheral(_ peripheral: CBPeripheral,
                     didUpdateNotificationStateFor characteristic: CBCharacteristic,
                     error: Error?) {
         guard !ended else { return }
@@ -795,24 +795,24 @@ extension ControllerSession: CBPeripheralDelegate {
         }
     }
 
-    func peripheral(_ peripheral: CBPeripheral, didReadRSSI RSSI: NSNumber, error: Error?) {
+    package func peripheral(_ peripheral: CBPeripheral, didReadRSSI RSSI: NSNumber, error: Error?) {
         if !ended, error == nil { onRSSI?(RSSI.intValue) }
     }
 
     /// Outbound buffer has space again; resume bounded protocol and optional companion writes.
-    func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
+    package func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
         pumpWrites()
         writeCapacityAvailable()
     }
 
-    func peripheral(_ peripheral: CBPeripheral, didModifyServices invalidatedServices: [CBService]) {
+    package func peripheral(_ peripheral: CBPeripheral, didModifyServices invalidatedServices: [CBService]) {
         guard !ended, invalidatedServices.contains(where: { service in
             (service.characteristics ?? []).contains { ch in chars.values.contains { $0 === ch } }
         }) else { return }
         fail("controller services changed; reconnect required")
     }
 
-    func peripheral(_ peripheral: CBPeripheral,
+    package func peripheral(_ peripheral: CBPeripheral,
                     didUpdateValueFor characteristic: CBCharacteristic,
                     error: Error?) {
         guard !ended, error == nil, let data = characteristic.value else { return }

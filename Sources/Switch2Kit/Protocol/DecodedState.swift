@@ -25,7 +25,8 @@ package struct ControllerState: Sendable {
     package init() {}
 
     package func snapshot(model: Switch2ControllerModel, receivedAt: TimeInterval,
-                          sensorProfile: Switch2.Feature.SensorProfile = .compatibility) -> Switch2ControllerState {
+                          sensorProfile: Switch2.Feature.SensorProfile = .compatibility,
+                          sequence: UInt64 = 0) -> Switch2ControllerState {
         let flags = Switch2.Feature.flags(for: model, profile: sensorProfile)
         return Switch2ControllerState(buttons: buttons,
             leftStick: model.capabilities.contains(.leftStick) ? .init(x: leftStick.x, y: leftStick.y) : nil,
@@ -39,6 +40,6 @@ package struct ControllerState: Sendable {
                 magneticFieldRaw: .init(x: mag.0, y: mag.1, z: mag.2), temperatureCelsius: temperatureC) : nil,
             optical: flags & Switch2.Feature.mouse != 0 ? .init(xCounter: mouseX, yCounter: mouseY,
                 surfaceQualityRaw: surfaceQuality, liftDistanceRaw: liftDistance) : nil,
-            receivedAt: receivedAt)
+            receivedAt: receivedAt, sequence: sequence)
     }
 }

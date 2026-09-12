@@ -248,15 +248,17 @@ public struct Switch2ControllerState: Equatable, Sendable {
     public let optical: Switch2OpticalState?
     /// Host monotonic receive time in seconds since boot; never compare across machines or boots.
     public let receivedAt: TimeInterval
+    /// Per-connection report sequence starting at one. Gaps reveal dropped input; fixtures may use zero.
+    public let sequence: UInt64
     /// Creates an input value, useful for host adapters and deterministic tests.
     public init(buttons: Switch2Buttons = [], leftStick: Switch2Stick? = nil,
                 rightStick: Switch2Stick? = nil, leftTrigger: Switch2Trigger = .init(),
                 rightTrigger: Switch2Trigger = .init(), battery: Switch2Battery = .init(),
                 motion: Switch2Motion? = nil, optical: Switch2OpticalState? = nil,
-                receivedAt: TimeInterval = 0) {
+                receivedAt: TimeInterval = 0, sequence: UInt64 = 0) {
         self.buttons = buttons; self.leftStick = leftStick; self.rightStick = rightStick
         self.leftTrigger = leftTrigger; self.rightTrigger = rightTrigger; self.battery = battery
-        self.motion = motion; self.optical = optical; self.receivedAt = receivedAt
+        self.motion = motion; self.optical = optical; self.receivedAt = receivedAt; self.sequence = sequence
     }
 }
 
@@ -295,6 +297,8 @@ public struct Switch2Controller: Identifiable, Equatable, Sendable {
     /// Hardware serial only when the host explicitly enables identity access. Nil by default.
     /// Never log this automatically. No raw identity or serial is passed to the diagnostic handler.
     public let serialNumber: String?
+    /// Transient token for this connection. Changes on reconnect; not a persistent device identity.
+    public var connectionID: UUID { sessionGeneration }
     package let sessionGeneration: UUID
     package let lastActivityAt: TimeInterval
     package init(id: Switch2ControllerID, model: Switch2ControllerModel, state: Switch2ControllerState,

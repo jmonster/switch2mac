@@ -136,19 +136,26 @@ public enum Switch2ControllerEvent: Sendable {
 /// Resource and privacy choices for one independent manager. No singleton is required.
 public struct Switch2ControllerConfiguration: Sendable {
     /// Initial discovery policy. On-demand is the reusable-library default.
-    public var discoveryMode: Switch2DiscoveryMode
+    public let discoveryMode: Switch2DiscoveryMode
     /// Initial locally remembered identities. Duplicates are removed; the resource limit bounds storage.
-    public var rememberedControllers: [Switch2ControllerID]
+    public let rememberedControllers: [Switch2ControllerID]
     /// Physical-controller resource limit, clamped to 1...64. It is not a logical-player limit.
-    public var maximumControllers: Int
+    public let maximumControllers: Int
     /// Explicitly include hardware serials in controller snapshots for legacy host mappings.
     /// False by default. This never enables serials in diagnostic records.
-    public var includeSerialNumbers: Bool
+    public let includeSerialNumbers: Bool
     /// Creates configuration; applications own any persistence and sleep/wake policy.
     public init(discoveryMode: Switch2DiscoveryMode = .onDemand,
                 rememberedControllers: [Switch2ControllerID] = [], maximumControllers: Int = 16,
                 includeSerialNumbers: Bool = false) {
-        self.discoveryMode = discoveryMode; self.rememberedControllers = rememberedControllers
-        self.maximumControllers = min(64, max(1, maximumControllers)); self.includeSerialNumbers = includeSerialNumbers
+        self.discoveryMode = discoveryMode
+        self.maximumControllers = min(64, max(1, maximumControllers))
+        self.includeSerialNumbers = includeSerialNumbers
+        var unique: [Switch2ControllerID] = []
+        for id in rememberedControllers where !unique.contains(id) {
+            unique.append(id)
+            if unique.count == self.maximumControllers { break }
+        }
+        self.rememberedControllers = unique
     }
 }

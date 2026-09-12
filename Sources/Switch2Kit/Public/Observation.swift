@@ -28,6 +28,8 @@ package struct EventEnvelope: Sendable {
     package let sequence: UInt64
     package let event: Switch2ControllerEvent
     package let lifetime: SessionLifetime?
+    // Only snapshots carry this bounded ready-set token list. No session objects escape.
+    package var snapshotLifetimes: [SessionLifetime] = []
 }
 
 // Every mutable field is mutex-protected; handler calls are serialized by a single scheduled drain.
@@ -77,11 +79,10 @@ package final class EventMailbox: Sendable {
             if next.0 { envelope = current() }
             else if let item = next.1 { envelope = item }
             else { break }
-            // State snapshots are authoritative at delivery time, never historical ready sets.
-            switch envelope.event {
-            case .snapshot, .status: envelope = current()
-            default: break
-            }
+            // Preserve FIFO delivery at full rate. Refresh a historical snapshot only
+            // when one of its attempts retired; refreshing every status used to jump
+            // the sequence watermark over valid queued input even without overflow.
+            if envelope.snapshotLifetimes.contains(where: { !$0.isActive }) { envelope = current() }
             guard envelope.lifetime?.isActive != false else { continue }
             let deliver = state.withLock { value in
                 guard !value.cancelled, envelope.sequence > value.delivered else { return false }
@@ -111,11 +112,13 @@ package final class ControllerEventHub: Sendable {
         var sequence: UInt64 = 1
         var nextObserver: UInt64 = 0
         var observers: [UInt64: EventMailbox] = [:]
+        var lifetimes: [Switch2ControllerID: SessionLifetime] = [:]
     }
     private let state = Mutex(State())
     package var snapshot: Switch2ManagerSnapshot { state.withLock { $0.snapshot } }
     package func current() -> EventEnvelope {
-        state.withLock { EventEnvelope(sequence: $0.sequence, event: .snapshot($0.snapshot), lifetime: nil) }
+        state.withLock { EventEnvelope(sequence: $0.sequence, event: .snapshot($0.snapshot), lifetime: nil,
+                                         snapshotLifetimes: Array($0.lifetimes.values)) }
     }
     package func observe(queue: DispatchQueue, capacity: Int, interval: TimeInterval = 0,
                          handler: @escaping @Sendable (Switch2ControllerEvent) -> Void) throws -> Switch2ControllerObservation {
@@ -127,7 +130,8 @@ package final class ControllerEventHub: Sendable {
             guard value.observers.count < 32 else { throw Switch2KitError.observerLimitReached }
             value.nextObserver &+= 1
             let id = value.nextObserver; value.observers[id] = mailbox
-            mailbox.enqueue(EventEnvelope(sequence: value.sequence, event: .snapshot(value.snapshot), lifetime: nil))
+            mailbox.enqueue(EventEnvelope(sequence: value.sequence, event: .snapshot(value.snapshot), lifetime: nil,
+                                          snapshotLifetimes: Array(value.lifetimes.values)))
             return id
         }
         return Switch2ControllerObservation(mailbox: mailbox) { [weak self] in
@@ -139,7 +143,19 @@ package final class ControllerEventHub: Sendable {
                          lifetime: SessionLifetime? = nil) {
         state.withLock { value in
             value.snapshot = snapshot; value.sequence &+= 1
-            let envelope = EventEnvelope(sequence: value.sequence, event: event, lifetime: lifetime)
+            if let lifetime {
+                switch event {
+                case .connected(let controller), .input(let controller): value.lifetimes[controller.id] = lifetime
+                default: break
+                }
+            }
+            let readyIDs = Set(snapshot.controllers.map(\.id))
+            value.lifetimes = value.lifetimes.filter { readyIDs.contains($0.key) }
+            var envelope = EventEnvelope(sequence: value.sequence, event: event, lifetime: lifetime)
+            switch event {
+            case .snapshot, .status: envelope.snapshotLifetimes = Array(value.lifetimes.values)
+            default: break
+            }
             for mailbox in value.observers.values { mailbox.enqueue(envelope) }
         }
     }
@@ -147,6 +163,7 @@ package final class ControllerEventHub: Sendable {
         state.withLock { value in
             for mailbox in value.observers.values { mailbox.cancel() }
             value.observers.removeAll()
+            value.lifetimes.removeAll()
         }
     }
 }
