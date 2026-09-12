@@ -1,53 +1,51 @@
-# RetroArch fork integration
+# RetroArch integration
 
-Adapted from vialoh/switch2mac retroarch-network-gamepad at
-2c7a396336f5a657a16a772b8c056d96ec6ff7f1 (upstream PR #1). The optional
-configuration toggle and default-off behavior remain. No Nintendo command,
-BLE handshake, decoding or entitlement changes are required.
+GameCubed can send controller input to RetroArch's network gamepad receiver.
+The output is disabled by default and does not require a custom SDL library.
 
 ## Setup
 
-In RetroArch, enable Settings > Network > Network Gamepad and the desired
-Network Gamepad Users, then restart RetroArch. In this app's dashboard,
-enable Configuration > Network gamepad output (RetroArch). Both base ports
-must match (default 55400, with one port per player). The sink sends only to
-127.0.0.1; the receiver may listen on other interfaces, so do not enable it
-on an untrusted network. No patched SDL library is required for this path.
+In RetroArch, enable **Settings → Network → Network Gamepad** and the desired
+**Network Gamepad Users**, then restart RetroArch. In GameCubed's Dashboard,
+enable **Configuration → Network gamepad output (RetroArch)**. Both base ports
+must match: the default is 55400, with one port per player.
 
-The original desired-state timer erased taps completed before its next tick.
-The corrected sink retains ordered button edges (up to 256 per player),
-coalesces analog positions separately, and retains the existing 60/s pacing.
-Overflow explicitly neutralizes that player's output and logs a failure;
-disable/re-enable network output to retry. It never silently drops oldest
-button edges while pretending the stream is intact.
+GameCubed sends only to `127.0.0.1`. RetroArch's unauthenticated receiver may
+listen on other interfaces; enable it only on a trusted network.
 
-Full periodic refreshes include zeros/releases, not only held values, so a
-lost release can converge later. A disconnect/disable attempts repeated
-neutral refreshes. Changing the destination first paces 20 neutral control
-messages to the old port, then establishes current state at the new port;
-input during that explicit configuration reset becomes the new initial state.
-Cancelling a destination change reasserts current state at the original port
-and resumes ordered edge delivery. Normal input/taps do not use that reset
-policy. Send failures retain pending work; sendto success means kernel
-acceptance, not remote acknowledgement.
+## Delivery behavior
 
-The 20-byte native little-endian message layout was cross-checked against
-libretro/RetroArch commit 81478f2aa2abb942cfacb2109cbc25a4bd3b46ca,
-input/input_driver.h and tools/ra_stress.md. This legacy protocol updates one
-control per datagram and receiver polling/pacing can lose UDP traffic. It is
-not an atomic full-state or lossless channel, and it has no rumble return path.
-GameCube analog triggers still map to digital L2/R2 at the inherited threshold;
-this is not full analog-trigger fidelity. Use only on a trusted local network
-when enabling RetroArch's unauthenticated listener.
+The sink retains ordered button edges, up to 256 per player, coalesces analog
+positions separately, and uses 60/s pacing. Overflow neutralizes that player's
+output and logs a failure. Disable and re-enable network output to retry.
 
-Nine tests use the actual sink and real loopback sockets. Tests reproduce
-lost taps, missing release refreshes and cancelled destination changes against
-the corresponding earlier implementation. The visibility-only test copy
-avoids unrelated UI initialization; the complete app is separately built with
-Apple frameworks. Synthetic tests do not establish gameplay, physical timing
-or controller compatibility.
+Periodic refreshes include zeros and releases, allowing a lost release to
+converge later. Disconnect and disable attempt repeated neutral refreshes.
+Changing destination first paces 20 neutral control messages to the old port,
+then establishes state at the new port. Input received during that configuration
+reset becomes the new initial state. Cancelling the change reasserts state at
+the original port and resumes ordered edge delivery. Normal taps do not use
+that reset policy. Send failures retain pending work; `sendto` success means
+kernel acceptance, not remote acknowledgment.
 
-Run bash tests/retroarch/run.sh. The per-report DispatchQueue itself is not
-byte-bounded; this PR bounds retained digital edges and documents overload,
-not all memory. The optional browser output may coexist with this sink;
-neither listener is enabled by default.
+## Protocol limits
+
+The 20-byte native little-endian layout follows `input/input_driver.h` and
+`tools/ra_stress.md` in libretro/RetroArch revision
+`81478f2aa2abb942cfacb2109cbc25a4bd3b46ca`. The protocol updates one control per
+datagram. Receiver polling and UDP loss can discard traffic; this is not an
+atomic full-state or lossless channel. There is no rumble return path.
+GameCube analog triggers map to digital L2/R2 at the configured threshold,
+not full analog-trigger travel.
+
+## Testing
+
+Run `bash tests/retroarch/run.sh`. Tests use the actual sink and real loopback
+sockets to cover taps, release refreshes, and cancelled destination changes.
+The test copy adjusts visibility without initializing unrelated UI; macOS
+build checks compile the complete application with Apple frameworks.
+
+Retained digital edges are bounded; the per-report DispatchQueue is not
+byte-bounded. Automated tests do not establish gameplay timing or physical
+controller compatibility. Browser and RetroArch outputs can run together;
+both are disabled by default.
