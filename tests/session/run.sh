@@ -24,3 +24,15 @@ swiftc -swift-version 5 \
   "$work/ControllerSession.swift" tests/session/FrameworkFakes.swift \
   tests/session/FlowTests.swift -o "$work/flow-tests"
 "$work/flow-tests" "${SESSION_CASE:-all}"
+
+swiftc -swift-version 5 \
+  Sources/FinallyTheControllerWorks/Protocol/Switch2Protocol.swift \
+  "$work/ControllerSession.swift" tests/session/FrameworkFakes.swift \
+  tests/session/ResponseTests.swift -o "$work/response-tests"
+"$work/response-tests" "${SESSION_CASE:-all}"
+
+swiftc -swift-version 5 \
+  Sources/FinallyTheControllerWorks/Protocol/Switch2Protocol.swift \
+  "$work/ControllerSession.swift" tests/session/FrameworkFakes.swift \
+  tests/session/ResultTests.swift -o "$work/result-tests"
+"$work/result-tests"
