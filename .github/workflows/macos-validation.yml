@@ -12,7 +12,7 @@ concurrency:
 jobs:
   validate:
     runs-on: macos-26
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -23,6 +23,14 @@ jobs:
           swift --version
           xcodebuild -version
           git archive HEAD -o "$RUNNER_TEMP/source.zip"
+      - name: Describe and build the Swift package with Apple SDKs
+        run: |
+          swift package describe
+          swift build
+      - name: Test the Swift package with Swift 6 concurrency checking
+        run: swift test -Xswiftc -warnings-as-errors
+      - name: Build the independent example
+        run: swift build --product Switch2KitDemo
       - name: Run controller protocol and output regressions (no radio required)
         run: bash tests/run.sh
       - name: Build the actual app bundle (ad-hoc signing only)
