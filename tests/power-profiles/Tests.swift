@@ -9,7 +9,7 @@ final class PowerDelegate: ControllerSessionDelegate {
     static func main() {
         typealias Profile = Switch2.Feature.SensorProfile
         let expected = Profile(rawValue: CommandLine.arguments[1])!
-        precondition(Switch2.Feature.selectedProfile == expected)
+        precondition(ApplicationSensorPolicy.selectedProfile == expected)
         for profile in Profile.allCases {
             precondition(Profile.resolve(profile.rawValue, acknowledged: false) == .compatibility)
             precondition(Profile.resolve(profile.rawValue, acknowledged: true) == profile)
@@ -36,7 +36,7 @@ final class PowerDelegate: ControllerSessionDelegate {
             let radio = CBPeripheral(), queue = DispatchQueue(label: "power-profile-test")
             let delegate = PowerDelegate()
             let session = ControllerSession(peripheral: radio, slot: 0, wasPairingMode: false,
-                                            queue: queue, delegate: delegate)
+                                            queue: queue, delegate: delegate, sensorProfile: ApplicationSensorPolicy.selectedProfile)
             session.model = model
             session.chars[Switch2.GATT.commandWrite] = CBCharacteristic(Switch2.GATT.commandWrite)
             queue.sync {

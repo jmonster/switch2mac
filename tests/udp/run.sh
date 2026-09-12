@@ -1,6 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+source tests/support/kit-sources.sh
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 python3 - "$work" <<'PY'
@@ -12,11 +13,9 @@ s=re.sub(r'\bprivate\s+', '', s)
 if sys.platform != 'darwin':
     s=s.replace('import Darwin','import Glibc\nimport CoreFoundation').replace('SOCK_DGRAM,','Int32(SOCK_DGRAM.rawValue),')
 out.joinpath('UDPHub.swift').write_text(s)
-s=Path('Sources/FinallyTheControllerWorks/Bluetooth/ControllerSession.swift').read_text()
-a=s.index('struct ControllerState:'); b=s.index('/// Called on the Bluetooth queue.',a)
-out.joinpath('State.swift').write_text('import Foundation\n'+s[a:b])
+out.joinpath('State.swift').write_text('// ControllerState is compiled from the production Switch2Kit target.\n')
 PY
-swiftc -swift-version 5 Sources/FinallyTheControllerWorks/Protocol/Switch2Protocol.swift \
+swiftc "${kit_flags[@]}" -swift-version 5 "${kit_sources[@]}" \
  tests/output-health/Probe.swift Sources/FinallyTheControllerWorks/Runtime/OutputHealth.swift \
  Sources/FinallyTheControllerWorks/Runtime/BoundedStateMailbox.swift \
  "$work/State.swift" "$work/UDPHub.swift" tests/udp/UDPTests.swift -o "$work/test"

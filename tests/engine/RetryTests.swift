@@ -35,7 +35,7 @@ import Foundation
     }
     static func main() {
         func test(_ name: String, _ body: (BridgeEngine) -> Void) {
-            let engine = BridgeEngine()
+            let engine = BridgeEngine.fixture()
             engine.btQueue.sync {
                 defer { engine.running = false; engine.resetConnections(cancel: true) }
                 body(engine)
@@ -130,7 +130,7 @@ import Foundation
         test("quiet-policy-revokes-cached-discovery") { engine in
             let radio = failed(engine); discover(engine, radio)
             let active = ready(engine, slot: 0)
-            engine.discoveryDefaults.set(true, forKey: DiscoveryPolicy.enabledKey)
+            engine.discovery.configure(mode: .quietWhenReady, remembered: [])
             engine.updateScanning(); engine.discovery.useConnected([active.peripheral.identifier]); engine.updateScanning()
             precondition(!engine.central.isScanning && engine.retryWake == nil && engine.retryAdvertisements.isEmpty)
             precondition(engine.sessions[0] === active && !active.isRetired)
@@ -157,17 +157,17 @@ import Foundation
             precondition(engine.central.connections.count == 1)
         }
         // Exercise the public asynchronous stop/suspend/resume methods too.
-        for suspend in [false, true] {
-            let engine = BridgeEngine()
+        for _ in [false, true] {
+            let engine = BridgeEngine.fixture()
             var old: DispatchWorkItem!
             engine.btQueue.sync { let radio = failed(engine); discover(engine, radio); old = engine.retryWake }
-            if suspend { engine.setSuspended(true) } else { engine.stop() }
+            engine.stop() // Both application stop and sleep retire transport sessions.
             engine.btQueue.sync {
                 old.perform()
                 precondition(engine.retryWake == nil && engine.retryAdvertisements.isEmpty && engine.retryAfter.isEmpty)
                 precondition(engine.central.connections.count == 1)
             }
-            if suspend { engine.setSuspended(false) } else { engine.resume() }
+            engine.start() // Wake/resume starts a fresh transport lifecycle.
             engine.btQueue.sync {
                 precondition(engine.central.isScanning)
                 old.perform()
