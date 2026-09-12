@@ -1,0 +1,30 @@
+name: Apply reviewed Switch2Kit concurrency fixes
+on:
+  push:
+    branches: [refactor/switch2kit-library]
+    paths: [.github/switch2kit-refine.py, .github/workflows/switch2kit-apply-patch.yml]
+permissions:
+  contents: write
+jobs:
+  apply:
+    if: github.repository == 'jmonster/Switch2Kit' && github.ref == 'refs/heads/refactor/switch2kit-library'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+      - name: Apply the reviewed edits on this branch only
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = 76e349403cb477698e73bce2e1a5ab8ad3a57dca
+          python3 .github/switch2kit-refine.py
+          git add -- Sources/Switch2Kit Sources/FinallyTheControllerWorks/Runtime/Switch2KitAdapter.swift Sources/FinallyTheControllerWorks/Runtime/Switch2KitStateAdapter.swift
+          git diff --cached --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Fix Apple delegate visibility and bounded observation generation delivery'
+          git push origin HEAD:refs/heads/refactor/switch2kit-library
+          git rev-parse HEAD
