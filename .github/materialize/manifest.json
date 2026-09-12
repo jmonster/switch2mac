@@ -1,0 +1,7 @@
+{
+  "base": "a3a2b777bff5df37aa5a44bd8e0b977868ab6565",
+  "branch": "refactor/switch2kit-library",
+  "sha256": "491acaab8f1b4786757e2b2b971047ee942af34d550365dc05cd50d706668077",
+  "parts": 10,
+  "message": "Extract Switch2Kit physical-controller library and migrate dashboard consumer"
+}
