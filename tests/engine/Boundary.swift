@@ -7,14 +7,15 @@ final class Central {
     enum State { case poweredOn, poweredOff }
     var state = State.poweredOn
     var isScanning = false
+    var scans = 0, stops = 0
     var connections: [UUID] = []
     func scanForPeripherals(withServices: [String]?, options: [String: Any]?) {
         precondition(options?[CBCentralManagerScanOptionAllowDuplicatesKey] as? Bool == false)
-        isScanning = true
+        isScanning = true; scans += 1
     }
     func connect(_ peripheral: CBPeripheral, options: [String: Any]?) { connections.append(peripheral.identifier) }
     var cancelled: [UUID] = []
-    func stopScan() { isScanning = false }
+    func stopScan() { isScanning = false; stops += 1 }
     func cancelPeripheralConnection(_ peripheral: CBPeripheral) { cancelled.append(peripheral.identifier) }
 }
 final class Output {
@@ -43,6 +44,11 @@ final class BridgeEngine: ControllerSessionDelegate, @unchecked Sendable {
     var deadlines: [UUID: DispatchWorkItem] = [:]
     var connectedAt: [Int: Date] = [:]
     var retryAfter: [UUID: TimeInterval] = [:]
+    var retryAdvertisements: [UUID: RetryAdvertisement] = [:]
+    var retryWake: DispatchWorkItem?
+    var retryWakeAt: TimeInterval?
+    var retryWakeGeneration: UInt64 = 0
+    var retryBlockedUntil: TimeInterval = 0
     var lastButtonsByPlayer: [Int: Int] = [:], captureLast: [Int: Int] = [:]
     @MainActor var liveStates: [Int: ControllerState] = [:]
     weak var findingSession: ControllerSession?

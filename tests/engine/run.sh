@@ -22,7 +22,13 @@ def method(marker):
     return re.sub(r'\bprivate\s+', '', s[start:end])
 # Production lifecycle methods, unchanged; replace CoreBluetooth and unrelated
 # UI/output effects only. The full app is built separately against Apple SDKs.
-markers = ['func stop(completion:', 'func resume()', 'func setSuspended(',
+markers = ['private struct RetryAdvertisement', 'private func noteConnectionFailure(',
+           'private func cancelRetryWake()', 'private func resetConnectionRetries()',
+           'private func armRetryWake()', 'private func wakeConnectionRetries(',
+           'private func beginConnection(',
+           'func centralManager(_ central: CBCentralManager,\n                        didFailToConnect peripheral:',
+           'func centralManager(_ central: CBCentralManager,\n                        didDisconnectPeripheral peripheral:',
+           'func centralManager(_ central: CBCentralManager, didConnect peripheral:', 'func stop(completion:', 'func resume()', 'func setSuspended(',
            'private func owns(', 'private func retire(', 'private func resetConnections(',
            'private func armDeadline(', 'func sessionReady(', 'func sessionFailed(',
            'func sessionDidUpdateState(', 'private func updateIdleSweep()',
@@ -48,3 +54,18 @@ swiftc -swift-version 5 Sources/FinallyTheControllerWorks/Protocol/Switch2Protoc
  "$work/Session.swift" tests/session/FrameworkFakes.swift "$work/Engine.swift" \
  tests/discovery/EngineTests.swift -o "$work/discovery"
 "$work/discovery"
+
+swiftc -swift-version 5 Sources/FinallyTheControllerWorks/Protocol/Switch2Protocol.swift \
+ Sources/FinallyTheControllerWorks/Runtime/ControllerConfiguration.swift \
+ Sources/FinallyTheControllerWorks/Runtime/VisualizerMailbox.swift \
+ Sources/FinallyTheControllerWorks/Runtime/DiscoveryPolicy.swift \
+ "$work/Session.swift" tests/session/FrameworkFakes.swift "$work/Engine.swift" \
+ tests/engine/RetryRegression.swift -o "$work/retry-regression"
+"$work/retry-regression"
+swiftc -swift-version 5 Sources/FinallyTheControllerWorks/Protocol/Switch2Protocol.swift \
+ Sources/FinallyTheControllerWorks/Runtime/ControllerConfiguration.swift \
+ Sources/FinallyTheControllerWorks/Runtime/VisualizerMailbox.swift \
+ Sources/FinallyTheControllerWorks/Runtime/DiscoveryPolicy.swift \
+ "$work/Session.swift" tests/session/FrameworkFakes.swift "$work/Engine.swift" \
+ tests/engine/RetryTests.swift -o "$work/retry-tests"
+"$work/retry-tests"
