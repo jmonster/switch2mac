@@ -1,13 +1,12 @@
-# The browser bridge
+# Browser bridge
 
-This optional output lets supported Chromium web games consume controller
-state from the native menu-bar app without a system-wide virtual HID device.
-It adapts Andrei-Kondrykau's browser-bridge contribution; the current fork's
-access and lifecycle changes are described in [FORK-INTEGRATION.md](FORK-INTEGRATION.md).
+The browser output lets Chromium web games consume controller state from
+GameCubed without a system-wide virtual HID device. See
+[access and lifecycle](INTEGRATION.md) for listener limits and security details.
 
 ```
-Controller ──BLE──> menu-bar app ──ws://127.0.0.1:24810──> extension ──> navigator.getGamepads()
-                                <──────── rumble ─────────────────── vibrationActuator
+Controller ──BLE──> GameCubed ──ws://127.0.0.1:24810──> extension ──> navigator.getGamepads()
+                            <──────── rumble ─────────────────── vibrationActuator
 ```
 
 | File | Purpose |
@@ -17,67 +16,60 @@ Controller ──BLE──> menu-bar app ──ws://127.0.0.1:24810──> exten
 | `extension/bridge.js` | Relays messages between the service worker and page. |
 | `extension/shim.js` | Exposes standard-mapping gamepad snapshots and forwards supported rumble. |
 
-## Install in this fork
+## Install
 
-1. Build and run this branch's menu-bar app. The browser listener is disabled
-   by default; the upstream release does not include these fork repairs.
-2. In a Chromium browser open `chrome://extensions`, enable **Developer mode**,
-   click **Load unpacked**, and select `browser/extension`. Copy its 32-letter ID.
-3. Open **Browser Bridge Settings** in the menu-bar app. Enter that extension
-   ID, enable the bridge, and click **Apply Changes**. Empty/invalid IDs do not
-   open a listener. Moving the unpacked extension can change its ID.
-4. Open <https://hardwaretester.com/gamepad> and verify every control, then
-   test the intended game. Reload the extension after editing its files.
+1. Build and run GameCubed. The browser listener is disabled by default.
+2. In Chromium, open `chrome://extensions`, enable **Developer mode**, click
+   **Load unpacked**, and select `browser/extension` or the folder opened by
+   **Browser Bridge Settings → Show bundled extension**. Copy its 32-letter ID.
+3. In **Browser Bridge Settings**, enter the ID, enable the bridge, and click
+   **Apply Changes**. Empty or invalid IDs do not open a listener. Moving the
+   unpacked extension can change its ID.
+4. Open <https://hardwaretester.com/gamepad> and verify every control, then test
+   the intended game. Reload the extension after editing its files.
 
-The provided extension targets Chromium; no Safari or Firefox package is
-included. The original contributor reported Xbox Cloud Gaming with a Pro
-Controller 2. This fork has automated Node and real macOS WebSocket tests,
-not a new physical-controller/cloud-game acceptance result.
+No Safari or Firefox package is included. Automated Node and macOS WebSocket
+tests do not replace physical-controller and real-browser/game testing.
 
-The listener accepts only configured extension Origins, not arbitrary
-websites. Local native programs can forge Origin, so this is not authentication
-against other software running as the same user. See the integration notes
-for connection, message, and pending-send limits.
-
-GameCube HD rumble is intentionally not forwarded; verified preset rumble
-remains unavailable. Other models' effects refresh only for their requested
-lifetime, within the native session's existing 0.5-second intent timeout.
+The listener accepts only configured extension Origins. Other native programs
+can forge Origin, so this does not authenticate software running as the same
+user. GameCube HD rumble is not forwarded; verified preset rumble remains
+unavailable. Other models' effects refresh only for their requested lifetime,
+within the native session's existing 0.5-second intent timeout.
 
 ## Live settings
 
-Applying changes closes existing clients, stops their owned rumble, invalidates
-queued input from the previous configuration, and restarts the loopback listener.
+Applying changes closes clients, stops their owned rumble, invalidates queued
+input from the previous configuration, and restarts the loopback listener.
 The extension reconnects without re-pairing the controller. Unchanged settings
 do not restart it. Bind failures retry while enabled; disabling cancels retries.
 No input reports are queued or encoded when disabled. Four small lifecycle/name
 records are retained so enabling does not require a controller reconnect.
 
-The settings window validates the entire entry (at most eight IDs), rather than
-silently keeping valid IDs from an invalid list. Enabled state and IDs are saved
-as one `browserBridgeConfiguration` preference dictionary. Legacy preferences
-are read only until this new value exists. Malformed new settings disable access
-rather than restoring an older allowlist. A saved setting is not proof that a
-listener bound, the extension connected, or a game received input.
+The settings window validates the entire entry, with at most eight IDs.
+Enabled state and IDs are saved together as `browserBridgeConfiguration`.
+Legacy preferences are read only until that dictionary exists. Malformed new
+settings disable access rather than restoring an older allowlist. A saved
+setting does not prove that the listener bound or that a game received input.
 
 ## Troubleshooting
 
-Check the dashboard log for `opt-in browser bridge on 127.0.0.1:24810`.
-Verify the toggle and exact extension ID, then click **Apply Changes**. A second running
-copy can occupy the port. The controller must separately appear connected in
-the dashboard before its input can reach the browser.
+Check the dashboard log for `opt-in browser bridge on 127.0.0.1:24810`. Verify
+the toggle and exact extension ID, then click **Apply Changes**. A second copy
+can occupy the port. The controller must appear connected in Dashboard before
+its input can reach the browser.
 
-Confirm that the extension is enabled and the current site matches an entry
-in `manifest.json`. After loading/reloading the extension, reload game tabs:
-the shim installs when the page loads. The service-worker console is available
-under `chrome://extensions` → Inspect views. Include its errors, browser/OS
-version and the tested app commit when reporting a problem.
+Confirm that the extension is enabled and the site matches its manifest.
+Reload game tabs after loading or reloading the extension: the shim installs
+when the page loads. The service-worker console is available under
+`chrome://extensions` → Inspect views. Include its errors, browser/OS version,
+and the app's source revision when reporting a problem.
 
 ## Layout
 
-The inherited positional layout maps Switch B/A/Y/X to standard gamepad
-indices 0/1/2/3. Set `NINTENDO_LABELS` to `true` in `shim.js` for label-based
-mapping, then reload the extension. Check the GameCube's different physical
-layout in the intended game rather than assuming Pro Controller ergonomics.
+The positional layout maps Switch B/A/Y/X to standard gamepad indices 0/1/2/3.
+Set `NINTENDO_LABELS` to `true` in `shim.js` for label-based mapping, then reload
+the extension. Check the GameCube's different physical layout in the game.
 
 | Standard index | Xbox name | Switch 2 control |
 |---|---|---|
@@ -91,20 +83,19 @@ layout in the intended game rather than assuming Pro Controller ergonomics.
 | 17 | Share | Capture |
 | 18 / 19 / 20 | — | C / GL / GR, only with `EXTRA_BUTTONS = true` |
 
-App-side remapping runs before this output. Trigger travel, physical clicks,
-and per-game mappings still require hardware acceptance.
+App-side remapping runs before this output. Check trigger travel, physical
+clicks, and per-game mappings on hardware.
 
 ## Identity and sites
 
-The default is a Nintendo compatibility persona (`Vendor: 057e Product: 2069`),
-not an assertion of every model's physical product ID. `PERSONA_DEFAULT` in
-`shim.js` can select the inherited Xbox persona. A site's local override is
+The default Nintendo compatibility persona is `Vendor: 057e Product: 2069`,
+not a claim about every model's physical product ID. `PERSONA_DEFAULT` in
+`shim.js` selects the Xbox persona. A site's override is
 `localStorage.ftcwPersona = 'xbox'` (or `'nintendo'`), followed by reload.
 
-The extension injects only into the sites listed in its manifest. Adding a
-site broadens that access; add only intended game sites and reload. Multiple
-tabs receive the same controllers. Native-client rumble ownership does not
-arbitrate competing pages sharing the same extension connection.
+The extension injects only into sites listed in its manifest. Add only intended
+game sites and reload. Multiple tabs receive the same controllers. Native-client
+rumble ownership does not arbitrate pages sharing an extension connection.
 
 ## Protocol
 
@@ -121,7 +112,7 @@ hub → page   {"t":"hello","v":1}
 page → hub   {"t":"rumble","slot":0,"strong":0…1,"weak":0…1}
 ```
 
-`b` retains the app's Switch2.Buttons layout. Approved clients receive hello,
+`b` retains the `Switch2.Buttons` layout. Approved clients receive hello,
 complete current identity/name, and the last state for each active player.
-A rename no longer replaces the connection record in replay. All controller
-protocol decoding remains in the existing native implementation.
+Renames preserve the connection record in replay. Controller protocol decoding
+runs in the native application.
