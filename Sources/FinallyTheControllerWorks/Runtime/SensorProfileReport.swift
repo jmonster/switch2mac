@@ -4,7 +4,7 @@ import Foundation
 /// handshake. This is not a hardware probe and never starts a controller.
 enum SensorProfileReport {
     static func data(revision: String?) throws -> Data {
-        let profile = Switch2.Feature.selectedProfile
+        let profile = ApplicationSensorPolicy.selectedProfile
         let rawRevision = revision ?? ""
         let source = rawRevision.utf8.count == 40 && rawRevision.utf8.allSatisfy {
             (48...57).contains($0) || (97...102).contains($0)

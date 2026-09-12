@@ -1,21 +1,16 @@
 // BridgeEngine.swift
-// The conductor: owns the CBCentralManager, scans for Switch 2 controller
-// advertisements, and maps PHYSICAL Bluetooth sessions onto LOGICAL players.
-//
-// Two-level model:
-//  * Physical: up to 8 concurrent BLE sessions (8 Joy-Cons = 4 grips).
-//  * Logical: up to 4 player outputs (what games can see). A logical
-//    player is either one controller or a linked Joy-Con L+R pair.
-//  Links are persisted per serial pair, so grips re-form on reconnect.
-//  Player LEDs show the LOGICAL player number; both halves of a grip match.
-//
-// Threading model: ALL engine state is confined to `btQueue` — the queue the
-// central manager and every delegate callback run on. The only main-thread
-// state is the @Published properties, updated via explicit hops.
+// Application policy adapter for Switch2Kit physical-controller snapshots.
+// Four logical outputs and up to eight physical dashboard records preserve the
+// existing Joy-Con grouping, player order, settings, and output integrations.
+// No CoreBluetooth, handshake, report decoder, or calibration lives here.
+// All mutable policy/output state belongs to btQueue (the application's serial
+// output queue); only @Published presentation properties are main-actor isolated.
 
 import Foundation
 import Synchronization
-import CoreBluetooth
+import Combine
+import Switch2Kit
+import Switch2KitExperimental
 
 /// UI-facing snapshot of one logical controller (single or Joy-Con pair).
 struct ControllerStatus: Identifiable, Sendable {
@@ -65,19 +60,11 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
     @MainActor private var participantSnapshot: [(id: String, name: String)] = []
     private var running = true
     private var suspended = false
-    private var disconnecting = Set<UUID>()
-    private var deadlines: [UUID: DispatchWorkItem] = [:]
-    private var retryAfter: [UUID: TimeInterval] = [:]
-    private struct RetryAdvertisement {
-        let peripheral: CBPeripheral
-        let wasPairingMode: Bool
-        let expiresAt: TimeInterval
-    }
-    private var retryAdvertisements: [UUID: RetryAdvertisement] = [:]
-    private var retryWake: DispatchWorkItem?
-    private var retryWakeAt: TimeInterval?
-    private var retryWakeGeneration: UInt64 = 0
-    private var retryBlockedUntil: TimeInterval = 0
+    private let controllerManager: Switch2ControllerManager
+    private var experimentalSupport: Switch2ExperimentalControllerSupport!
+    private var controllerObservation: Switch2ControllerObservation?
+    private var lastDiscoveryPreference: (quiet: Bool, ids: [Switch2ControllerID])?
+    private var lastControllerPublication: TimeInterval = 0
 
     private var observers: [NSObjectProtocol] = []
     private var configurations: [String: ControllerConfiguration] = [:]
@@ -96,12 +83,10 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
             btQueue.async { [weak self] in self?.reloadConfiguration() }
         }
     }
-    private var central: CBCentralManager!
-    private let btQueue = DispatchQueue(label: "com.petersharma.ftcw.bluetooth")
+    private let btQueue = DispatchQueue(label: "io.github.jmonster.switch2mac.outputs")
 
     // btQueue-confined.
-    private var sessions: [Int: ControllerSession] = [:]     // physical slot →
-    private var connecting: [UUID: (session: ControllerSession, slot: Int)] = [:]
+    private var sessions: [Int: ApplicationController] = [:]     // physical slot →
     private var connectedAt: [Int: Date] = [:]
     private var sinks: [any ControllerOutputSink] = []
 
@@ -124,18 +109,41 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
             .filter { (0..<4).contains($0.value) }
 
     private var idleSweepTimer: DispatchSourceTimer?
-    private lazy var discovery = DiscoveryPolicy(queue: btQueue) { [weak self] in self?.updateScanning() }
 
     @MainActor override init() {
+        let configuration = Switch2ControllerConfiguration(
+            discoveryMode: UserDefaults.standard.bool(forKey: DiscoveryPolicy.enabledKey) ? .quietWhenReady : .automatic,
+            rememberedControllers: DiscoveryPolicy.savedControllers(), maximumControllers: Self.maxSessions,
+            includeSerialNumbers: true) // Explicit legacy mapping compatibility; never log serials.
+        controllerManager = Switch2ControllerManager(configuration: configuration) { record in
+            let level: LogLevel
+            switch record.level {
+            case .debug: level = .debug
+            case .info: level = .info
+            case .warning: level = .warning
+            case .error: level = .error
+            }
+            bridgeLog(level, "Switch2Kit/" + record.category.rawValue, record.message)
+        }
         super.init()
-        central = CBCentralManager(delegate: self, queue: btQueue)
+        experimentalSupport = Switch2ExperimentalControllerSupport(manager: controllerManager, on: btQueue) { [weak self] event in
+            self?.receiveExperimental(event)
+        }
+        experimentalSupport.setSensorProfile(.init(rawValue: ApplicationSensorPolicy.selectedProfile.rawValue) ?? .compatibility)
+        controllerObservation = try? controllerManager.observe(on: btQueue, bufferingNewest: 256) { [weak self] event in
+            self?.receiveController(event)
+        }
         btQueue.async { [weak self] in self?.reloadConfiguration() }
-        // The settings store posts this when a custom name changes; push the
-        // new names to sinks so games can relabel their joysticks live.
+        controllerManager.start()
         observers.append(NotificationCenter.default.addObserver(
             forName: UserDefaults.didChangeNotification, object: nil, queue: nil) { [weak self] _ in
                 self?.btQueue.async { [weak self] in self?.reloadConfiguration() }
         })
+    }
+    deinit {
+        controllerObservation?.cancel()
+        for observer in observers { NotificationCenter.default.removeObserver(observer) }
+        controllerManager.stop(completion: {})
     }
 
     func updateInputContext(_ context: InputContext) {
@@ -169,15 +177,16 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
         btQueue.async { [weak self] in
             guard let self else { completion?(); return }
             self.running = false
-            self.resetConnections(cancel: true)
+            self.resetConnections(cancel: false)
             self.publishState(.paused)
-            completion?()
+            self.controllerManager.stop { completion?() }
         }
     }
     func resume() {
         btQueue.async { [weak self] in
             guard let self else { return }
             self.running = true
+            if !self.suspended { self.controllerManager.start() }
             self.updateScanning()
         }
     }
@@ -185,145 +194,22 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
         btQueue.async { [weak self] in
             guard let self else { return }
             self.suspended = value
-            if value { self.resetConnections(cancel: true) }
-            else { self.updateScanning() }
+            if value { self.resetConnections(cancel: false); self.controllerManager.stop(completion: {}) }
+            else if self.running { self.controllerManager.start(); self.updateScanning() }
         }
-    }
-
-    private func owns(_ session: ControllerSession) -> Bool {
-        sessions[session.slot] === session || connecting[session.peripheral.identifier]?.session === session
     }
 
     /// Retire before requesting cancellation. CoreBluetooth cancellation is
     /// asynchronous; do not reuse this peripheral until its terminal callback.
-    private func retire(_ session: ControllerSession, cancel: Bool, recompute: Bool = true) {
-        guard owns(session) else { return }
-        let id = session.peripheral.identifier
-        if connecting[id]?.session === session { connecting.removeValue(forKey: id) }
-        if sessions[session.slot] === session { sessions.removeValue(forKey: session.slot) }
-        deadlines.removeValue(forKey: id)?.cancel()
-        connectedAt.removeValue(forKey: session.slot)
-        mouseController.reset(serial: session.serialNumber)
-        pointerActivity.removeValue(forKey: id)
-        retryAdvertisements.removeValue(forKey: id)
-        if findingSession === session { stopFinding() }
-        session.teardown()
-        if cancel {
-            disconnecting.insert(id)
-            central.cancelPeripheralConnection(session.peripheral)
-        }
-        updateIdleSweep()
-        if recompute { recomputeLogical(); updateScanning() }
-    }
-
-    private func resetConnections(cancel: Bool) {
-        resetConnectionRetries()
-        discovery.cancelWindow()
-        central.stopScan()
-        let current = Array(sessions.values) + connecting.values.map { $0.session }
-        for session in current { retire(session, cancel: cancel, recompute: false) }
-        recomputeLogical()
-        if !cancel { disconnecting.removeAll() }
-        stopFinding()
-        keyboardMapper.reset(); mouseController.reset(); gestureRecognizer.reset()
-        lastButtonsByPlayer.removeAll(); captureLast.removeAll()
-        if visualizer.clearAll() { scheduleVisualizerDrain() }
-    }
-
-    private func armDeadline(_ session: ControllerSession, seconds: Double) {
-        let id = session.peripheral.identifier
-        deadlines.removeValue(forKey: id)?.cancel()
-        let work = DispatchWorkItem { [weak self, weak session] in
-            guard let self, let session, self.connecting[id]?.session === session else { return }
-            bridgeLog(.warning, "engine", "connection phase timed out; retiring attempt")
-            self.noteConnectionFailure(id)
-            self.retire(session, cancel: true)
-            self.updateScanning()
-        }
-        deadlines[id] = work
-        btQueue.asyncAfter(deadline: .now() + seconds, execute: work)
-    }
 
     /// Record failure before retirement invokes updateScanning. No radio work
     /// occurs here. Saturation keeps existing cooldowns instead of erasing them.
-    private func noteConnectionFailure(_ id: UUID) {
-        let now = ProcessInfo.processInfo.systemUptime
-        retryAfter = retryAfter.filter { $0.value > now || disconnecting.contains($0.key) }
-        retryAdvertisements = retryAdvertisements.filter { $0.value.expiresAt > now }
-        retryAdvertisements.removeValue(forKey: id)
-        if retryAfter[id] == nil && retryAfter.count >= Self.maxSessions * 8 {
-            // Fail closed under exceptional churn: one global two-second
-            // cooldown, no unbounded dictionary and no per-device timers.
-            retryBlockedUntil = max(retryBlockedUntil, now + 2)
-        } else {
-            retryAfter[id] = now + 2
-        }
-    }
-
-    private func cancelRetryWake() {
-        retryWakeGeneration &+= 1
-        retryWake?.cancel(); retryWake = nil; retryWakeAt = nil
-    }
-
-    private func resetConnectionRetries() {
-        cancelRetryWake()
-        retryAfter.removeAll(); retryAdvertisements.removeAll()
-        retryBlockedUntil = 0
-    }
 
     /// Arm only the earliest future deadline. Expired entries waiting on a
     /// terminal cancellation callback cannot create a zero-delay timer loop.
-    private func armRetryWake() {
-        guard running, !suspended, central.state == .poweredOn,
-              connecting.isEmpty, central.isScanning else { cancelRetryWake(); return }
-        let now = ProcessInfo.processInfo.systemUptime
-        let future = Array(retryAfter.values) + [retryBlockedUntil]
-        guard let deadline = future.filter({ $0 > now }).min() else { cancelRetryWake(); return }
-        guard retryWake == nil || retryWakeAt != deadline else { return }
-        cancelRetryWake()
-        let generation = retryWakeGeneration
-        let work = DispatchWorkItem { [weak self] in self?.wakeConnectionRetries(generation: generation) }
-        retryWake = work; retryWakeAt = deadline
-        btQueue.asyncAfter(deadline: .now() + max(0, deadline - now), execute: work)
-    }
-
-    private func wakeConnectionRetries(generation: UInt64) {
-        guard generation == retryWakeGeneration, retryWake != nil else { return }
-        let now = ProcessInfo.processInfo.systemUptime
-        let deadline = retryWakeAt
-        retryWake = nil; retryWakeAt = nil
-        guard running, !suspended, central.state == .poweredOn else { resetConnectionRetries(); return }
-        if let deadline, now < deadline { armRetryWake(); return }
-        retryAfter = retryAfter.filter { $0.value > now || disconnecting.contains($0.key) }
-        if retryBlockedUntil <= now { retryBlockedUntil = 0 }
-        // Duplicate filtering may have consumed the only wake advertisement.
-        // Cached, validated advertisements are retried directly below. Without
-        // one, a single fresh scan permits rediscovery; duplicates stay disabled.
-        if central.isScanning { central.stopScan() }
-        updateScanning()
-    }
 
     /// Shared admission for fresh discovery and a deferred advertisement. A
     /// terminal callback must release cancellation ownership before slot reuse.
-    private func beginConnection(_ peripheral: CBPeripheral, wasPairingMode: Bool) -> Bool {
-        let id = peripheral.identifier
-        let now = ProcessInfo.processInfo.systemUptime
-        guard running, !suspended, central.state == .poweredOn, connecting.isEmpty,
-              !disconnecting.contains(id), now >= retryBlockedUntil,
-              now >= (retryAfter[id] ?? 0),
-              !sessions.values.contains(where: { $0.peripheral.identifier == id }),
-              let slot = freeSlot() else { return false }
-        retryAfter.removeValue(forKey: id); retryAdvertisements.removeValue(forKey: id)
-        cancelRetryWake()
-        let session = ControllerSession(peripheral: peripheral, slot: slot,
-                                        wasPairingMode: wasPairingMode, queue: btQueue, delegate: self)
-        connecting[id] = (session, slot)
-        central.stopScan()
-        publishState(.connecting)
-        central.connect(peripheral, options: nil)
-        armDeadline(session, seconds: 10)
-        return true
-    }
 
     /// Only active, ready sessions require an idle/stale watchdog. Connecting
     /// attempts already have their own deadlines; paused/empty engines do not poll.
@@ -345,14 +231,12 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
         guard running, !suspended else { return }
         let now = ProcessInfo.processInfo.systemUptime
         let minutes = AppConfig.idleSleepMinutes
-        let cutoff = now - (minutes.isFinite ? max(0, minutes) : 0) * 60
+        guard minutes.isFinite, minutes > 0 else { return }
+        let cutoff = now - minutes * 60
         for session in Array(sessions.values) {
-            // Audio capture intentionally suppresses normal reports on some firmware.
-            let stale = session.audioExperimentName == nil && now - session.lastReportAt > 5
-            let activity = max(session.lastActivityAt, pointerActivity[session.peripheral.identifier] ?? 0)
-            let idle = minutes.isFinite && minutes > 0 && activity < cutoff
-            if stale || idle {
-                bridgeLog(.warning, "engine", "\(session.displayName): \(stale ? "input stream stopped" : "idle timeout")")
+            let activity = max(session.lastActivityAt, pointerActivity[session.id.rawValue] ?? 0)
+            if activity < cutoff {
+                bridgeLog(.warning, "engine", "controller idle timeout")
                 retire(session, cancel: true)
             }
         }
@@ -410,7 +294,7 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
     func testRumble(serial: String) {
         btQueue.async { [weak self] in
             guard let self else { return }
-            let owners: [ControllerSession]
+            let owners: [ApplicationController]
             if let logical = self.players.values.first(where: { $0.id == serial }) {
                 owners = logical.slots.compactMap { self.sessions[$0] }
             } else {
@@ -447,693 +331,22 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
 
     /// NFC discovery probe per ndeadly's sniffed console traffic: start
     /// discovery (0x01/0x03), then poll status (0x01/0x05) for a tag UID.
-    func nfcProbe(serial: String) {
+    func nfcProbe(serial: String) { experimental(.nfcProbe, serial: serial) }
+    func audioPlayTone(serial: String) { experimental(.audioTone, serial: serial) }
+    func audioToneTest(serial: String) { experimental(.audioFormatProbe, serial: serial) }
+    func hapticMelody(serial: String) { experimental(.hapticMelody, serial: serial) }
+    private func experimental(_ action: Switch2ExperimentalAction, serial: String) {
         btQueue.async { [weak self] in
-            guard let self,
-                  let session = self.sessions.values.first(where: { $0.serialNumber == serial })
-            else { return }
-            bridgeLog(.info, "nfc",
-                      "starting NFC discovery — place the tag on the touchpoint "
-                      + "BEFORE clicking, or hold it on during the 30 s window")
-            // Hunt for out-of-band data channels while the probe runs.
-            session.setPromiscuousNotify(true)
-            let startPayload = Data([0x00, 0xE8, 0x03, 0x2C, 0x01])
-            session.experimentalCommand(0x01, 0x03, payload: startPayload) { resp in
-                bridgeLog(.info, "nfc",
-                          "discovery start response: \(resp.map(Self.hex) ?? "TIMEOUT")")
-                self.nfcPollStatus(session: session, attempt: 0)
-            }
+            guard let self, let session = self.sessions.values.first(where: { $0.serialNumber == serial }) else { return }
+            try? self.experimentalSupport.perform(action, on: session.id)
         }
     }
-
-    private func nfcPollStatus(session: ControllerSession, attempt: Int) {
-        guard attempt < 60 else {
-            bridgeLog(.warning, "nfc", "no tag detected after 30 s — probe over")
-            self.nfcStopDiscovery(session: session)
-            return
-        }
-        // Empirical: detection only ever succeeded when the tag was already
-        // on the antenna at discovery start — the start command appears to
-        // fire a short poll burst, and state 07 41 means "burst over, idle".
-        // Re-kick discovery every ~3 s so a tag placed late is still caught.
-        if attempt > 0, attempt % 6 == 0 {
-            session.experimentalCommand(0x01, 0x03,
-                                        payload: Data([0x00, 0xE8, 0x03, 0x2C, 0x01])) { resp in
-                bridgeLog(.debug, "nfc",
-                          "discovery re-kick: \(resp.map(Self.hex) ?? "TIMEOUT")")
-            }
-        }
-        btQueue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            guard let self else { return }
-            session.experimentalCommand(0x01, 0x05, payload: Data()) { resp in
-                guard let resp else {
-                    bridgeLog(.warning, "nfc", "status poll timed out; retrying")
-                    self.nfcPollStatus(session: session, attempt: attempt + 1)
-                    return
-                }
-                bridgeLog(.debug, "nfc", "status: \(Self.hex(resp))")
-                // Observed layout: ... byte[8] = UID length, bytes 9.. = UID.
-                if resp.count > 9, resp[resp.startIndex + 8] > 0,
-                   resp.count >= 9 + Int(resp[resp.startIndex + 8]) {
-                    let len = Int(resp[resp.startIndex + 8])
-                    let uid = resp.subdata(in: resp.startIndex + 9 ..< resp.startIndex + 9 + len)
-                    bridgeLog(.info, "nfc",
-                              "🎉 TAG DETECTED — UID \(uid.map { String(format: "%02X", $0) }.joined(separator: ":"))")
-                    bridgeLog(.info, "nfc", "full status: \(Self.hex(resp))")
-                    // Tactile ack, like the console does on an amiibo scan.
-                    session.setRumble(strong: 0.6, weak: 0)
-                    self.btQueue.asyncAfter(deadline: .now() + 0.15) {
-                        session.setRumble(strong: 0, weak: 0)
-                    }
-                    self.nfcReadTag(session: session, uid: uid)
-                } else {
-                    self.nfcPollStatus(session: session, attempt: attempt + 1)
-                }
-            }
-        }
-    }
-
-    /// Observed console "read device" payload: d0 07 = 2000 (ms timeout?),
-    /// then what appear to be NTAG page-range descriptors covering pages
-    /// 0x00–0x3B, 0x3C–0x77, 0x78–0x86 — all 135 pages = 540 bytes.
-    private static let nfcReadDevicePayload =
-        Data([0xD0, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-              0x01, 0x03, 0x00, 0x3B, 0x3C, 0x77, 0x78, 0x86, 0x00, 0x00])
-
-    /// After a tag is detected, read its data buffer. Sends "read device"
-    /// (0x01/0x06) to start the controller's RF read of the whole tag, then
-    /// loops "read buffer" (0x01/0x15) over increasing offsets, logging each
-    /// chunk as hex + ASCII so text records (e.g. an NDEF "banans") are
-    /// visible.
-    ///
-    /// Timing: 0x06 only ACKs — the controller then reads all 135 NTAG215
-    /// pages over RF, which is not instantaneous. We deliberately send NO
-    /// other NFC command for 1.2 s (a status poll mid-read may abort the RF
-    /// transaction), then log one status + the console's 0x0C "result info"
-    /// before pulling the buffer.
-    /// One stage of the read-unlock hunt: send each command in `sequence` in
-    /// order, wait `delay`, then try up to `readTries` chunk reads before
-    /// moving on to the next stage.
-    private struct NFCStage {
-        let label: String
-        let sequence: [(subcommand: UInt8, payload: Data)]
-        let delay: Double
-        let readTries: Int
-    }
-
-    private func nfcReadTag(session: ControllerSession, uid: Data) {
-        // Top hypothesis: an NFC reader must STOP POLLING before it can
-        // transact with the selected tag — 0x04 (previously assumed to be
-        // plain "stop discovery") is likely that halt, and belongs BETWEEN
-        // detection and read-device. Fall back to the UID-in-payload variant
-        // and a fresh-restart control if the halt alone doesn't unlock it.
-        // Suspected "authenticate as amiibo" flag at payload index 9 — try
-        // the read with it cleared, in case the firmware aborts full-tag
-        // reads of non-amiibo NTAGs (state 07 48) on failed validation.
-        var noAuth = Self.nfcReadDevicePayload
-        noAuth[noAuth.startIndex + 9] = 0x00
-        let stages = [
-            NFCStage(label: "read-device, byte9=00 (no amiibo auth?)",
-                     sequence: [(0x06, noAuth)],
-                     delay: 0.8, readTries: 4),
-            NFCStage(label: "read-device standard, patient 10 s poll",
-                     sequence: [(0x06, Self.nfcReadDevicePayload)],
-                     delay: 1.0, readTries: 40),   // 40 × 0.25 s = 10 s
-        ]
-        // Read-only probe: map which feature-mask bits exist beyond the
-        // documented byte 0 — candidate NFC-enable bits for the next round.
-        session.experimentalCommand(0x0C, 0x01, payload: Data([0xFF, 0xFF, 0xFF, 0xFF])) { resp in
-            bridgeLog(.info, "nfc", "feature info (mask FFFFFFFF): \(resp.map(Self.hex) ?? "TIMEOUT")")
-        }
-        nfcRunStage(session: session, uid: uid, stages: stages, index: 0)
-    }
-
-    private func nfcRunStage(session: ControllerSession, uid: Data,
-                             stages: [NFCStage], index: Int) {
-        guard index < stages.count else {
-            bridgeLog(.warning, "nfc", "all read strategies exhausted — dumping final status")
-            session.experimentalCommand(0x01, 0x05, payload: Data()) { [weak self] resp in
-                guard let self else { return }
-                bridgeLog(.info, "nfc", "final status: \(resp.map(Self.hex) ?? "TIMEOUT")")
-                self.nfcFinish(session: session, assembled: Data(), uid: uid)
-            }
-            return
-        }
-        let stage = stages[index]
-        bridgeLog(.info, "nfc", "stage \(index + 1)/\(stages.count): \(stage.label)")
-        nfcSendSequence(session: session, stage.sequence, at: 0) { [weak self] in
-            guard let self else { return }
-            self.btQueue.asyncAfter(deadline: .now() + stage.delay) {
-                self.nfcReadBuffer(session: session, assembled: Data(),
-                                   chunks: 0, retries: 0,
-                                   maxRetries: stage.readTries, uid: uid,
-                                   onNoData: {
-                    self.nfcRunStage(session: session, uid: uid,
-                                     stages: stages, index: index + 1)
-                })
-            }
-        }
-    }
-
-    /// Send a stage's commands strictly in order (each waits for the
-    /// previous response), logging every reply, then call `done`.
-    private func nfcSendSequence(session: ControllerSession,
-                                 _ sequence: [(subcommand: UInt8, payload: Data)],
-                                 at index: Int, done: @escaping () -> Void) {
-        guard index < sequence.count else { done(); return }
-        let (sub, payload) = sequence[index]
-        session.experimentalCommand(0x01, sub, payload: payload) { [weak self] resp in
-            bridgeLog(.info, "nfc",
-                      "  0x\(String(format: "%02x", sub)) → \(resp.map(Self.hex) ?? "TIMEOUT")")
-            self?.nfcSendSequence(session: session, sequence, at: index + 1, done: done)
-        }
-    }
-
-    /// One step of the buffer dump.
-    ///
-    /// Wire format (reverse-engineered from the console's traffic + our own
-    /// probes): 0x01/0x15 is a CURSOR-based stream read, not offset-based.
-    /// Request payload = requested byte count as LE u16 (console always asks
-    /// for 0x46 = 70). Response payload = [status][valid-count LE u16][data];
-    /// status 0x00 = OK, non-zero (with response class 0x02) = not ready /
-    /// nothing to read. Identical requests return SUCCESSIVE chunks.
-    ///
-    /// `chunks` bounds the loop (12 × 70 > 540); `retries` counts consecutive
-    /// not-ready replies at the current cursor — the RF read may still be
-    /// filling the buffer, so an error only ends the dump once we have data
-    /// or patience runs out.
-    private func nfcReadBuffer(session: ControllerSession,
-                               assembled: Data, chunks: Int, retries: Int,
-                               maxRetries: Int = 6, uid: Data,
-                               onNoData: (@Sendable () -> Void)? = nil) {
-        guard assembled.count < 540, chunks < 12 else {
-            self.nfcFinish(session: session, assembled: assembled, uid: uid)
-            return
-        }
-        let request = Data([0x46, 0x00])   // next 70 bytes, as the console asks
-        session.experimentalCommand(0x01, 0x15, payload: request) { [weak self] resp in
-            guard let self else { return }
-            let status: UInt8? = resp.flatMap { $0.isEmpty ? nil : $0[$0.startIndex] }
-            guard let resp, let status, status == 0, resp.count > 3 else {
-                if retries < maxRetries {
-                    bridgeLog(.debug, "nfc",
-                              "chunk \(chunks) not ready (status \(status.map(String.init) ?? "none"), try \(retries + 1)/\(maxRetries))")
-                    self.btQueue.asyncAfter(deadline: .now() + 0.25) {
-                        self.nfcReadBuffer(session: session, assembled: assembled,
-                                           chunks: chunks, retries: retries + 1,
-                                           maxRetries: maxRetries, uid: uid,
-                                           onNoData: onNoData)
-                    }
-                } else if assembled.isEmpty, let onNoData {
-                    onNoData()
-                } else {
-                    bridgeLog(.info, "nfc",
-                              "buffer stream ended at \(assembled.count) bytes (status \(status.map(String.init) ?? "none"))")
-                    self.nfcFinish(session: session, assembled: assembled, uid: uid)
-                }
-                return
-            }
-            // [status][valid-count LE][data...] — trust valid-count, capped
-            // by what actually arrived.
-            let declared = Int(resp[resp.startIndex + 1]) | Int(resp[resp.startIndex + 2]) << 8
-            let available = resp.count - 3
-            let take = min(declared, available)
-            guard take > 0 else {
-                bridgeLog(.info, "nfc", "zero-length chunk — stream complete at \(assembled.count) bytes")
-                self.nfcFinish(session: session, assembled: assembled, uid: uid)
-                return
-            }
-            let chunk = resp.subdata(in: resp.startIndex + 3 ..< resp.startIndex + 3 + take)
-            bridgeLog(.debug, "nfc", "chunk \(chunks) (\(take)B): \(Self.hex(chunk))")
-            var acc = assembled
-            acc.append(chunk)
-            self.nfcReadBuffer(session: session, assembled: acc,
-                               chunks: chunks + 1, retries: 0, uid: uid)
-        }
-    }
-
-    /// Dump the assembled tag image, decode any NDEF text, notify the user,
-    /// and end discovery so the NFC radio doesn't stay on.
-    private func nfcFinish(session: ControllerSession, assembled: Data, uid: Data) {
-        defer { nfcStopDiscovery(session: session) }
-        guard !assembled.isEmpty else {
-            bridgeLog(.warning, "nfc", "no tag data — keep the tag flat and still on the touchpoint and try again")
-            return
-        }
-        bridgeLog(.info, "nfc",
-                  "tag dump (\(assembled.count) bytes):\n\(Self.hexAscii(assembled))")
-        if assembled.allSatisfy({ $0 == 0 }) {
-            bridgeLog(.warning, "nfc",
-                      "buffer was all zeros — the tag likely moved before the read finished; try again")
-            return
-        }
-        let uidString = uid.map { String(format: "%02X", $0) }.joined(separator: ":")
-        let text = Self.extractNDEFText(assembled)
-        if let text {
-            bridgeLog(.info, "nfc", "📖 decoded text record: \"\(text)\"")
-        }
-        NotificationCenter.default.post(
-            name: nfcTagReadNotification, object: nil,
-            userInfo: ["uid": uidString, "text": text as Any,
-                       "bytes": assembled.count])
-    }
-
-    /// End discovery (0x01/0x04 per the sniffed console traffic — sent with
-    /// an empty payload once the console is done with the tag).
-    private func nfcStopDiscovery(session: ControllerSession) {
-        session.setPromiscuousNotify(false)
-        session.experimentalCommand(0x01, 0x04, payload: Data()) { resp in
-            bridgeLog(.debug, "nfc", "discovery stop response: \(resp.map(Self.hex) ?? "TIMEOUT")")
-        }
-    }
-
-    /// Minimal NDEF Text-record extractor: finds a well-known Text record
-    /// (type 'T', TNF 0x01) and returns its UTF-8 payload.
-    ///
-    /// Precondition: `data` is a raw Type 2 tag image. Its TLV area begins at
-    /// byte 16 (after UID/lock/capability pages), so scanning starts there —
-    /// UID bytes can contain a spurious 0x03 that would misparse.
-    private static func extractNDEFText(_ data: Data) -> String? {
-        let bytes = [UInt8](data)
-        var i = bytes.count > 16 ? 16 : 0
-        while i + 3 < bytes.count {
-            // NDEF TLV: 0x03 = NDEF message, then length.
-            if bytes[i] == 0x03 {
-                var j = i + 2                     // skip TLV type + length
-                // Short-record header: flags, type-length, payload-length.
-                while j + 3 < bytes.count {
-                    let flags = bytes[j]
-                    let typeLen = Int(bytes[j + 1])
-                    let payLen = Int(bytes[j + 2])
-                    let typeStart = j + 3
-                    guard typeStart + typeLen + payLen <= bytes.count else { break }
-                    let type = bytes[typeStart..<typeStart + typeLen]
-                    if type.first == 0x54 {       // 'T' text record
-                        let payStart = typeStart + typeLen
-                        let status = bytes[payStart]
-                        let langLen = Int(status & 0x3F)
-                        let textStart = payStart + 1 + langLen
-                        let textEnd = payStart + payLen
-                        if textStart <= textEnd, textEnd <= bytes.count {
-                            return String(bytes: bytes[textStart..<textEnd], encoding: .utf8)
-                        }
-                    }
-                    if flags & 0x40 != 0 { break }  // ME (last record)
-                    j = typeStart + typeLen + payLen
-                }
-            }
-            i += 1
-        }
-        return nil
-    }
-
-    private static func hexAscii(_ data: Data) -> String {
-        var out = ""
-        let bytes = [UInt8](data)
-        for row in stride(from: 0, to: bytes.count, by: 16) {
-            let slice = Array(bytes[row..<min(row + 16, bytes.count)])
-            let hex = slice.map { String(format: "%02x", $0) }.joined(separator: " ")
-                .padding(toLength: 47, withPad: " ", startingAt: 0)
-            let ascii = String(slice.map { (32...126).contains($0)
-                ? Character(UnicodeScalar($0)) : "." })
-            out += String(format: "  %04x: ", row) + hex + " |" + ascii + "|\n"
-        }
-        return out
-    }
-
-    // MARK: - Audio lab
-    //
-    // Ground truth so far (our captures + ndeadly/switch2_controller_research):
-    //  * Audio and rumble are SEPARATE lanes: rumble on ...2b05, headset
-    //    audio on ...2b06 (out) / 7492866c... (in). No documented
-    //    audio-driven-haptics mode.
-    //  * The 112-byte input notification is: [seq][0x20][buttons][sticks]
-    //    [jack-state @13][audio-len @14][audio frame @15, 50 B]
-    //    [zeros][telemetry-len @65][packed motion telemetry @66][zeros].
-    //    Jack state: 0x00 nothing, 0x05 headphones, 0x07 headset(mic);
-    //    bit 3 = "this report carries an audio frame" (alternates).
-    //  * Idle audio frames are f8 ff fe + 47 zero bytes. The codec for
-    //    live frames is publicly unknown (~10:1 vs the configured
-    //    240-sample/5 ms PCM rate).
-    //  * Capture starves regular input reports for its whole window.
-
-    /// The audio-state byte's human reading (provisional decode).
-    private static func jackStateName(_ b: UInt8) -> String {
-        switch b & ~0x08 {
-        case 0x00: return "nothing plugged"
-        case 0x05: return "headphones (no mic)"
-        case 0x07: return "headset (mic present)"
-        default:   return "unknown"
-        }
-    }
-
-    /// Audio capture v2: subscribe the headset-audio characteristic and
-    /// record timestamped notifications, decoding the report layout live.
-    /// Writes two files to ~/Documents (names carry a run timestamp):
-    /// the full packets, and just the 50-byte audio-region frames for
-    /// offline codec work. File format: "FTCWAUD2" magic, then records of
-    /// [f64 LE seconds since start][u32 LE length][bytes].
     func audioCapture(serial: String, seconds: Double = 30) {
+        // The dashboard, not Switch2Kit, explicitly chooses its legacy Documents destination.
+        let directory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         btQueue.async { [weak self] in
-            guard let self,
-                  let session = self.sessions.values.first(where: { $0.serialNumber == serial })
-            else { return }
-            guard session.beginAudioExperiment("capture") else {
-                bridgeLog(.warning, "audio", "another audio experiment is running — wait for it to finish")
-                return
-            }
-            session.setAudioCapture(true) { ok in
-                guard ok else {
-                    session.endAudioExperiment()
-                    bridgeLog(.warning, "audio",
-                              "audio characteristic not found — controller firmware "
-                              + "may be older than 2.0 (update it via a Switch 2 console)")
-                    return
-                }
-                let stamp: String = {
-                    let f = DateFormatter()
-                    f.dateFormat = "yyyyMMdd-HHmmss"
-                    return f.string(from: Date())
-                }()
-                // The serial suffix keeps simultaneous captures on two
-                // controllers from colliding on one path.
-                let suffix = String(serial.suffix(4)).replacingOccurrences(
-                    of: "[^A-Za-z0-9]", with: "", options: .regularExpression)
-                let docs = FileManager.default.urls(for: .documentDirectory,
-                                                    in: .userDomainMask)[0]
-                let fullURL = docs.appendingPathComponent("FTCW-audio-\(stamp)-\(suffix).bin")
-                let regionURL = docs.appendingPathComponent("FTCW-audio-\(stamp)-\(suffix)-frames.bin")
-                let magic = Data("FTCWAUD2".utf8)
-                FileManager.default.createFile(atPath: fullURL.path, contents: magic)
-                FileManager.default.createFile(atPath: regionURL.path, contents: magic)
-                guard let fullFile = try? FileHandle(forWritingTo: fullURL),
-                      let regionFile = try? FileHandle(forWritingTo: regionURL) else {
-                    // Notifications are already on — turn them back off or
-                    // the controller's input reports stay frozen forever.
-                    session.setAudioCapture(false) { _ in }
-                    session.endAudioExperiment()
-                    bridgeLog(.error, "audio",
-                              "cannot open capture files in ~/Documents — capture aborted")
-                    return
-                }
-                _ = try? fullFile.seekToEnd(); _ = try? regionFile.seekToEnd()
-
-                let start = CFAbsoluteTimeGetCurrent()
-                func record(_ data: Data, to handle: FileHandle) {
-                    var rec = Data()
-                    withUnsafeBytes(of: (CFAbsoluteTimeGetCurrent() - start)) {
-                        rec.append(contentsOf: $0)
-                    }
-                    withUnsafeBytes(of: UInt32(data.count).littleEndian) {
-                        rec.append(contentsOf: $0)
-                    }
-                    rec.append(data)
-                    try? handle.write(contentsOf: rec)
-                }
-
-                final class CaptureCounters: @unchecked Sendable {
-                    // Accessed only on this engine's btQueue, including the deadline.
-                    var packets = 0, audioFrames = 0, dataFrames = 0
-                    var lastState: UInt8 = 0xFF
-                    var lastMeter: TimeInterval
-                    init(_ start: TimeInterval) { lastMeter = start }
-                }
-                let counters = CaptureCounters(start)
-                session.onAudioPacket = { data in
-                    counters.packets += 1
-                    record(data, to: fullFile)
-                    if data.count >= 65 {
-                        let state = data[13]
-                        if state & ~0x08 != counters.lastState & ~0x08 {
-                            bridgeLog(.info, "audio",
-                                      String(format: "jack state 0x%02x: %@", state,
-                                             Self.jackStateName(state)))
-                            counters.lastState = state
-                        }
-                        let len = Int(data[14])
-                        if state & 0x08 != 0, len > 0, 15 + len <= data.count {
-                            let frame = data.subdata(in: 15..<(15 + len))
-                            counters.audioFrames += 1
-                            // Silent idle frames are f8 ff fe + zeros; any
-                            // other content counts as real data.
-                            let body = frame.starts(with: [0xF8, 0xFF, 0xFE])
-                                ? frame.dropFirst(3) : frame[...]
-                            if body.contains(where: { $0 != 0 }) { counters.dataFrames += 1 }
-                            record(frame, to: regionFile)
-                        }
-                    }
-                    let now = CFAbsoluteTimeGetCurrent()
-                    if now - counters.lastMeter >= 5 {
-                        counters.lastMeter = now
-                        bridgeLog(.info, "audio",
-                                  "…\(counters.packets) reports, \(counters.audioFrames) audio frames "
-                                  + "(\(counters.dataFrames) with data)")
-                    }
-                }
-                bridgeLog(.info, "audio",
-                          "capture v2: \(Int(seconds)) s — buttons/sticks will freeze "
-                          + "during capture (firmware quirk). To capture REAL audio, "
-                          + "plug in a HEADSET WITH A MIC and speak into it")
-                let config = Data([0x80, 0xBB, 0x00, 0x00, 0x02, 0xF0, 0x00])
-                session.experimentalCommand(0x17, 0x02, payload: config) { resp in
-                    bridgeLog(.info, "audio",
-                              "audio config (48 kHz) response: \(resp.map(Self.hex) ?? "none")")
-                }
-                self.btQueue.asyncAfter(deadline: .now() + seconds) {
-                    session.onAudioPacket = nil
-                    session.setAudioCapture(false) { _ in }
-                    try? fullFile.close(); try? regionFile.close()
-                    session.endAudioExperiment()
-                    let verdict = counters.dataFrames > 0
-                        ? "\(counters.dataFrames) frames with real payload — codec material!"
-                        : "all frames silent — no mic signal reached the controller "
-                          + "(state was \(Self.jackStateName(counters.lastState)))"
-                    bridgeLog(.info, "audio",
-                              "capture done: \(counters.packets) reports, \(counters.audioFrames) audio "
-                              + "frames; \(verdict)")
-                    bridgeLog(.info, "audio", "files: \(fullURL.lastPathComponent), "
-                              + "\(regionURL.lastPathComponent) in ~/Documents")
-                }
-            }
-        }
-    }
-
-    /// Build one PCM sine frame: `samples` × s16 LE mono, advancing the
-    /// caller's phase for a true `freq` Hz tone at `sampleRate`.
-    private static func sineFrame(samples: Int, freq: Double,
-                                  sampleRate: Double, phase: inout Double) -> Data {
-        var payload = Data(capacity: samples * 2)
-        for _ in 0..<samples {
-            let sample = Int16(sin(phase) * 20000)
-            phase += 2 * .pi * freq / sampleRate
-            withUnsafeBytes(of: sample.littleEndian) { payload.append(contentsOf: $0) }
-        }
-        if phase > 2 * .pi { phase -= (2 * .pi) * (phase / (2 * .pi)).rounded(.down) }
-        return payload
-    }
-
-    /// Play a 440 Hz tone for 4 s at the FULL configured rate: 240 s16
-    /// samples per 5 ms frame (48 kHz real time — 9.6× the data the old
-    /// probe sent), with MTU splitting and true backpressure. If the
-    /// format is right, this is the first honest test of where the audio
-    /// goes: listen at the actuator AND with headphones plugged in.
-    func audioPlayTone(serial: String) {
-        btQueue.async { [weak self] in
-            guard let self,
-                  let session = self.sessions.values.first(where: { $0.serialNumber == serial })
-            else { return }
-            guard session.hasAudioOutput else {
-                bridgeLog(.warning, "audio",
-                          "audio characteristic not found — controller firmware "
-                          + "may be older than 2.0 (update it via a Switch 2 console)")
-                return
-            }
-            guard session.beginAudioExperiment("tone") else {
-                bridgeLog(.warning, "audio", "another audio experiment is running — wait for it to finish")
-                return
-            }
-            bridgeLog(.info, "audio",
-                      "real-time tone: 4 s of 440 Hz, 480 B/5 ms; link accepts "
-                      + "\(session.audioWriteChunkLimit) B per write. A clean A4 tone "
-                      + "= PCM format confirmed; a garble = wrong encoding; silence "
-                      + "= wrong lane/config")
-            let config = Data([0x80, 0xBB, 0x00, 0x00, 0x02, 0xF0, 0x00])
-            session.experimentalCommand(0x17, 0x02, payload: config) { resp in
-                bridgeLog(.info, "audio",
-                          "config → \(resp.map(Self.hex) ?? "none"); streaming")
-            }
-            var phase = 0.0
-            var frames = 0
-            session.startAudioStream(frameInterval: 0.005) {
-                guard frames < 800 else { return nil }
-                frames += 1
-                return Self.sineFrame(samples: 240, freq: 440,
-                                      sampleRate: 48000, phase: &phase)
-            } done: { stats in
-                session.endAudioExperiment()
-                bridgeLog(.info, "audio",
-                          "tone done: \(stats.framesGenerated) frames, "
-                          + "\(stats.chunksWritten) writes, \(stats.chunksDropped) dropped, "
-                          + "\(stats.stalls) stalls, peak queue \(stats.maxQueueDepth) "
-                          + "— what did you hear, and where (actuator vs headphones)?")
-            }
-        }
-    }
-
-    /// Audio OUTPUT format probe — four phases, ears as the detector.
-    /// Run it twice: once with nothing plugged in (listen at the
-    /// controller body) and once with headphones in (listen there).
-    ///
-    /// Phase 1  raw PCM at the full configured rate (480 B / 5 ms):
-    ///          a clean 440 Hz tone anywhere = PCM confirmed.
-    /// Phase 2  the legacy 50 B / 5 ms frames, but with the sine generated
-    ///          for the effective 5 kHz rate (the old probe generated
-    ///          48 kHz samples at this rate, so its "440 Hz" actually came
-    ///          out near 46 Hz — sub-bass, felt as haptics).
-    /// Phase 3  the input lane's own idle-frame shape: f8 ff fe header +
-    ///          47 B — tests "output frames mirror input framing".
-    /// Phase 4  exponential sweep 100→3000 Hz at full rate: the actuator
-    ///          physically rolls off above ~1 kHz, headphones don't, so
-    ///          where the sound dies reveals which transducer plays it.
-    func audioToneTest(serial: String) {
-        btQueue.async { [weak self] in
-            guard let self,
-                  let session = self.sessions.values.first(where: { $0.serialNumber == serial })
-            else { return }
-            guard session.hasAudioOutput else {
-                bridgeLog(.warning, "audio",
-                          "audio characteristic not found — controller firmware "
-                          + "may be older than 2.0 (update it via a Switch 2 console)")
-                return
-            }
-            guard session.beginAudioExperiment("format probe") else {
-                bridgeLog(.warning, "audio", "another audio experiment is running — wait for it to finish")
-                return
-            }
-            let config = Data([0x80, 0xBB, 0x00, 0x00, 0x02, 0xF0, 0x00])
-            session.experimentalCommand(0x17, 0x02, payload: config) { resp in
-                bridgeLog(.info, "audio",
-                          "config → \(resp.map(Self.hex) ?? "none") — starting phases")
-            }
-            bridgeLog(.info, "audio",
-                      "FORMAT PROBE — four phases. For each, note: clean tone / "
-                      + "garble / silence, and from WHERE (controller body vs headphones)")
-
-            struct Phase {
-                let name: String
-                let frames: Int
-                let make: (Int, inout Double) -> Data
-            }
-            let phases: [Phase] = [
-                Phase(name: "1/4 raw PCM, full rate (expect 440 Hz if PCM)",
-                      frames: 600) { _, ph in
-                    Self.sineFrame(samples: 240, freq: 440, sampleRate: 48000, phase: &ph)
-                },
-                Phase(name: "2/4 legacy 50 B frames at true pitch (the old buzz, corrected)",
-                      frames: 600) { _, ph in
-                    Self.sineFrame(samples: 25, freq: 440, sampleRate: 5000, phase: &ph)
-                },
-                Phase(name: "3/4 idle-frame mimic: f8 ff fe + 47 B",
-                      frames: 600) { _, ph in
-                    var d = Data([0xF8, 0xFF, 0xFE])
-                    d.append(Self.sineFrame(samples: 23, freq: 440, sampleRate: 4600, phase: &ph))
-                    d.append(0)
-                    return d
-                },
-                Phase(name: "4/4 sweep 100→3000 Hz (where does it die?)",
-                      frames: 1200) { i, ph in
-                    let freq = 100 * pow(30, Double(i) / 1200)   // exponential sweep
-                    if i % 200 == 0 {
-                        bridgeLog(.info, "audio", "  sweep at \(Int(freq)) Hz")
-                    }
-                    return Self.sineFrame(samples: 240, freq: freq, sampleRate: 48000, phase: &ph)
-                },
-            ]
-            var phaseIndex = 0, frameInPhase = 0
-            var sinePhase = 0.0
-            session.startAudioStream(frameInterval: 0.005) {
-                guard phaseIndex < phases.count else { return nil }
-                if frameInPhase == 0 {
-                    bridgeLog(.info, "audio", "phase \(phases[phaseIndex].name)")
-                    sinePhase = 0
-                }
-                let data = phases[phaseIndex].make(frameInPhase, &sinePhase)
-                frameInPhase += 1
-                if frameInPhase >= phases[phaseIndex].frames {
-                    phaseIndex += 1
-                    frameInPhase = 0
-                }
-                return data
-            } done: { stats in
-                session.endAudioExperiment()
-                bridgeLog(.info, "audio",
-                          "probe done: \(stats.chunksWritten) writes, "
-                          + "\(stats.chunksDropped) dropped, \(stats.stalls) stalls — "
-                          + "which phases made sound, and where?")
-            }
-        }
-    }
-
-    /// Actuator melody on the DOCUMENTED rumble lane (no audio mystery
-    /// involved): frequency-controlled HD-rumble tones, resent every
-    /// 25 ms with an incrementing sequence nibble. If this plays a clean
-    /// little tune, the actuators are fully under our control.
-    func hapticMelody(serial: String) {
-        btQueue.async { [weak self] in
-            guard let self,
-                  let session = self.sessions.values.first(where: { $0.serialNumber == serial })
-            else { return }
-            guard session.beginAudioExperiment("haptic melody") else {
-                bridgeLog(.warning, "audio", "another audio experiment is running — wait for it to finish")
-                return
-            }
-            // C major arpeggio up and back — all within the actuator's
-            // 1...511 Hz field. (freq, beats); a beat is 90 ms.
-            let notes: [(freq: Int, beats: Int)] = [
-                (262, 2), (330, 2), (392, 2), (494, 2), (392, 2), (330, 2),
-                (262, 4), (0, 1), (392, 1), (0, 1), (392, 2), (262, 4),
-            ]
-            let beat = 0.090
-            let tick = 0.025
-            var elapsed = 0.0
-            let total = Double(notes.reduce(0) { $0 + $1.beats }) * beat
-            bridgeLog(.info, "audio", "haptic melody: \(String(format: "%.1f", total)) s "
-                      + "on the rumble lane — should be clean notes, not buzz")
-            let timer = DispatchSource.makeTimerSource(flags: .strict, queue: self.btQueue)
-            timer.schedule(deadline: .now(), repeating: tick, leeway: .milliseconds(2))
-            timer.setEventHandler { [weak self] in
-                // Stop silently if the controller vanished mid-tune —
-                // writing to a disconnected peripheral is API misuse.
-                guard let self, self.sessions.values.contains(where: { $0 === session }) else {
-                    timer.cancel()
-                    return
-                }
-                guard elapsed < total else {
-                    timer.cancel()
-                    session.writeHapticSample(Switch2.Vibration.tone(freqHz: 200, amp: 0))
-                    session.endAudioExperiment()
-                    bridgeLog(.info, "audio", "melody done — clean notes = actuator control verified")
-                    return
-                }
-                // Locate the current note and its age (for the envelope).
-                var t = elapsed
-                var current: (freq: Int, beats: Int) = (0, 1)
-                for n in notes {
-                    let dur = Double(n.beats) * beat
-                    if t < dur { current = n; break }
-                    t -= dur
-                }
-                if current.freq > 0 {
-                    // Exponential decay envelope makes notes articulate
-                    // instead of running together.
-                    let amp = 0.95 * exp(-t * 6)
-                    session.writeHapticSample(.tone(freqHz: current.freq, amp: amp))
-                } else {
-                    session.writeHapticSample(.tone(freqHz: 200, amp: 0))
-                }
-                elapsed += tick
-            }
-            timer.resume()
+            guard let self, let session = self.sessions.values.first(where: { $0.serialNumber == serial }) else { return }
+            try? self.experimentalSupport.captureAudio(on: session.id, directory: directory, seconds: seconds)
         }
     }
 
@@ -1170,13 +383,13 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
                 }
                 ControllerSettings.shared.removeSettings(forSerial: serial)
             }
-            self.disconnect(serial: serial)
+            for part in serial.split(separator: "+").map(String.init) {
+                if let session = self.sessions.values.first(where: { $0.serialNumber == part }) {
+                    self.controllerManager.forget(session.id)
+                    self.retire(session, cancel: false)
+                }
+            }
         }
-    }
-
-    private static func hex(_ data: Data) -> String {
-        data.prefix(48).map { String(format: "%02x", $0) }.joined(separator: " ")
-            + (data.count > 48 ? " …(\(data.count)B)" : "")
     }
 
     // MARK: - Grip links
@@ -1190,7 +403,7 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
             self.links = self.links.filter { $0.key != leftSerial && $0.value != rightSerial }
             self.links[leftSerial] = rightSerial
             UserDefaults.standard.set(self.links, forKey: "joyConLinks")
-            bridgeLog(.info, "engine", "linked grip: \(leftSerial) + \(rightSerial)")
+            bridgeLog(.info, "engine", "linked Joy-Con grip")
             self.recomputeLogical()
         }
     }
@@ -1208,14 +421,14 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
                 }
             }
             UserDefaults.standard.set(self.links, forKey: "joyConLinks")
-            bridgeLog(.info, "engine", "unlinked grip (\(serial))")
+            bridgeLog(.info, "engine", "unlinked Joy-Con grip")
             self.recomputeLogical()
         }
     }
 
     // MARK: - Logical assignment (btQueue)
 
-    private func sessionBySerial(_ serial: String) -> (slot: Int, session: ControllerSession)? {
+    private func sessionBySerial(_ serial: String) -> (slot: Int, session: ApplicationController)? {
         for (slot, session) in sessions where session.serialNumber == serial {
             return (slot, session)
         }
@@ -1375,7 +588,7 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
     @MainActor @Published private(set) var findingSerial: String?
     @MainActor @Published private(set) var findRSSI: Int = -100
     private var findTimer: DispatchSourceTimer?
-    private weak var findingSession: ControllerSession?
+    private weak var findingSession: ApplicationController?
 
     /// Flash LEDs, pulse rumble, and poll RSSI for ~15 s so a lost
     /// controller can be located. Call again with the same serial to stop.
@@ -1491,11 +704,11 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
         if visualizer.submit(slot: player, state: out) { scheduleVisualizerDrain() }
     }
 
-    private func handlePointerInput(_ session: ControllerSession, state: ControllerState) {
+    private func handlePointerInput(_ session: ApplicationController, state: ControllerState) {
         guard sessions[session.slot] === session, !session.isRetired else { return }
         if mouseController.handle(serial: session.serialNumber, model: session.model, state: state,
                                   configuration: configurations[session.serialNumber] ?? ControllerConfiguration()) {
-            pointerActivity[session.peripheral.identifier] = ProcessInfo.processInfo.systemUptime
+            pointerActivity[session.id.rawValue] = ProcessInfo.processInfo.systemUptime
         }
     }
 
@@ -1534,64 +747,119 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
 
     // MARK: - Scan control (btQueue)
 
-    private func updateScanning() {
+    private func receiveController(_ event: Switch2ControllerEvent) {
+        dispatchPrecondition(condition: .onQueue(btQueue))
+        switch event {
+        case .snapshot(let snapshot), .status(let snapshot):
+            reconcile(snapshot)
+        case .connected(let controller):
+            guard running, !suspended else { return }
+            accept(controller)
+        case .input(let controller):
+            guard running, !suspended else { return }
+            accept(controller)
+        case .disconnected(let id, _):
+            if let record = sessions.values.first(where: { $0.id == id }) { retire(record, cancel: false) }
+        case .connectionChanged:
+            if running, !suspended { publishState(.connecting) }
+        case .signalStrengthChanged(let id, let decibels):
+            sessions.values.first(where: { $0.id == id })?.onRSSI?(decibels)
+        case .failure(_, let error):
+            bridgeLog(.warning, "Switch2Kit", "controller operation failed: \(error)")
+        }
+    }
+
+    private func reconcile(_ snapshot: Switch2ManagerSnapshot) {
         guard running, !suspended else {
-            central.stopScan(); resetConnectionRetries(); publishState(.paused); return
+            if !sessions.isEmpty { resetConnections(cancel: false) }
+            publishState(.paused); return
         }
-        guard central.state == .poweredOn else { resetConnectionRetries(); return }
-        let now = ProcessInfo.processInfo.systemUptime
-        retryAdvertisements = retryAdvertisements.filter { $0.value.expiresAt > now }
-        // Complete one connection/handshake before admitting another. Existing
-        // ready sessions continue delivering input while a retry waits.
-        guard connecting.isEmpty else {
-            central.stopScan(); cancelRetryWake(); publishState(.connecting); return
+        let current = Set(snapshot.controllers.map(\.id))
+        for record in Array(sessions.values) where !current.contains(record.id) { retire(record, cancel: false) }
+        for controller in snapshot.controllers { accept(controller) }
+        if snapshot.isRunning, UserDefaults.standard.bool(forKey: DiscoveryPolicy.enabledKey) {
+            let remembered = snapshot.rememberedControllers.prefix(Self.maxSessions).map { $0.rawValue.uuidString }
+            if UserDefaults.standard.stringArray(forKey: DiscoveryPolicy.rememberedKey) != remembered {
+                UserDefaults.standard.set(remembered, forKey: DiscoveryPolicy.rememberedKey)
+            }
         }
-        let occupied = sessions.count
-        let shouldDiscover = discovery.shouldScan(readyIDs: sessions.values.map { $0.peripheral.identifier })
-        if occupied < Self.maxSessions && shouldDiscover {
-            for (id, advertisement) in retryAdvertisements.sorted(by: {
-                if $0.value.expiresAt != $1.value.expiresAt { return $0.value.expiresAt < $1.value.expiresAt }
-                return $0.key.uuidString < $1.key.uuidString
-            }) where now >= (retryAfter[id] ?? 0) && !disconnecting.contains(id) {
-                if beginConnection(advertisement.peripheral, wasPairingMode: advertisement.wasPairingMode) { return }
+        switch snapshot.bluetooth {
+        case .unauthorized: publishState(.unauthorized)
+        case .poweredOn:
+            switch snapshot.discovery {
+            case .scanning: publishState(.scanning)
+            case .connecting: publishState(.connecting)
+            case .capacityReached: publishState(.idle)
+            case .paused: publishState(.ready)
+            case .stopped: publishState(snapshot.isRunning ? .ready : .paused)
             }
-            if !central.isScanning {
-                central.scanForPeripherals(withServices: nil, options: [
-                    CBCentralManagerScanOptionAllowDuplicatesKey: false
-                ])
-                publishState(.scanning)
-            }
-            armRetryWake()
+        default: publishState(.off)
+        }
+    }
+
+    private func accept(_ controller: Switch2Controller) {
+        if let old = sessions.values.first(where: { $0.id == controller.id }),
+           old.snapshot.sessionGeneration != controller.sessionGeneration { retire(old, cancel: false) }
+        let record: ApplicationController
+        if let existing = sessions.values.first(where: { $0.id == controller.id }) {
+            existing.update(controller); record = existing
         } else {
-            if central.isScanning { central.stopScan() }
-            if !shouldDiscover { retryAdvertisements.removeAll() }
-            cancelRetryWake()
-            publishState(occupied >= Self.maxSessions ? .idle : .ready)
+            guard let slot = (0..<Self.maxSessions).first(where: { sessions[$0] == nil }) else { return }
+            record = ApplicationController(snapshot: controller, slot: slot, manager: controllerManager,
+                                           experimental: experimentalSupport)
+            sessions[slot] = record; connectedAt[slot] = controller.connectedAt
+            updateIdleSweep(); recomputeLogical()
         }
+        emitState(slot: record.slot, state: record.state)
+        let now = ProcessInfo.processInfo.systemUptime
+        if now - lastControllerPublication >= 1 { lastControllerPublication = now; publishControllers() }
     }
 
-    func requestDiscoveryWindow() {
-        btQueue.async { [weak self] in
-            guard let self, self.running, !self.suspended else { return }
-            self.discovery.openWindow()
-            self.updateScanning()
-        }
+    // Application-output retirement only. All transport/session retirement belongs to Switch2Kit.
+    private func retire(_ session: ApplicationController, cancel: Bool, recompute: Bool = true) {
+        guard sessions[session.slot] === session else { return }
+        sessions.removeValue(forKey: session.slot)
+        connectedAt.removeValue(forKey: session.slot)
+        session.teardown()
+        mouseController.reset(serial: session.serialNumber)
+        pointerActivity.removeValue(forKey: session.id.rawValue)
+        if findingSession === session { stopFinding() }
+        if cancel { controllerManager.disconnect(session.id) }
+        updateIdleSweep()
+        if recompute { recomputeLogical() }
     }
 
-    func useConnectedForDiscovery() {
-        btQueue.async { [weak self] in
-            guard let self, self.running, !self.suspended else { return }
-            self.discovery.useConnected(self.sessions.values.map { $0.peripheral.identifier })
-            self.updateScanning()
-        }
+    private func resetConnections(cancel: Bool) {
+        for session in Array(sessions.values) { retire(session, cancel: cancel, recompute: false) }
+        recomputeLogical(); stopFinding()
+        keyboardMapper.reset(); mouseController.reset(); gestureRecognizer.reset()
+        lastButtonsByPlayer.removeAll(); captureLast.removeAll()
+        if visualizer.clearAll() { scheduleVisualizerDrain() }
     }
 
-    private func freeSlot() -> Int? {
-        for slot in 0..<Self.maxSessions
-        where sessions[slot] == nil && !connecting.values.contains(where: { $0.slot == slot }) {
-            return slot
+    // Preference bridge only: the actual scan state machine is in Switch2Kit.
+    private func updateScanning() {
+        let quiet = UserDefaults.standard.bool(forKey: DiscoveryPolicy.enabledKey)
+        let ids = DiscoveryPolicy.savedControllers()
+        if lastDiscoveryPreference?.quiet != quiet || lastDiscoveryPreference?.ids != ids {
+            lastDiscoveryPreference = (quiet, ids)
+            controllerManager.configureDiscovery(quiet ? .quietWhenReady : .automatic, remembered: ids)
         }
-        return nil
+    }
+    func requestDiscoveryWindow() { try? controllerManager.discover(for: 60) }
+    func useConnectedForDiscovery() { controllerManager.useOnlyConnectedControllersForDiscovery() }
+
+    private func receiveExperimental(_ event: Switch2ExperimentalEvent) {
+        switch event {
+        case .nfcTagRead(_, let tag):
+            // UI owns this notification contract; tag contents are not sent to the log pipeline.
+            NotificationCenter.default.post(name: nfcTagReadNotification, object: nil,
+                userInfo: ["uid": tag.uid, "text": tag.text as Any, "bytes": tag.byteCount])
+        case .audioCaptureFinished(_, let capture):
+            bridgeLog(.info, "audio", "capture finished: \(capture.packetCount) packets, \(capture.droppedPacketCount) dropped; files saved in the selected Documents directory")
+        case .failure(_, let error):
+            bridgeLog(.warning, "experimental", "research operation failed: \(error)")
+        }
     }
 
     // MARK: - Publishing to the UI
@@ -1651,146 +919,9 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
     }
 }
 
-// MARK: - CBCentralManagerDelegate (runs on btQueue)
-
-extension BridgeEngine: CBCentralManagerDelegate {
-
-    func centralManagerDidUpdateState(_ central: CBCentralManager) {
-        switch central.state {
-        case .poweredOn:
-            bridgeLog(.info, "engine", "Bluetooth ready")
-            updateScanning()
-        case .unauthorized:
-            resetConnections(cancel: false)
-            bridgeLog(.error, "engine",
-                      "Bluetooth permission denied — grant it in System Settings > Privacy & Security > Bluetooth")
-            publishState(.unauthorized)
-        case .poweredOff:
-            resetConnections(cancel: false)
-            bridgeLog(.warning, "engine", "Bluetooth is off")
-            publishState(.off)
-        default:
-            resetConnections(cancel: false)
-            publishState(.off)
-        }
-    }
-
-    func centralManager(_ central: CBCentralManager,
-                        didDiscover peripheral: CBPeripheral,
-                        advertisementData: [String: Any],
-                        rssi RSSI: NSNumber) {
-        guard running, !suspended, central.state == .poweredOn, central.isScanning,
-              let manu = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data,
-              manu.count > 2,
-              Switch2.u16(manu, 0) == Switch2.nintendoCompanyID,
-              let adv = Switch2.parseAdvertisement(manufacturerData: manu.dropFirst(2)),
-              connecting[peripheral.identifier] == nil,
-              !sessions.values.contains(where: { $0.peripheral.identifier == peripheral.identifier })
-        else { return }
-
-        let id = peripheral.identifier
-        let now = ProcessInfo.processInfo.systemUptime
-        if let notBefore = retryAfter[id], now < notBefore || disconnecting.contains(id) {
-            // Retain only the validated identity and pairing flag, not arbitrary
-            // advertisement data. Never reuse observations older than 10 seconds.
-            if retryAdvertisements[id] != nil || retryAdvertisements.count < Self.maxSessions * 8 {
-                retryAdvertisements[id] = RetryAdvertisement(peripheral: peripheral,
-                    wasPairingMode: adv.isPairing, expiresAt: now + 10)
-            }
-            armRetryWake()
-            return
-        }
-        guard !disconnecting.contains(id), now >= retryBlockedUntil else { armRetryWake(); return }
-        bridgeLog(.info, "engine",
-                  "found \(adv.model.displayName) rssi=\(RSSI) \(adv.isPairing ? "(pairing mode)" : "(wake)")")
-        _ = beginConnection(peripheral, wasPairingMode: adv.isPairing)
-    }
-
-    func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-        guard !disconnecting.contains(peripheral.identifier), running, !suspended,
-              let pending = connecting[peripheral.identifier], pending.session.peripheral === peripheral else {
-            central.cancelPeripheralConnection(peripheral); return
-        }
-        bridgeLog(.info, "engine", "connected, starting handshake")
-        armDeadline(pending.session, seconds: 45)
-        pending.session.begin()
-    }
-
-    func centralManager(_ central: CBCentralManager,
-                        didFailToConnect peripheral: CBPeripheral,
-                        error: Error?) {
-        if disconnecting.remove(peripheral.identifier) != nil, central.isScanning {
-            // A deferred advertisement may have expired while cancellation was
-            // pending. Refresh duplicate filtering once at the terminal event.
-            central.stopScan()
-        }
-        if let pending = connecting[peripheral.identifier], pending.session.peripheral === peripheral {
-            noteConnectionFailure(peripheral.identifier)
-            retire(pending.session, cancel: false)
-            bridgeLog(.warning, "engine", "connect failed (\(error?.localizedDescription ?? "unknown"))")
-        }
-        updateScanning()
-    }
-
-    func centralManager(_ central: CBCentralManager,
-                        didDisconnectPeripheral peripheral: CBPeripheral,
-                        error: Error?) {
-        if disconnecting.remove(peripheral.identifier) != nil, central.isScanning {
-            // A deferred advertisement may have expired while cancellation was
-            // pending. Refresh duplicate filtering once at the terminal event.
-            central.stopScan()
-        }
-        if let pending = connecting[peripheral.identifier], pending.session.peripheral === peripheral {
-            noteConnectionFailure(peripheral.identifier)
-            retire(pending.session, cancel: false)
-        }
-        if let session = sessions.values.first(where: { $0.peripheral === peripheral }) {
-            retire(session, cancel: false)
-        }
-        updateScanning()
-    }
-}
-
-// MARK: - ControllerSessionDelegate (runs on btQueue)
-
-extension BridgeEngine: ControllerSessionDelegate {
-
-    func sessionReady(_ session: ControllerSession) {
-        let id = session.peripheral.identifier
-        guard running, !suspended, !session.isRetired, !disconnecting.contains(id),
-              connecting[id]?.session === session, sessions[session.slot] == nil else {
-            if !owns(session) { session.teardown() }
-            return
-        }
-        deadlines.removeValue(forKey: id)?.cancel()
-        connecting.removeValue(forKey: id)
-        sessions[session.slot] = session
-        connectedAt[session.slot] = Date()
-        updateIdleSweep()
-        session.onState = { [weak self, weak session] slot, state in
-            guard let self, let session, self.sessions[slot] === session else { return }
-            self.emitState(slot: slot, state: state)
-        }
-        recomputeLogical()
-        updateScanning()
-    }
-
-    func sessionFailed(_ session: ControllerSession, reason: String) {
-        guard owns(session) else { return }
-        noteConnectionFailure(session.peripheral.identifier)
-        retire(session, cancel: true)
-        updateScanning()
-    }
-
-    func sessionDidUpdateState(_ session: ControllerSession) {
-        guard sessions[session.slot] === session else { return }
-        publishControllers()
-    }
-}
-
 // MARK: - Output sink protocol
 
-/// Receives decoded controller traffic on the Bluetooth queue. The `slot`
+/// Receives adapted controller traffic on the application output queue, never the Bluetooth callback queue. The `slot`
 /// parameter is the LOGICAL player index (0..maxPlayers-1). Implementations
 /// must be fast and non-blocking (fire-and-forget I/O only).
 protocol ControllerOutputSink: AnyObject, Sendable {

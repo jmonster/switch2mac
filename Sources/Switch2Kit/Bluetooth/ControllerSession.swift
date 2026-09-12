@@ -1,3 +1,4 @@
+#if canImport(CoreBluetooth)
 // ControllerSession.swift
 // One connected Switch 2 controller: GATT handshake, command serialization,
 // input decoding, keep-alive, and rumble.
@@ -12,95 +13,95 @@
 //    a 1 Hz keep-alive write (player-LED refresh) holds it open. Rumble
 //    writes count as keep-alives too.
 //
-// All CoreBluetooth callbacks arrive on `queue`; UI-visible state is
-// published through the delegate on the main actor.
+// All CoreBluetooth callbacks and every mutable field are confined to `queue`.
+// Package-only subclass hooks share that executor. Only Sendable value snapshots
+// leave through ControllerEventHub; no host callbacks execute on this queue.
 
 import Foundation
 import CoreBluetooth
 
 /// Decoded, calibrated controller state pushed to output sinks per report.
-struct ControllerState: Sendable {
-    var buttons: Switch2.Buttons = []
-    var leftStick: (x: Double, y: Double) = (0, 0)
-    var rightStick: (x: Double, y: Double) = (0, 0)
-    var leftTrigger: UInt8 = 0    // 0...255
-    var rightTrigger: UInt8 = 0
-    var batteryMillivolts: UInt16 = 0
-    var gyro: (Int16, Int16, Int16) = (0, 0, 0)
-    var accel: (Int16, Int16, Int16) = (0, 0, 0)
-    /// Optical mouse raw absolute counters (Joy-Con 2; wrap mod 2^16).
-    var mouseX: UInt16 = 0
-    var mouseY: UInt16 = 0
-    var surfaceQuality: UInt16 = 0
-    var liftDistance: UInt16 = 0
-    /// Magnetometer raw (0.15 µT/LSB).
-    var mag: (Int16, Int16, Int16) = (0, 0, 0)
-    /// Battery/thermal: charge state byte, signed current (+charging),
-    /// IMU die temperature in °C.
-    var chargeState: UInt8 = 0
-    var batteryCurrent: Int16 = 0
-    var temperatureC: Double = 0
-}
+
 
 /// Called on the Bluetooth queue.
-protocol ControllerSessionDelegate: AnyObject {
+package protocol ControllerSessionDelegate: AnyObject {
     func sessionReady(_ session: ControllerSession)
     func sessionFailed(_ session: ControllerSession, reason: String)
     func sessionDidUpdateState(_ session: ControllerSession)
 }
 
-final class ControllerSession: NSObject, @unchecked Sendable {
+// Only a separately linked package companion may implement these queue-confined hooks.
+package protocol ControllerSessionCompanion: AnyObject, Sendable {
+    var isExperimentActive: Bool { get }
+    func didRetire()
+    func writeCapacityAvailable()
+    func receivedAuxiliaryValue(uuid: UUID?, data: Data)
+}
+
+package final class ControllerSession: NSObject, @unchecked Sendable {
+
+    package let lifetime = SessionLifetime()
+    package let diagnostics: Switch2Diagnostics
+    package let sensorProfile: Switch2.Feature.SensorProfile
+    package var customLEDPattern: UInt8?
+    package var companion: (any ControllerSessionCompanion)?
+    package var isExperimentActive: Bool { companion?.isExperimentActive ?? false }
+    package var isReady: Bool { readyReported && !ended }
+    package var isCommandIdle: Bool { pendingCommand == nil && queuedCommands.isEmpty }
+    package func didRetire() { companion?.didRetire(); companion = nil }
+    package func receivedAuxiliaryValue(uuid: UUID?, data: Data) { companion?.receivedAuxiliaryValue(uuid: uuid, data: data) }
+    package func writeCapacityAvailable() { companion?.writeCapacityAvailable() }
 
     // MARK: Configuration
 
-    let peripheral: CBPeripheral
-    let slot: Int                       // 0-based; player number is slot+1
-    let wasPairingMode: Bool            // Sync-held advert → write bond
-    private let queue: DispatchQueue    // the central's queue
+    package let peripheral: CBPeripheral
+    package let slot: Int                       // 0-based; player number is slot+1
+    package let wasPairingMode: Bool            // Sync-held advert → write bond
+    package let queue: DispatchQueue    // the central's queue
     private weak var delegate: ControllerSessionDelegate?
 
     // MARK: Session state (all mutated on `queue`)
 
-    private(set) var model: Switch2.Model = .proController2
-    private(set) var info: Switch2.ControllerInfo?
+    package private(set) var model: Switch2.Model = .proController2
+    package private(set) var info: Switch2.ControllerInfo?
     private var leftCal: Switch2.StickCalibration?
     private var rightCal: Switch2.StickCalibration?
 
-    private var chars: [UUID: CBCharacteristic] = [:]
+    package var chars: [UUID: CBCharacteristic] = [:]
     private var handshakeStarted = false
-    private var ended = false
+    package private(set) var ended = false
     private var handshakeComplete = false
     private var readyReported = false
     /// Command replies have no transaction sequence. Correlate all echoed
     /// fields, and never treat the observed status/error class as success.
-    struct CommandResponse: Sendable {
-        enum Kind: UInt8, Sendable { case success = 0x01, status = 0x02 }
-        let kind: Kind
-        let header: Data
-        let payload: Data
-        var command: UInt8 { header[0] }
-        var transport: UInt8 { header[2] }
-        var subcommand: UInt8 { header[3] }
+    package struct CommandResponse: Sendable {
+        package enum Kind: UInt8, Sendable { case success = 0x01, status = 0x02 }
+        package let kind: Kind
+        package let header: Data
+        package let payload: Data
+        package var command: UInt8 { header[0] }
+        package var transport: UInt8 { header[2] }
+        package var subcommand: UInt8 { header[3] }
 
-        init?(_ frame: Data) {
+        package init?(_ frame: Data) {
             guard frame.count >= 8, let kind = Kind(rawValue: frame[frame.startIndex + 1]) else { return nil }
             self.kind = kind
             self.header = Data(frame.prefix(8))
             self.payload = Data(frame.dropFirst(8))
         }
     }
-    enum CommandFailure: Error, Sendable {
+    package enum CommandFailure: Error, Sendable {
         case retired, unavailable, payloadTooLarge, frameTooLarge, queueFull, timeout
         case rejected(CommandResponse)
     }
-    typealias CommandResult = Result<CommandResponse, CommandFailure>
+    package typealias CommandResult = Result<CommandResponse, CommandFailure>
 
     private struct CommandRequest {
-        let token: UInt64
-        let id: UInt8
-        let frame: Data
-        let accepts: ((Data) -> Bool)?
-        let completion: (CommandResult) -> Void
+        package let token: UInt64
+        package let id: UInt8
+        package let frame: Data
+        package let accepts: ((Data) -> Bool)?
+        package let completion: (CommandResult) -> Void
     }
     private var nextCommandToken: UInt64 = 0
     private var pendingCommand: CommandRequest?
@@ -117,32 +118,35 @@ final class ControllerSession: NSObject, @unchecked Sendable {
 
     /// 1-based player number shown on the LEDs; the engine reassigns it when
     /// logical players shuffle (e.g. Joy-Cons link into a grip).
-    private(set) var playerNumber: Int
+    package private(set) var playerNumber: Int
     private var keepAliveTimer: DispatchSourceTimer?
-    private var lastWriteAt: TimeInterval = 0
+    package var lastWriteAt: TimeInterval = 0
     private var vibrationPacketID: UInt8 = 0
     private var rumbleTarget: (strong: Double, weak: Double) = (0, 0)
     private var rumbleSetAt: TimeInterval = 0
     private var rumbleActive = false
     private var rumbleGeneration: UInt64 = 0
-    private var lastRumbleTestAt: TimeInterval = -.infinity
 
     /// Latest decoded state. All reads and writes belong to the Bluetooth
     /// queue; consumers receive a Sendable value snapshot, never this storage.
-    private(set) var state = ControllerState()
-    private(set) var reportCount: UInt64 = 0
-    private(set) var lastReportAt: TimeInterval = 0
+    package private(set) var state = ControllerState()
+    package private(set) var reportCount: UInt64 = 0
+    package private(set) var lastReportAt: TimeInterval = 0
     private var gapCount = 0
 
     /// Last time the HUMAN did something (button/stick/trigger change) —
     /// reports stream constantly, so idleness must be judged on content.
-    private(set) var lastActivityAt: TimeInterval = ProcessInfo.processInfo.systemUptime
+    package private(set) var lastActivityAt: TimeInterval = ProcessInfo.processInfo.systemUptime
 
-    /// Sink receiving every decoded report (UDP hub / virtual HID).
-    var onState: (@Sendable (Int, ControllerState) -> Void)?
+    /// Internal queue-confined receiver; never a host output callback.
+    package var onState: (@Sendable (Int, ControllerState) -> Void)?
 
-    init(peripheral: CBPeripheral, slot: Int, wasPairingMode: Bool,
-         queue: DispatchQueue, delegate: ControllerSessionDelegate) {
+    package init(peripheral: CBPeripheral, slot: Int, wasPairingMode: Bool,
+         queue: DispatchQueue, delegate: ControllerSessionDelegate,
+         diagnostics: Switch2Diagnostics = Switch2Diagnostics(),
+         sensorProfile: Switch2.Feature.SensorProfile = .compatibility) {
+        self.diagnostics = diagnostics
+        self.sensorProfile = sensorProfile
         self.peripheral = peripheral
         self.slot = slot
         self.playerNumber = slot + 1
@@ -154,7 +158,7 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     }
 
     /// Engine (btQueue): update the player LEDs to a new logical number.
-    func setPlayerNumber(_ player: Int) {
+    package func setPlayerNumber(_ player: Int) {
         guard player != playerNumber else { return }
         playerNumber = player
         if keepAliveTimer != nil {   // only once streaming (commands live)
@@ -162,26 +166,28 @@ final class ControllerSession: NSObject, @unchecked Sendable {
         }
     }
 
-    var displayName: String { model.displayName }
-    var serialNumber: String {
+    package var displayName: String { model.displayName }
+    package var serialNumber: String {
         let serial = info?.serialNumber.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return serial.isEmpty || serial == "?" ? "peripheral-\(peripheral.identifier.uuidString)" : serial
     }
-    var isRetired: Bool { ended }
-    var batteryMillivolts: UInt16 { state.batteryMillivolts }
+    package var isRetired: Bool { ended }
+    package var batteryMillivolts: UInt16 { state.batteryMillivolts }
 
     // MARK: - Handshake
 
     /// Called by the engine once CoreBluetooth reports the connect.
-    func begin() {
+    package func begin() {
         guard !ended else { return }
         log(.info, "slot \(slot + 1): discovering services")
         peripheral.discoverServices(nil)
     }
 
-    func teardown() {
+    package func teardown() {
         guard !ended else { return }
         ended = true
+        lifetime.retire()
+        peripheral.delegate = nil
         notifyCompletion = nil
         handshakeSteps.removeAll()
         onState = nil
@@ -199,12 +205,7 @@ final class ControllerSession: NSObject, @unchecked Sendable {
         queuedCommands.removeAll()
         // Complete external command waiters after making retirement terminal.
         for request in cancelled { request.completion(.failure(.retired)) }
-        // A dead link must also stop any audio experiment: finish the
-        // stream (releasing its closures — they retain self), stop
-        // capture callbacks, and free the experiment guard.
-        finishAudioStream()
-        onAudioPacket = nil
-        audioExperimentName = nil
+        didRetire()
     }
 
     private func fail(_ reason: String) {
@@ -310,7 +311,7 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     }
 
     private func stepFeatures(_ done: @escaping (Bool) -> Void) {
-        let flags = Data([Switch2.Feature.flags(for: model), 0, 0, 0])
+        let flags = Data([Switch2.Feature.flags(for: model, profile: sensorProfile), 0, 0, 0])
         writeCommand(Switch2.Command.feature, Switch2.Subcommand.featureInit, flags) { [weak self] resp in
             guard let self, resp != nil else { done(false); return }
             self.writeCommand(Switch2.Command.feature, Switch2.Subcommand.featureEnable, flags) { resp in
@@ -333,7 +334,7 @@ final class ControllerSession: NSObject, @unchecked Sendable {
                 self.writeCommand(Switch2.Command.pair, Switch2.Subcommand.pairLTK2, Switch2.pairLTK2) { [weak self] resp in
                     guard let self, resp != nil else { done(false); return }
                     self.writeCommand(Switch2.Command.pair, Switch2.Subcommand.pairFinish, Data([0x00])) { resp in
-                        if resp != nil { bridgeLog(.info, "session", "bonded controller to this Mac") }
+                        if resp != nil { self.log(.info, "protocol bond operation completed") }
                         done(resp != nil)
                     }
                 }
@@ -363,7 +364,7 @@ final class ControllerSession: NSObject, @unchecked Sendable {
         }
     }
 
-    private func sendCommand(_ command: UInt8, _ subcommand: UInt8, _ data: Data,
+    package func sendCommand(_ command: UInt8, _ subcommand: UInt8, _ data: Data,
                              flag: UInt8 = 0x01,
                              accepts: ((Data) -> Bool)? = nil,
                              completion: @escaping (CommandResult) -> Void) {
@@ -395,7 +396,7 @@ final class ControllerSession: NSObject, @unchecked Sendable {
 
     /// Queue-confined: command frames remain atomic and FIFO. Motor intents
     /// may be replaced, but controller input reports are never coalesced here.
-    private func pumpWrites() {
+    package func pumpWrites() {
         guard !ended, !pumpingWrites else { return }
         pumpingWrites = true
         defer { pumpingWrites = false }
@@ -479,9 +480,6 @@ final class ControllerSession: NSObject, @unchecked Sendable {
         commandTimeout = nil
         pendingCommand = nil
         commandSubmitted = false
-        if pending.id == 0x01 {
-            log(.debug, "nfc raw frame: \(data.map { String(format: "%02x", $0) }.joined(separator: " "))")
-        }
         if response.kind == .success {
             pending.completion(.success(response))
         } else {
@@ -511,15 +509,7 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     }
 
     private func setPlayerLEDs(_ completion: @escaping (Bool) -> Void = { _ in }) {
-        // A user-set custom LED pattern (per serial) overrides the player LEDs.
-        let custom = UserDefaults.standard
-            .dictionary(forKey: "controllerSettings")?[serialNumber] as? [String: Any]
-        let pattern: UInt8
-        if let raw = custom?["ledPattern"] as? Int, raw > 0 {
-            pattern = UInt8(raw & 0x0F)
-        } else {
-            pattern = Switch2.ledPatterns[min(max(playerNumber - 1, 0), 7)]
-        }
+        let pattern = customLEDPattern ?? Switch2.ledPatterns[min(max(playerNumber - 1, 0), 7)]
         writeCommand(Switch2.Command.leds, Switch2.Subcommand.ledsSetPlayer,
                      Data([pattern, 0, 0, 0])) { resp in
             completion(resp != nil)
@@ -528,7 +518,7 @@ final class ControllerSession: NSObject, @unchecked Sendable {
 
     /// Directly drive the four player LEDs (bit 0..3). For Find-My flashing;
     /// bypasses persisted patterns. Restores normal LEDs when `nil`.
-    func setRawLEDs(_ pattern: UInt8?) {
+    package func setRawLEDs(_ pattern: UInt8?) {
         queue.async { [weak self] in
             guard let self, !self.ended else { return }
             if let pattern {
@@ -541,243 +531,26 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     }
 
     /// Refresh LEDs now (e.g., after the user changes the custom pattern).
-    func refreshLEDs() {
+    package func refreshLEDs() {
         queue.async { [weak self] in self?.setPlayerLEDs() }
     }
 
     /// Read the current RSSI; result arrives via the rssi callback.
-    var onRSSI: ((Int) -> Void)?
-    func requestRSSI() {
+    package var onRSSI: ((Int) -> Void)?
+    package func requestRSSI() {
         queue.async { [weak self] in
             guard let self, !self.ended else { return }
             self.peripheral.readRSSI()
         }
     }
 
-    // MARK: - Experiments (NFC probing, audio capture)
-
-    /// Typed command access for protocol research. Rejections retain their
-    /// header and payload. Timeout retires this ambiguous command stream.
-    /// Like the session itself, this API is Bluetooth-queue confined.
-    func experimentalCommandResult(_ command: UInt8, _ subcommand: UInt8,
-                                   payload: Data, flag: UInt8 = 0x01,
-                                   completion: @escaping (CommandResult) -> Void) {
-        sendCommand(command, subcommand, payload, flag: flag, completion: completion)
-    }
-
-    /// Compatibility for existing NFC/audio probes: preserve status payloads
-    /// they intentionally inspect (e.g. "not ready"), but never use this raw
-    /// adapter for normal handshake success decisions. nil means no reply.
-    func experimentalCommand(_ command: UInt8, _ subcommand: UInt8,
-                             payload: Data, flag: UInt8 = 0x01,
-                             completion: @escaping (Data?) -> Void) {
-        experimentalCommandResult(command, subcommand, payload: payload, flag: flag) { result in
-            switch result {
-            case .success(let response), .failure(.rejected(let response)): completion(response.payload)
-            case .failure: completion(nil)
-            }
-        }
-    }
-
-    /// NFC experiments: subscribe every notify-capable characteristic we are
-    /// not already listening to and log whatever arrives — hunting for
-    /// out-of-band bulk-data channels (the NFC tag payload may not travel on
-    /// the main command-response characteristic).
-    private(set) var promiscuousNotify = false
-    func setPromiscuousNotify(_ enabled: Bool) {
-        queue.async { [weak self] in
-            guard let self, !self.ended else { return }
-            self.promiscuousNotify = enabled
-            let known: Set<UUID> = [Switch2.GATT.inputReport,
-                                    Switch2.GATT.commandResponse,
-                                    Self.audioInputUUID]
-            for (uuid, ch) in self.chars
-            where ch.properties.contains(.notify) && !known.contains(uuid) {
-                self.log(.debug, "promiscuous notify \(enabled ? "ON" : "off"): \(uuid.uuidString)")
-                self.peripheral.setNotifyValue(enabled, for: ch)
-            }
-        }
-    }
-
-    /// Firmware 2.0+ Pro Controller audio input characteristic.
-    static let audioInputUUID = UUID(uuidString: "7492866C-EC3E-4619-8258-32755FFCC0F9")!
-    /// Firmware 2.0+ audio OUTPUT (host → controller headphone jack).
-    static let audioOutputUUID = UUID(uuidString: "CC483F51-9258-427D-A939-630C31F72B06")!
-
-    /// Write one raw frame to the audio output characteristic (Bluetooth
-    /// queue only). Returns false when the characteristic is absent.
-    @discardableResult
-    func writeAudioFrame(_ data: Data) -> Bool {
-        guard !ended, peripheral.canSendWriteWithoutResponse,
-              data.count <= audioWriteChunkLimit,
-              let ch = chars[Self.audioOutputUUID] else { return false }
-        peripheral.writeValue(data, for: ch, type: .withoutResponse)
-        lastWriteAt = ProcessInfo.processInfo.systemUptime
-        return true
-    }
-
-    // MARK: Audio streaming (paced, backpressured)
-
-    /// The largest single write-without-response the current link accepts
-    /// (ATT MTU − 3). Audio frames larger than this must be split.
-    var audioWriteChunkLimit: Int {
-        peripheral.maximumWriteValueLength(for: .withoutResponse)
-    }
-
-    /// Whether the firmware exposes the audio output characteristic
-    /// (2.0+ Pro Controller only). Bluetooth queue only.
-    var hasAudioOutput: Bool {
-        dispatchPrecondition(condition: .onQueue(queue))
-        return chars[Self.audioOutputUUID] != nil
-    }
-
-    /// Delivery accounting for one audio streaming run. `chunksDropped`
-    /// counts writes shed because CoreBluetooth's outbound buffer stayed
-    /// full for longer than the queue cap — the silent failure mode the
-    /// old fire-and-forget path could never see.
-    struct AudioStreamStats {
-        var framesGenerated = 0
-        var chunksWritten = 0
-        var chunksDropped = 0
-        var stalls = 0            // times the drain hit a full buffer
-        var maxQueueDepth = 0
-        var chunkLimit = 0
-    }
-
-    private var audioStreamTimer: DispatchSourceTimer?
-    private var audioStreamQueue: [Data] = []      // pending chunks, FIFO
-    private var audioStreamStats = AudioStreamStats()
-    private var audioStreamNext: (() -> Data?)?
-    private var audioStreamDone: ((AudioStreamStats) -> Void)?
-    /// Cap on queued chunks: for live audio, late data is worse than lost
-    /// data, so beyond ~4 frames of backlog we shed the oldest.
-    private var audioStreamQueueCap = 8
-
-    /// Guard so concurrent experiments cannot interleave on one controller.
-    /// Both calls must run on the Bluetooth queue (as all experiment
-    /// bodies already do) — they are simple flag operations, not locks.
-    private(set) var audioExperimentName: String?
-    func beginAudioExperiment(_ name: String) -> Bool {
-        dispatchPrecondition(condition: .onQueue(queue))
-        guard !ended, audioExperimentName == nil else { return false }
-        audioExperimentName = name
-        return true
-    }
-    func endAudioExperiment() {
-        queue.async { [weak self] in self?.audioExperimentName = nil }
-    }
-
-    /// Stream audio frames at a fixed cadence with real backpressure.
-    ///
-    /// Algorithm (producer–consumer with loss-preferring bounded queue):
-    /// a strict timer enqueues one frame per `frameInterval` (split into
-    /// ≤ chunk-limit writes); a drain loop issues writes only while
-    /// CoreBluetooth reports `canSendWriteWithoutResponse`, resuming from
-    /// the `peripheralIsReady` callback. `next` runs on the Bluetooth
-    /// queue; returning nil ends the stream, after which `done` receives
-    /// the delivery stats.
-    ///
-    /// Precondition: at most one stream per session (enforced by restart:
-    /// starting a new stream cancels the previous one without stats).
-    func startAudioStream(frameInterval: TimeInterval,
-                      next: @escaping () -> Data?,
-                      done: @escaping (AudioStreamStats) -> Void) {
-        guard !ended else { return }
-        audioStreamTimer?.cancel()
-        audioStreamQueue.removeAll()
-        audioStreamStats = AudioStreamStats(chunkLimit: audioWriteChunkLimit)
-        audioStreamNext = next
-        audioStreamDone = done
-        // Queue cap = 4 frames' worth of chunks (min 1 chunk per frame).
-        audioStreamQueueCap = 8
-        let timer = DispatchSource.makeTimerSource(flags: .strict, queue: queue)
-        timer.schedule(deadline: .now(), repeating: frameInterval,
-                       leeway: .microseconds(500))
-        timer.setEventHandler { [weak self] in self?.audioStreamTick() }
-        timer.resume()
-        audioStreamTimer = timer
-    }
-
-    /// Stop an in-flight stream early (Bluetooth queue or any thread);
-    /// `done` still fires with the stats gathered so far.
-    func stopAudioStream() {
-        queue.async { [weak self] in self?.finishAudioStream() }
-    }
-
-    private func audioStreamTick() {
-        guard let next = audioStreamNext else { return }
-        guard let frame = next() else { finishAudioStream(); return }
-        audioStreamStats.framesGenerated += 1
-        let limit = max(20, audioWriteChunkLimit)
-        var offset = 0
-        while offset < frame.count {
-            let end = min(offset + limit, frame.count)
-            audioStreamQueue.append(frame.subdata(in: offset..<end))
-            offset = end
-        }
-        audioStreamStats.maxQueueDepth = max(audioStreamStats.maxQueueDepth,
-                                             audioStreamQueue.count)
-        while audioStreamQueue.count > audioStreamQueueCap {
-            audioStreamQueue.removeFirst()
-            audioStreamStats.chunksDropped += 1
-        }
-        drainAudioStream()
-    }
-
-    /// Write queued chunks until the stack refuses; `peripheralIsReady`
-    /// re-enters. Runs on the Bluetooth queue only.
-    fileprivate func drainAudioStream() {
-        pumpWrites()
-        guard !ended, audioStreamNext != nil, let ch = chars[Self.audioOutputUUID] else { return }
-        var budget = 8
-        while !audioStreamQueue.isEmpty && budget > 0 {
-            budget -= 1
-            guard peripheral.canSendWriteWithoutResponse else {
-                audioStreamStats.stalls += 1
-                return
-            }
-            peripheral.writeValue(audioStreamQueue.removeFirst(),
-                                  for: ch, type: .withoutResponse)
-            audioStreamStats.chunksWritten += 1
-            lastWriteAt = ProcessInfo.processInfo.systemUptime
-        }
-    }
-
-    private func finishAudioStream() {
-        audioStreamTimer?.cancel()
-        audioStreamTimer = nil
-        audioStreamQueue.removeAll()
-        audioStreamNext = nil
-        let done = audioStreamDone
-        audioStreamDone = nil
-        done?(audioStreamStats)
-    }
-
-    /// One HD-rumble write on demand (haptic tones/melodies drive this at
-    /// their own cadence; the packet sequence nibble increments per write —
-    /// the controller de-duplicates packets with a stale sequence).
-    func writeHapticSample(_ vib: Switch2.Vibration) {
-        queue.async { [weak self] in self?.writeMotor(vib) }
-    }
-
-    /// Called per audio notification when capture is active.
-    var onAudioPacket: ((Data) -> Void)?
-
-    /// Subscribe (or unsubscribe) the audio input characteristic.
-    /// Returns false via completion when the firmware doesn't expose it.
-    func setAudioCapture(_ enabled: Bool, completion: @escaping (Bool) -> Void) {
-        guard !ended, let ch = chars[Self.audioInputUUID] else { completion(false); return }
-        peripheral.setNotifyValue(enabled, for: ch)
-        completion(true)
-    }
-
     // MARK: - Keep-alive + rumble
 
-    func setRumble(strong: Double, weak: Double) {
+    package func setRumble(strong: Double, weak: Double) {
         queue.async { [weak self] in self?.applyRumble(strong: strong, weak: weak) }
     }
 
-    private func applyRumble(strong: Double, weak: Double) {
+    package func applyRumble(strong: Double, weak: Double) {
         guard !ended else { return }
         rumbleGeneration &+= 1
         rumbleTarget = (strong.isFinite ? max(0, min(1, strong)) : 0,
@@ -789,48 +562,9 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     /// Direct diagnostic, independent of player assignment or game output.
     /// GameCube clips finish in firmware: they are not duration-controlled
     /// effects and must not be advertised as general game-rumble support.
-    func testRumble(intensity: Double) {
-        queue.async { [weak self] in
-            guard let self, !self.ended, self.readyReported else { return }
-            let level = intensity.isFinite ? max(0, min(1, intensity)) : 0
-            guard level > 0 else {
-                self.log(.info, "rumble test muted: raise Rumble above 0%")
-                return
-            }
-            let now = ProcessInfo.processInfo.systemUptime
-            guard now - self.lastRumbleTestAt >= 0.5 else { return }
-            if self.model.hasHDRumble {
-                self.lastRumbleTestAt = now
-                // Pro has independent left/strong and right/weak actuators.
-                // A test must exercise BOTH, unlike a single-motor effect.
-                self.applyRumblePulse(strong: level, weak: self.model == .proController2 ? level : 0,
-                                      duration: 0.4)
-                self.log(.info, "direct rumble test requested: verify vibration by touch")
-            } else if self.model == .nsoGameCube,
-                      let preset = Switch2.GameCubeRumblePreset.forTest(intensity: level) {
-                // A preset cannot be cancelled after submission. Never let a
-                // test accumulate behind commands or radio backpressure and
-                // buzz unexpectedly later. Retry is an explicit user action.
-                guard self.pendingCommand == nil, self.queuedCommands.isEmpty,
-                      self.peripheral.canSendWriteWithoutResponse else {
-                    self.log(.warning, "rumble test not sent: Bluetooth is busy; press Test again")
-                    return
-                }
-                self.lastRumbleTestAt = now
-                self.sendCommand(Switch2.Command.vibration, Switch2.Subcommand.vibrationPlayPreset,
-                                 preset.payload) { [weak self] result in
-                    switch result {
-                    case .success:
-                        self?.log(.info, "GameCube rumble preset acknowledged: verify vibration by touch")
-                    case .failure(let reason):
-                        self?.log(.warning, "GameCube rumble test failed: \(reason)")
-                    }
-                }
-            }
-        }
-    }
 
-    func pulseRumble(strong: Double, weak: Double = 0, duration: Double) {
+
+    package func pulseRumble(strong: Double, weak: Double = 0, duration: Double) {
         queue.async { [weak self] in
             self?.applyRumblePulse(strong: strong, weak: weak, duration: duration)
         }
@@ -838,7 +572,7 @@ final class ControllerSession: NSObject, @unchecked Sendable {
 
     /// Queue-confined so a direct test cannot jump ahead of a newer game
     /// request by enqueueing a second hop onto the same Bluetooth queue.
-    private func applyRumblePulse(strong: Double, weak: Double, duration: Double) {
+    package func applyRumblePulse(strong: Double, weak: Double, duration: Double) {
         guard !ended, duration.isFinite else { return }
         applyRumble(strong: strong, weak: weak)
         let generation = rumbleGeneration
@@ -890,7 +624,7 @@ final class ControllerSession: NSObject, @unchecked Sendable {
     }
 
     @discardableResult
-    private func writeMotor(_ vib: Switch2.Vibration) -> Bool {
+    package func writeMotor(_ vib: Switch2.Vibration) -> Bool {
         writeMotor(Switch2.MotorVibration(vib))
     }
 
@@ -994,8 +728,8 @@ final class ControllerSession: NSObject, @unchecked Sendable {
         }
     }
 
-    private func log(_ level: LogLevel, _ message: String) {
-        bridgeLog(level, "session", message)
+    package func log(_ level: Switch2LogLevel, _ message: String) {
+        diagnostics.emit(level, .session, message)
     }
 }
 
@@ -1005,7 +739,7 @@ extension ControllerSession: CBPeripheralDelegate {
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         guard !ended else { return }
-        if let error { fail("service discovery: \(error.localizedDescription)"); return }
+        if error != nil { fail("service discovery failed"); return }
         for service in peripheral.services ?? [] {
             peripheral.discoverCharacteristics(nil, for: service)
         }
@@ -1015,7 +749,7 @@ extension ControllerSession: CBPeripheralDelegate {
                     didDiscoverCharacteristicsFor service: CBService,
                     error: Error?) {
         guard !ended else { return }
-        if let error { fail("characteristic discovery: \(error.localizedDescription)"); return }
+        if error != nil { fail("characteristic discovery failed"); return }
         for ch in service.characteristics ?? [] {
             if let uuid = UUID(uuidString: ch.uuid.uuidString) {
                 chars[uuid] = ch
@@ -1037,13 +771,13 @@ extension ControllerSession: CBPeripheralDelegate {
                     error: Error?) {
         guard !ended else { return }
         let uuid = UUID(uuidString: characteristic.uuid.uuidString)
-        if let error {
+        if error != nil {
             // Only the essential channels are fatal — an experimental
             // (promiscuous) subscribe may legitimately be refused.
             if uuid == Switch2.GATT.commandResponse || uuid == Switch2.GATT.inputReport {
-                fail("notify state: \(error.localizedDescription)")
+                fail("essential notification subscription failed")
             } else {
-                log(.debug, "notify refused on \(characteristic.uuid.uuidString): \(error.localizedDescription)")
+                log(.debug, "optional notification subscription refused")
             }
             return
         }
@@ -1065,10 +799,10 @@ extension ControllerSession: CBPeripheralDelegate {
         if !ended, error == nil { onRSSI?(RSSI.intValue) }
     }
 
-    /// Outbound buffer has space again — resume a stalled audio stream.
+    /// Outbound buffer has space again; resume bounded protocol and optional companion writes.
     func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
         pumpWrites()
-        drainAudioStream()
+        writeCapacityAvailable()
     }
 
     func peripheral(_ peripheral: CBPeripheral, didModifyServices invalidatedServices: [CBService]) {
@@ -1087,12 +821,8 @@ extension ControllerSession: CBPeripheralDelegate {
             handleInputReport(data)
         } else if uuid == Switch2.GATT.commandResponse {
             handleCommandResponse(data)
-        } else if uuid == Self.audioInputUUID {
-            onAudioPacket?(data)
-        } else if promiscuousNotify {
-            // Experiment channel: surface out-of-band data loudly.
-            log(.info, "OOB data on \(characteristic.uuid.uuidString): "
-                + data.map { String(format: "%02x", $0) }.joined(separator: " "))
+        } else {
+            receivedAuxiliaryValue(uuid: uuid, data: data)
         }
     }
 }
@@ -1104,7 +834,7 @@ import IOBluetooth
 enum HostBluetooth {
     /// The Mac's Bluetooth adapter MAC, little-endian bytes, for the
     /// protocol-level bond command. nil when unavailable.
-    static var macAddressBytesLE: Data? {
+    package static var macAddressBytesLE: Data? {
         guard let addr = IOBluetoothHostController.default()?.addressAsString() else {
             return nil
         }
@@ -1114,3 +844,5 @@ enum HostBluetooth {
         return Data(parts.reversed())
     }
 }
+
+#endif

@@ -20,8 +20,8 @@ import SwiftUI
             return
         }
         guard CommandLine.arguments.contains("--runtime-check") else {
-            if Switch2.Feature.selectedProfile != .compatibility {
-                bridgeLog(.warning, "app", "Unqualified sensor profile: \(Switch2.Feature.selectedProfile.rawValue). Some sensor features are disabled; normal relaunch and reconnect restores compatibility.")
+            if ApplicationSensorPolicy.selectedProfile != .compatibility {
+                bridgeLog(.warning, "app", "Unqualified sensor profile: \(ApplicationSensorPolicy.selectedProfile.rawValue). Some sensor features are disabled; normal relaunch and reconnect restores compatibility.")
             }
             FTCWApp.main()
             return
