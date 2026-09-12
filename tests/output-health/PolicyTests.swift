@@ -5,7 +5,7 @@ import Foundation
         for model in Switch2.Model.allCases {
             for backend in OutputBackend.allCases {
                 let caps = OutputCapabilities(model: model, backend: backend)
-                precondition(caps.directRumble == (model != .nsoGameCube))
+                precondition(caps.directRumble, "Every currently supported model has a direct test")
                 precondition(caps.gameRumble == (model != .nsoGameCube && [.sdl, .browser].contains(backend)))
                 precondition(caps.analogTravel == (model == .nsoGameCube && backend != .retroarch))
                 precondition(caps.independentTriggerClicks == (model == .nsoGameCube && backend == .sdl))

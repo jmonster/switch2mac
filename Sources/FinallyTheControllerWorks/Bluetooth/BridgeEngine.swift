@@ -404,8 +404,29 @@ final class BridgeEngine: NSObject, ObservableObject, @unchecked Sendable {
         }
     }
 
-    func testRumble(player: Int) {
-        btQueue.async { [weak self] in self?.pulse(player: player, strong: 1, duration: 0.4) }
+    /// The card identifies hardware, not a reusable game-player number.
+    /// Unassigned controllers can still be tested; a pair targets both current
+    /// physical sessions. Delayed pulse stops remain owned by those sessions.
+    func testRumble(serial: String) {
+        btQueue.async { [weak self] in
+            guard let self else { return }
+            let owners: [ControllerSession]
+            if let logical = self.players.values.first(where: { $0.id == serial }) {
+                owners = logical.slots.compactMap { self.sessions[$0] }
+            } else {
+                owners = self.sessions.values.filter { $0.serialNumber == serial }
+            }
+            guard !owners.isEmpty else {
+                bridgeLog(.warning, "engine", "rumble test not sent: controller is no longer connected")
+                return
+            }
+            // Read the latest saved slider value for this explicit UI action;
+            // don't race the asynchronous configuration-change notification.
+            let entry = (UserDefaults.standard.dictionary(forKey: "controllerSettings")
+                as? [String: [String: Any]])?[serial] ?? [:]
+            let scale = ControllerConfiguration(entry).rumble
+            for session in owners { session.testRumble(intensity: scale) }
+        }
     }
 
     private func pulse(player: Int, strong: Double, duration: Double) {

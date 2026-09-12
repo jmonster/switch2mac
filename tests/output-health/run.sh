@@ -13,13 +13,18 @@ from pathlib import Path
 app=Path('Sources/FinallyTheControllerWorks/FTCWApp.swift').read_text()
 view=Path('Sources/FinallyTheControllerWorks/UI/OutputStatusView.swift').read_text()
 dashboard=Path('Sources/FinallyTheControllerWorks/UI/DashboardView.swift').read_text()
-assert '.disabled(status.player < 0 || !status.model.hasHDRumble)' in dashboard
+assert '.disabled(!status.model.hasDirectRumbleTest)' in dashboard
+assert 'engine.testRumble(serial: serial)' in dashboard
+assert 'engine.testRumble(serial: controller.serial)' in view
+assert 'engine.testRumble(player:' not in dashboard + view
+assert 'No matching connected controller' in view
+assert 'Test preset' in dashboard and 'Rumble is muted.' in dashboard
 assert 'id: "output-status"' in app
 assert 'Output Status and Capabilities' in app and 'Output Status and Capabilities' in view
 assert '.disabled(controller == nil || !OutputCapabilities(model: model, backend: backend).directRumble)' in view
 for sink in ('UDPHub','WebSocketHub','NetworkGamepadSink','VirtualHIDSink'):
     assert f'OutputStatusStore.shared.register({sink}())' in app
-print('PASS output UI wiring, provider registration and unsupported rumble control')
+print('PASS output UI wiring, serial-addressed rumble tests, mute and preset guidance')
 PY
 
 # Exercise real production sinks, sharing only existing harness declarations.
