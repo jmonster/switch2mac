@@ -1,0 +1,49 @@
+name: Switch2Kit distribution and independent consumers
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: switch2kit-distribution-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  distribute:
+    runs-on: macos-26
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Check source ownership boundaries
+        run: python3 scripts/switch2kit/check-boundaries.py
+      - name: Archive and inspect the universal controller framework from another directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/build"
+          cd "$RUNNER_TEMP"
+          bash "$GITHUB_WORKSPACE/scripts/build-switch2kit-xcframework.sh" 2>&1 | tee "$GITHUB_WORKSPACE/build/Switch2Kit-distribution.log"
+      - name: Compile independent source and binary interface consumers
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/verify-switch2kit-consumer.sh 2>&1 | tee build/Switch2Kit-consumers.log
+      - name: Preserve inspected development framework and checksums
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: Switch2Kit-xcframework
+          path: |
+            build/Switch2Kit.xcframework.zip
+            build/Switch2Kit.xcframework.zip.sha256
+            build/Switch2Kit-build.txt
+          retention-days: 14
+      - name: Preserve build and inspection diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: Switch2Kit-distribution-diagnostics
+          path: build/Switch2Kit-*.log
+          retention-days: 7
