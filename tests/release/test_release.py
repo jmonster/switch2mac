@@ -73,7 +73,7 @@ class ReleaseTests(unittest.TestCase):
             self.assertFalse(self.output.exists())
 
     def test_dirty_wrong_bundle_revision_and_unsafe_entitlements_rejected(self):
-        for key, value in [('FTCWSourceDirty', True), ('CFBundleIdentifier', 'upstream.id'), ('FTCWSourceRevision', 'b'*40)]:
+        for key, value in [('FTCWSourceDirty', True), ('CFBundleIdentifier', 'other.application'), ('FTCWSourceRevision', 'b'*40)]:
             old = self.info[key]; self.info[key] = value; self.save_info()
             with self.assertRaises(release.ReleaseError): self.package()
             self.info[key] = old

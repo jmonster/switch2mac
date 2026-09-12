@@ -15,7 +15,7 @@ import shutil
 import subprocess
 import tempfile
 
-BUNDLE_ID = "io.github.jmonster.switch2mac"
+BUNDLE_ID = "io.github.switch2mac.gamecubed"
 UNSAFE_ENTITLEMENTS = (
     "get-task-allow", "com.apple.security.get-task-allow",
     "com.apple.security.cs.disable-library-validation",
@@ -55,7 +55,7 @@ def verify_app(app, team, revision, run):
     with (app / "Contents/Info.plist").open("rb") as stream:
         info = plistlib.load(stream)
     if not isinstance(info, dict) or info.get("CFBundleIdentifier") != BUNDLE_ID:
-        raise ReleaseError("Bundle identity is not this fork")
+        raise ReleaseError("Bundle identity is not GameCubed")
     if info.get("FTCWSourceRevision") != revision or info.get("FTCWSourceDirty") is not False:
         raise ReleaseError("Bundle must identify the exact clean source revision")
     executable = info.get("CFBundleExecutable", "")

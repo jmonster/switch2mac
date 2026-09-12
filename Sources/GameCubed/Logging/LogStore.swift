@@ -99,8 +99,8 @@ final class LogPipeline: @unchecked Sendable {
     private let maxPending: Int
     private let batchSize: Int
     private let buffer = Mutex(Buffer())
-    private let writerQueue = DispatchQueue(label: "io.github.jmonster.switch2mac.logging", qos: .utility)
-    private let logger = Logger(subsystem: "io.github.jmonster.switch2mac", category: "bridge")
+    private let writerQueue = DispatchQueue(label: "io.github.switch2mac.gamecubed.logging", qos: .utility)
+    private let logger = Logger(subsystem: "io.github.switch2mac.gamecubed", category: "bridge")
     private let formatter: DateFormatter
     private var fileHandle: FileHandle?
     private var fileBytes = 0
@@ -108,7 +108,7 @@ final class LogPipeline: @unchecked Sendable {
 
     convenience init() {
         let directory = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Logs/io.github.jmonster.switch2mac", isDirectory: true)
+            .appendingPathComponent("Logs/io.github.switch2mac.gamecubed", isDirectory: true)
         self.init(directory: directory)
     }
 

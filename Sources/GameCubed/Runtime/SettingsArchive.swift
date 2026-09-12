@@ -145,7 +145,7 @@ enum SettingsArchive {
 
     static func defaultRecoveryURL() -> URL {
         let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("io.github.jmonster.switch2mac", isDirectory: true)
+            .appendingPathComponent("io.github.switch2mac.gamecubed", isDirectory: true)
         return root.appendingPathComponent(recoveryFileName)
     }
 

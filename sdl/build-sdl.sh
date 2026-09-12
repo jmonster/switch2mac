@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build reviewed SDL sources; never overwrite the tracked upstream dylib.
+# Build reviewed SDL sources; never overwrite the tracked dylib.
 # Usage: bash sdl/build-sdl.sh /path/to/SDL-git-checkout
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)

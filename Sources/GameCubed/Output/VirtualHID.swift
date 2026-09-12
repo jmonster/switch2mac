@@ -257,8 +257,8 @@ final class VirtualHIDSink: ControllerOutputSink, OutputHealthProviding {
                     let props = HIDVirtualDevice.Properties(
                         descriptor: VirtualHIDSink.gamepadDescriptor,
                         vendorID: UInt32(Switch2.nintendoVendorID), productID: UInt32(model.rawValue),
-                        transport: nil, product: "\(model.displayName) (Finally)",
-                        manufacturer: "Finally the Controller Works",
+                        transport: nil, product: "\(model.displayName) (GameCubed)",
+                        manufacturer: "GameCubed",
                         serialNumber: "FTCW-slot\(index + 1)", uniqueID: "com.petersharma.ftcw.slot\(index + 1)")
                     guard let created = HIDVirtualDevice(properties: props) else {
                         fail(token, "virtual device creation refused; check HID entitlement and device properties")

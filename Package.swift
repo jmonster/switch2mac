@@ -1,14 +1,14 @@
 // swift-tools-version: 6.2
-// "Finally the Controller Works" — Switch 2 controllers on macOS, for real.
+// GameCubed — Switch 2 controllers on macOS.
 import PackageDescription
 
 let package = Package(
-    name: "FinallyTheControllerWorks",
+    name: "GameCubed",
     platforms: [.macOS(.v15)],
     targets: [
         .executableTarget(
-            name: "FinallyTheControllerWorks",
-            path: "Sources/FinallyTheControllerWorks",
+            name: "GameCubed",
+            path: "Sources/GameCubed",
             swiftSettings: [.swiftLanguageMode(.v6)]
         )
     ]

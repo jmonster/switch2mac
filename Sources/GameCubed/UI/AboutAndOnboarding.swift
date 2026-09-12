@@ -19,8 +19,8 @@ enum AppInfo {
         return String(revision.prefix(12)) + (dirty ? " (modified)" : "")
     }
 
-    /// This fork has no approved update signing identity/feed. Never consume
-    /// the upstream feed or a persisted override until that trust path exists.
+    /// Automatic updates and saved feed overrides remain disabled until a
+    /// signing identity, trusted feed, and verified installation policy exist.
     static let updatesEnabled = false
     static let defaultUpdateFeedURL = ""
 
@@ -28,7 +28,7 @@ enum AppInfo {
     /// gesture menu items, keyboard mapping, and the Experiments cluster.
     /// Deliberately a runtime flag rather than a build flag so a beta build
     /// can be un-hidden for development without recompiling:
-    ///   defaults write io.github.jmonster.switch2mac showPreReleaseFeatures -bool YES
+    ///   defaults write io.github.switch2mac.gamecubed showPreReleaseFeatures -bool YES
     /// (then relaunch; delete the key to hide again).
     static var showPreReleaseFeatures: Bool {
         UserDefaults.standard.bool(forKey: "showPreReleaseFeatures")
@@ -46,18 +46,7 @@ enum AppInfo {
         NSWorkspace.shared.open(url)
     }
 
-    /// Buy Me a Coffee page. Opened in Safari so supporters get the web
-    /// Apple Pay option (Apple Pay on the web is Safari-only).
-    static let buyMeACoffeeURL = "https://buymeacoffee.com/peterksharma"
 
-    static func openBuyMeACoffee() {
-        guard let url = URL(string: buyMeACoffeeURL) else { return }
-        let safari = URL(fileURLWithPath: "/Applications/Safari.app")
-        let cfg = NSWorkspace.OpenConfiguration()
-        NSWorkspace.shared.open([url], withApplicationAt: safari, configuration: cfg) { _, err in
-            if err != nil { NSWorkspace.shared.open(url) }   // fallback: default browser
-        }
-    }
 }
 
 struct AboutView: View {
@@ -66,31 +55,21 @@ struct AboutView: View {
             Image(systemName: "gamecontroller.fill")
                 .font(.system(size: 52))
                 .foregroundStyle(.tint)
-            Text("Finally the Controller Works")
+            Text("GameCubed")
                 .font(.title2.bold())
             Text("Version \(AppInfo.version) (\(AppInfo.build))")
                 .foregroundStyle(.secondary)
             Text("Source: \(AppInfo.sourceRevision)")
                 .font(.caption.monospaced()).textSelection(.enabled)
-            Text("Nintendo Switch 2 controllers on macOS —\nover Bluetooth, at last.")
+            Text("Nintendo Switch 2 controllers on macOS.")
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
-            Button {
-                AppInfo.openBuyMeACoffee()
-            } label: {
-                Label("Buy me a coffee", systemImage: "cup.and.saucer.fill")
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(.orange)
-            .help("Opens in Safari — supports Apple Pay")
 
             Divider().frame(width: 240)
             Text("© 2026 Peter Sharma")
                 .font(.callout)
-            Text("Switch 2 BLE protocol research thanks to the\nopen-source controller community.")
+            Link("Credits", destination: OutputSetupPath.documentationURL("CREDITS.md"))
                 .font(.caption)
-                .multilineTextAlignment(.center)
-                .foregroundStyle(.tertiary)
         }
         .padding(28)
         .frame(width: 380)
@@ -106,7 +85,7 @@ struct OnboardingView: View {
 
     private let pages: [(icon: String, title: String, body: String)] = [
         ("gamecontroller.fill", "Connect, then choose an output",
-         "Use a Switch 2 Pro Controller, Joy-Con 2, or NSO GameCube controller with this development bridge. Bluetooth connection is the first step; your game also needs a supported output path."),
+         "Use a Switch 2 Pro Controller, Joy-Con 2, or NSO GameCube controller with GameCubed. Bluetooth connection is the first step; your game also needs a supported output path."),
         ("dot.radiowaves.left.and.right", "Pair with this app",
          "Run only one controller bridge. Hold Sync next to USB-C until the player LEDs sweep, then look for the controller in the Dashboard. Allow Bluetooth access when macOS asks. For a previously bonded controller, try a button press first."),
         ("arrow.triangle.branch", "Choose your game output",

@@ -1,15 +1,7 @@
 // Updater.swift
-// Retained upstream updater; disabled by AppInfo.updatesEnabled in this fork.
-//
-// Flow: fetch a small JSON "appcast" from a configurable feed URL → if it
-// advertises a newer build, download the .zip → verify its SHA-256 AND that
-// the unzipped app is code-signed by OUR team (4BA4S6WKX7) → atomically swap
-// the running bundle via a detached helper script and relaunch.
-//
-// The signature check is the security boundary: a compromised feed cannot
-// push a malicious app, because only our Developer ID certificate can produce
-// a bundle whose TeamIdentifier matches. Downloads that fail verification are
-// discarded and never executed.
+// Automatic updates are disabled by AppInfo.updatesEnabled.
+// The inactive download/install path retains checksum and signature checks;
+// enabling it requires the signing and update policy in docs/app-identity.md.
 
 import Foundation
 import AppKit
@@ -29,7 +21,7 @@ struct AppcastEntry: Codable {
 @MainActor
 final class Updater: ObservableObject {
 
-    /// Upstream Developer ID team. Fork updates remain disabled, not re-trusted.
+    /// Pinned Developer ID required by the signature verifier. Updates stay disabled.
     nonisolated static let requiredTeamID = "4BA4S6WKX7"
 
     enum State: Equatable {
@@ -70,9 +62,7 @@ final class Updater: ObservableObject {
 
     var feedURL: URL? {
         guard AppInfo.updatesEnabled else { return nil }
-        // The Configuration field overrides the built-in default, so a beta
-        // build updates out of the box while testers can still point at a
-        // staging feed.
+        // A saved feed overrides the configured default only when updates are enabled.
         if let s = UserDefaults.standard.string(forKey: Self.feedURLKey),
            !s.isEmpty, let url = URL(string: s) {
             return url
@@ -92,7 +82,7 @@ final class Updater: ObservableObject {
 
     func check(userInitiated: Bool) async {
         guard let url = feedURL else {
-            if userInitiated { state = .failed(AppInfo.updatesEnabled ? "No update feed URL is configured." : "Updates are disabled in this fork. Install reviewed builds manually.") }
+            if userInitiated { state = .failed(AppInfo.updatesEnabled ? "No update feed URL is configured." : "Automatic updates are disabled. Install builds manually.") }
             return
         }
         let prior = state
@@ -241,7 +231,7 @@ final class Updater: ObservableObject {
         return items.first { $0.pathExtension == "app" }
     }
 
-    /// Reject anything not validly signed by our team.
+    /// Reject anything not validly signed by the pinned Developer ID team.
     private nonisolated static func verifySignature(_ app: URL) throws {
         // codesign strict verification.
         let verify = try run("/usr/bin/codesign", ["--verify", "--deep", "--strict", app.path])
@@ -371,7 +361,7 @@ struct UpdaterView: View {
             if updater.feedURL == nil {
                 Text(AppInfo.updatesEnabled
                      ? "Set an update feed URL in the dashboard's Configuration section to enable updates."
-                     : "This fork uses manual updates until its own signing and update policy is configured.")
+                     : "Install updates manually. Automatic updates are disabled.")
                     .font(.caption).foregroundStyle(.tertiary).multilineTextAlignment(.center)
             }
         }

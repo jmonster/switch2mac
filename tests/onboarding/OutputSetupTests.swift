@@ -6,9 +6,8 @@ import Foundation
         precondition(Set(paths.map(\.id)).count == 3)
         for path in paths {
             precondition(!path.title.isEmpty && !path.detail.isEmpty)
-            precondition(path.guideURL.scheme == "https")
-            precondition(path.guideURL.host == "github.com")
-            precondition(path.guideURL.path == "/jmonster/switch2mac/blob/main/" + path.guidePath)
+            precondition(path.guideURL.isFileURL)
+            precondition(path.guideURL.path.hasSuffix("/Documentation/" + path.guidePath))
             precondition(FileManager.default.fileExists(atPath: path.guidePath), "Setup link has no checked-in guide")
         }
         // Keep each integration routed to its own maintained guide.

@@ -2,7 +2,7 @@ import Foundation
 
 @main enum RuntimeTests {
     static func main() throws {
-        let info: [String: Any] = ["CFBundleIdentifier": "io.github.jmonster.switch2mac",
+        let info: [String: Any] = ["CFBundleIdentifier": "io.github.switch2mac.gamecubed",
             "LSMinimumSystemVersion": "15.0", "FTCWSourceRevision": String(repeating: "a", count: 40),
             "FTCWSourceDirty": false, "FTCWBuildArchitecture": RuntimeCompatibility.architecture]
         let report = try RuntimeCompatibility.report(info: info, os: .init(majorVersion: 15, minorVersion: 7, patchVersion: 9))

@@ -24,7 +24,7 @@ enum RuntimeCompatibility {
         #endif
     }
     static func report(info: [String: Any], os: OperatingSystemVersion) throws -> Report {
-        guard info["CFBundleIdentifier"] as? String == "io.github.jmonster.switch2mac",
+        guard info["CFBundleIdentifier"] as? String == "io.github.switch2mac.gamecubed",
               let minimum = info["LSMinimumSystemVersion"] as? String,
               let revision = info["FTCWSourceRevision"] as? String,
               revision.utf8.count == 40, revision.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }),

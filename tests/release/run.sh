@@ -16,7 +16,7 @@ from pathlib import Path
 import plistlib, sys
 app = Path(sys.argv[1])
 (app/'Contents/Info.plist').write_bytes(plistlib.dumps({
-    'CFBundleIdentifier':'io.github.jmonster.switch2mac','CFBundleExecutable':'App',
+    'CFBundleIdentifier':'io.github.switch2mac.gamecubed','CFBundleExecutable':'App',
     'CFBundlePackageType':'APPL','CFBundleVersion':'1',
     'FTCWSourceRevision':'a'*40,'FTCWSourceDirty':False}))
 PY

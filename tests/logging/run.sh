@@ -5,13 +5,13 @@ cd "$(dirname "$0")/../.."
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 swiftc -swift-version 6 -warnings-as-errors \
-  Sources/FinallyTheControllerWorks/Logging/LogStore.swift \
+  Sources/GameCubed/Logging/LogStore.swift \
   tests/logging/LogPipelineTests.swift -o "$work/log-tests"
 "$work/log-tests"
 python3 - "$work" <<'PY'
 from pathlib import Path
 import os, sys
-source = Path(os.environ.get('LOG_SOURCE', 'Sources/FinallyTheControllerWorks/Logging/LogStore.swift')).read_text()
+source = Path(os.environ.get('LOG_SOURCE', 'Sources/GameCubed/Logging/LogStore.swift')).read_text()
 needle = '                try handle.write(contentsOf: data)'
 assert source.count(needle) == 1
 source = source.replace(needle, '                TestWrites.record(data.count)\n' + needle)

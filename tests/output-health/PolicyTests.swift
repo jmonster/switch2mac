@@ -14,7 +14,11 @@ import Foundation
             }
         }
         for backend in OutputBackend.allCases {
-            precondition(backend.guideURL.host == "github.com")
+            precondition(backend.guideURL.isFileURL)
+            let marker = "/Documentation/"
+            let parts = backend.guideURL.path.components(separatedBy: marker)
+            precondition(parts.count == 2)
+            precondition(FileManager.default.fileExists(atPath: parts[1]), "Missing bundled guide source")
             let result = OutputHealth(backend: backend, state: .unavailable, affectedSlots: [0, 2])
             precondition(!result.guidance.isEmpty)
             let decoded = try JSONDecoder().decode(OutputHealth.self, from: JSONEncoder().encode(result))

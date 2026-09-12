@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Finally the Controller Works \u2014 Browser Bridge",
+  "name": "GameCubed \u2014 Browser Bridge",
   "version": "0.1.0",
-  "description": "Lets web games (Xbox Cloud Gaming, GeForce NOW, Luna, gamepad testers) see the Switch 2 controllers connected through the Finally the Controller Works menu-bar app.",
+  "description": "Lets web games (Xbox Cloud Gaming, GeForce NOW, Luna, gamepad testers) see the Switch 2 controllers connected through the GameCubed menu-bar app.",
   "content_scripts": [
     {
       "matches": [

@@ -61,7 +61,7 @@ struct OutputStatusView: View {
                 }
                 .disabled(controller == nil || !OutputCapabilities(model: model, backend: backend).directRumble)
                 Text("Direct tests bypass the selected game output. GameCube preset rumble is not verified; its HD-motor test is disabled here.").font(.caption)
-                Link("Full model and hardware-acceptance limits", destination: URL(string: "https://github.com/jmonster/switch2mac/blob/main/docs/pro-controller-support.md")!)
+                Link("Full model and hardware-acceptance limits", destination: OutputSetupPath.documentationURL("docs/pro-controller-support.md"))
             }.padding(20)
         }
         .frame(minWidth: 560, minHeight: 500)

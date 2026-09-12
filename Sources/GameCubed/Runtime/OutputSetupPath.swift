@@ -21,7 +21,7 @@ enum OutputSetupPath: String, CaseIterable, Identifiable {
         case .retroarch:
             return "Enable network gamepad input in RetroArch and output in the Dashboard with matching ports. No SDL replacement is needed. This path has no rumble or analog GameCube trigger travel; use a trusted network."
         case .browser:
-            return "Load the bundled Chromium extension, allow its exact ID in Browser Bridge Settings, then relaunch the app and reload the game tab. Safari and Firefox are not included."
+            return "Load the bundled Chromium extension, allow its exact ID in Browser Bridge Settings, click Apply Changes, then reload the game tab. Safari and Firefox are not included."
         }
     }
 
@@ -34,6 +34,14 @@ enum OutputSetupPath: String, CaseIterable, Identifiable {
     }
 
     var guideURL: URL {
-        URL(string: "https://github.com/jmonster/switch2mac/blob/main/" + guidePath)!
+        Self.documentationURL(guidePath)
     }
+
+    /// Bundled guides match the installed application and remain available offline.
+    static func documentationURL(_ path: String) -> URL {
+        (Bundle.main.resourceURL ?? Bundle.main.bundleURL)
+            .appendingPathComponent("Documentation", isDirectory: true)
+            .appendingPathComponent(path)
+    }
+
 }

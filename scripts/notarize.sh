@@ -1,12 +1,12 @@
 #!/bin/bash
-# Explicit fork signing/notarization only. No inherited identity, credential
-# profile, update feed or release publication. Read docs/fork-identity.md first.
+# Explicit application signing and notarization. Read docs/app-identity.md
+# for the required signing identity, credentials, and provisioning inputs.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 : "${SIGN_IDENTITY:?Supply your own Developer ID signing identity}"
 : "${NOTARY_KEYCHAIN_PROFILE:?Supply your own notarytool keychain profile}"
-APP="build/Finally the Controller Works (jmonster).app"
-ZIP="build/switch2mac-jmonster.zip"
+APP="build/GameCubed.app"
+ZIP="build/GameCubed.zip"
 
 bash scripts/build-app.sh
 codesign --verify --strict "$APP"

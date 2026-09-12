@@ -2,7 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 [ "$(uname -s)" = Darwin ] || { echo 'Packaged runtime check requires macOS' >&2; exit 2; }
-app=${1:-"build/Finally the Controller Works (jmonster).app"}
+app=${1:-"build/GameCubed.app"}
 output=${2:-build/runtime-qualification.json}
 codesign --verify --deep --strict "$app"
 python3 - "$app" "$output" <<'PY'

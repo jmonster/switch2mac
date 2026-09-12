@@ -6,7 +6,7 @@ trap 'rm -rf "$work"' EXIT
 python3 - "$work" <<'PY'
 from pathlib import Path
 import re, sys
-root = Path('Sources/FinallyTheControllerWorks')
+root = Path('Sources/GameCubed')
 s = (root/'Bluetooth/ControllerSession.swift').read_text()
 s = re.sub(r'^import (CoreBluetooth|IOBluetooth)$', '', s, flags=re.M)
 s = re.sub(r'\b(?:fileprivate|private)(?:\(set\))?\s+', '', s)
@@ -39,33 +39,33 @@ markers = ['private struct RetryAdvertisement', 'private func noteConnectionFail
 Path(sys.argv[1], 'Engine.swift').write_text(Path('tests/engine/Boundary.swift').read_text()
     + '\n'.join(method(x) for x in markers) + '\n}\n')
 PY
-swiftc -swift-version 5 Sources/FinallyTheControllerWorks/Protocol/Switch2Protocol.swift \
- Sources/FinallyTheControllerWorks/Runtime/ControllerConfiguration.swift \
- Sources/FinallyTheControllerWorks/Runtime/VisualizerMailbox.swift \
- Sources/FinallyTheControllerWorks/Runtime/DiscoveryPolicy.swift \
+swiftc -swift-version 5 Sources/GameCubed/Protocol/Switch2Protocol.swift \
+ Sources/GameCubed/Runtime/ControllerConfiguration.swift \
+ Sources/GameCubed/Runtime/VisualizerMailbox.swift \
+ Sources/GameCubed/Runtime/DiscoveryPolicy.swift \
  "$work/Session.swift" tests/session/FrameworkFakes.swift "$work/Engine.swift" \
  tests/engine/EngineTests.swift -o "$work/check"
 "$work/check"
 
-swiftc -swift-version 5 Sources/FinallyTheControllerWorks/Protocol/Switch2Protocol.swift \
- Sources/FinallyTheControllerWorks/Runtime/ControllerConfiguration.swift \
- Sources/FinallyTheControllerWorks/Runtime/VisualizerMailbox.swift \
- Sources/FinallyTheControllerWorks/Runtime/DiscoveryPolicy.swift \
+swiftc -swift-version 5 Sources/GameCubed/Protocol/Switch2Protocol.swift \
+ Sources/GameCubed/Runtime/ControllerConfiguration.swift \
+ Sources/GameCubed/Runtime/VisualizerMailbox.swift \
+ Sources/GameCubed/Runtime/DiscoveryPolicy.swift \
  "$work/Session.swift" tests/session/FrameworkFakes.swift "$work/Engine.swift" \
  tests/discovery/EngineTests.swift -o "$work/discovery"
 "$work/discovery"
 
-swiftc -swift-version 5 Sources/FinallyTheControllerWorks/Protocol/Switch2Protocol.swift \
- Sources/FinallyTheControllerWorks/Runtime/ControllerConfiguration.swift \
- Sources/FinallyTheControllerWorks/Runtime/VisualizerMailbox.swift \
- Sources/FinallyTheControllerWorks/Runtime/DiscoveryPolicy.swift \
+swiftc -swift-version 5 Sources/GameCubed/Protocol/Switch2Protocol.swift \
+ Sources/GameCubed/Runtime/ControllerConfiguration.swift \
+ Sources/GameCubed/Runtime/VisualizerMailbox.swift \
+ Sources/GameCubed/Runtime/DiscoveryPolicy.swift \
  "$work/Session.swift" tests/session/FrameworkFakes.swift "$work/Engine.swift" \
  tests/engine/RetryRegression.swift -o "$work/retry-regression"
 "$work/retry-regression"
-swiftc -swift-version 5 Sources/FinallyTheControllerWorks/Protocol/Switch2Protocol.swift \
- Sources/FinallyTheControllerWorks/Runtime/ControllerConfiguration.swift \
- Sources/FinallyTheControllerWorks/Runtime/VisualizerMailbox.swift \
- Sources/FinallyTheControllerWorks/Runtime/DiscoveryPolicy.swift \
+swiftc -swift-version 5 Sources/GameCubed/Protocol/Switch2Protocol.swift \
+ Sources/GameCubed/Runtime/ControllerConfiguration.swift \
+ Sources/GameCubed/Runtime/VisualizerMailbox.swift \
+ Sources/GameCubed/Runtime/DiscoveryPolicy.swift \
  "$work/Session.swift" tests/session/FrameworkFakes.swift "$work/Engine.swift" \
  tests/engine/RetryTests.swift -o "$work/retry-tests"
 "$work/retry-tests"

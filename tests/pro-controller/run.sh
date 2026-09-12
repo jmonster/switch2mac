@@ -9,14 +9,14 @@ trap 'rm -rf "$work"' EXIT
 python3 - "$work/ControllerSession.swift" <<'PY'
 from pathlib import Path
 import re, sys
-source = Path('Sources/FinallyTheControllerWorks/Bluetooth/ControllerSession.swift').read_text()
+source = Path('Sources/GameCubed/Bluetooth/ControllerSession.swift').read_text()
 source = re.sub(r'^import (CoreBluetooth|IOBluetooth)$', '', source, flags=re.M)
 source = re.sub(r'\b(?:fileprivate|private)(?:\(set\))?\s+', '', source)
 Path(sys.argv[1]).write_text('import CoreFoundation\n' + source)
 PY
 swiftc -swift-version 5 \
-  Sources/FinallyTheControllerWorks/Protocol/Switch2Protocol.swift \
-  Sources/FinallyTheControllerWorks/Runtime/ControllerConfiguration.swift \
+  Sources/GameCubed/Protocol/Switch2Protocol.swift \
+  Sources/GameCubed/Runtime/ControllerConfiguration.swift \
   "$work/ControllerSession.swift" tests/session/FrameworkFakes.swift \
   tests/pro-controller/ProControllerTests.swift -o "$work/pro-tests"
 "$work/pro-tests"

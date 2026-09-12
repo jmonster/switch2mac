@@ -2,7 +2,7 @@
 // One connected Switch 2 controller: GATT handshake, command serialization,
 // input decoding, keep-alive, and rumble.
 //
-// Invariants carried over from the proven Python bridge:
+// Connection invariants:
 //  * No SMP pairing is ever initiated (the controller drops such links);
 //    CoreBluetooth only pairs on encrypted characteristics, which these are
 //    not, so plain connects are safe.

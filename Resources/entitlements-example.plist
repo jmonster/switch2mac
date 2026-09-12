@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!-- Replace YOUR_TEAM_ID with the team in your approved provisioning profile.
+     This example is not a provisioning profile or an entitlement grant. -->
+<dict>
+    <key>com.apple.application-identifier</key>
+    <string>YOUR_TEAM_ID.io.github.switch2mac.gamecubed</string>
+    <key>com.apple.developer.team-identifier</key>
+    <string>YOUR_TEAM_ID</string>
+    <key>com.apple.developer.hid.virtual.device</key>
+    <true/>
+</dict>
+</plist>

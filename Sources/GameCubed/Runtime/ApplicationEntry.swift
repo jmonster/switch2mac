@@ -23,7 +23,7 @@ import SwiftUI
             if Switch2.Feature.selectedProfile != .compatibility {
                 bridgeLog(.warning, "app", "Unqualified sensor profile: \(Switch2.Feature.selectedProfile.rawValue). Some sensor features are disabled; normal relaunch and reconnect restores compatibility.")
             }
-            FTCWApp.main()
+            GameCubedApp.main()
             return
         }
         guard CommandLine.arguments.count == 2 else {

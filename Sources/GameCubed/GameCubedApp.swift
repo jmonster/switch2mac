@@ -1,5 +1,5 @@
-// FTCWApp.swift
-// "Finally the Controller Works" — app entry point.
+// GameCubedApp.swift
+// "GameCubed" — app entry point.
 //
 // Menu-bar resident: launching the app starts the bridge; closing the
 // dashboard window leaves it running; quitting from the menu stops
@@ -8,7 +8,7 @@
 import SwiftUI
 import ServiceManagement
 
-struct FTCWApp: App {
+struct GameCubedApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     var body: some Scene {
@@ -18,7 +18,7 @@ struct FTCWApp: App {
             MenuBarIcon(engine: appDelegate.engine)
         }
 
-        Window("Finally the Controller Works", id: "dashboard") {
+        Window("GameCubed", id: "dashboard") {
             VStack(spacing: 0) {
                 OutputStatusShortcut()
                 DashboardView(engine: appDelegate.engine)
@@ -79,8 +79,8 @@ struct MenuBarIcon: View {
         Image(systemName: engine.controllers.isEmpty
               ? "gamecontroller" : "gamecontroller.fill")
             .accessibilityLabel(engine.controllers.isEmpty
-                ? "Finally the Controller Works — no controllers connected"
-                : "Finally the Controller Works — \(engine.controllers.count) connected")
+                ? "GameCubed — no controllers connected"
+                : "GameCubed — \(engine.controllers.count) connected")
     }
 }
 
@@ -104,7 +104,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     private var terminating = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        bridgeLog(.info, "app", "Finally the Controller Works — starting bridge")
+        bridgeLog(.info, "app", "GameCubed — starting bridge")
         inputEnvironment = InputEnvironment { [weak engine] context in engine?.updateInputContext(context) }
         engine.onInputPermissionNeeded = { [weak self] needed in
             Task { @MainActor in self?.inputEnvironment?.setNeeded(needed) }
@@ -213,11 +213,7 @@ struct MenuContent: View {
         Divider()
 
         Button("Build and Installation Help…") {
-            NSWorkspace.shared.open(URL(string: "https://github.com/jmonster/switch2mac#build-this-fork")!)
-        }
-
-        Button("Buy me a coffee ☕") {
-            AppInfo.openBuyMeACoffee()
+            NSWorkspace.shared.open(OutputSetupPath.documentationURL("README.md"))
         }
 
         Button("Welcome Guide") { show("welcome") }

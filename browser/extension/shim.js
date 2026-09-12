@@ -1,5 +1,5 @@
 // shim.js — runs in the page's main world. Wraps navigator.getGamepads() so
-// controllers streamed by the Finally the Controller Works app appear as
+// controllers streamed by the GameCubed app appear as
 // standard-mapping gamepads alongside any real ones, fires
 // gamepadconnected/gamepaddisconnected, and forwards vibrationActuator
 // effects back to the app (rumble).

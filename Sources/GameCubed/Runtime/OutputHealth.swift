@@ -17,9 +17,11 @@ enum OutputBackend: String, CaseIterable, Codable, Sendable {
         case .sdl: path = "sdl/README.md"
         case .browser: path = "browser/README.md"
         case .retroarch: path = "docs/retroarch-integration.md"
-        case .hid: path = "docs/fork-identity.md"
+        case .hid: path = "docs/app-identity.md"
         }
-        return URL(string: "https://github.com/jmonster/switch2mac/blob/main/" + path)!
+        return (Bundle.main.resourceURL ?? Bundle.main.bundleURL)
+            .appendingPathComponent("Documentation", isDirectory: true)
+            .appendingPathComponent(path)
     }
 }
 

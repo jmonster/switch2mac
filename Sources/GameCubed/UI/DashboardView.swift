@@ -815,7 +815,7 @@ struct ConfigurationSection: View {
     private func exportSettings() {
         guard let data = SettingsTransfer.export() else { return }
         let panel = NSSavePanel()
-        panel.nameFieldStringValue = "FinallyControllers.ftcw"
+        panel.nameFieldStringValue = "GameCubed.ftcw"
         panel.begin { resp in
             if resp == .OK, let url = panel.url { try? data.write(to: url) }
         }
@@ -907,7 +907,7 @@ struct LogView: View {
 
     private func exportLog() {
         let panel = NSSavePanel()
-        panel.nameFieldStringValue = "ftcw-diagnostics.log"
+        panel.nameFieldStringValue = "GameCubed-diagnostics.log"
         panel.begin { response in
             guard response == .OK, let dest = panel.url else { return }
             try? FileManager.default.removeItem(at: dest)
