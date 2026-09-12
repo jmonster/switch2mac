@@ -1,6 +1,6 @@
 # Switch 2 Pro Controller support
 
-This fork recognizes Nintendo VID `057e`, PID `2069`. This document describes
+GameCubed recognizes Nintendo VID `057e`, PID `2069`. This document describes
 implemented paths and their limits; it is **not** a physical-controller
 acceptance certificate. Tests use synthetic reports, fake Apple radio
 boundaries, and real loopback sockets. Record the commit, macOS version,
@@ -80,7 +80,7 @@ path uses host receipt timestamps, reports an unknown sample rate (`0`), and
 does not reproduce SDL's firmware-dependent sensitivity detection or bias
 calibration. Non-Pro controller orientation and per-unit motion accuracy must
 not be inferred from these Pro tests. See the pinned
-[upstream driver](https://github.com/libsdl-org/SDL/blob/147a8ee32dbf9ac02f3794964490687b6bbda1bc/src/joystick/hidapi/SDL_hidapi_switch2.c)
+[SDL driver](https://github.com/libsdl-org/SDL/blob/147a8ee32dbf9ac02f3794964490687b6bbda1bc/src/joystick/hidapi/SDL_hidapi_switch2.c)
 and the repository's [protocol notes](../research/PROTOCOL.md).
 
 ## Validation
@@ -95,7 +95,7 @@ The SDL CI workflow compiles `tests/sdl-pro-controller/check.c` against the
 pinned SDL headers and runs it against the rebuilt library through actual SDL
 gamepad and sensor APIs and localhost UDP. Existing queued-edge and USB
 negative controls remain in place. The macOS workflow also compiles and checks
-the complete ad-hoc-signed app. CI results must be checked for the exact PR SHA.
+the complete ad-hoc-signed app. Check CI results for the exact source revision.
 
 Before calling this hardware-qualified, exercise initial pairing and button
 wake, both stick endpoints/centers, every button and remap, LEDs/battery while
@@ -103,7 +103,7 @@ charging, asymmetric rumble and consumer exit, six-axis motion directions,
 radio loss/reconnect, sleep/wake, multiple players, USB and an actual game.
 Repeat across supported firmware/macOS versions and output backends.
 
-## Not completed by this change
+## Experimental features and limits
 
 NFC/amiibo and headphone/microphone audio remain experiments. No audio codec,
 macOS audio device, Nintendo GameChat service, arbitrary HD Rumble 2 renderer,

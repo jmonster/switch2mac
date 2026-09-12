@@ -7,7 +7,7 @@ establish compatibility with every game. RetroArch and Chromium have
 
 ## Choose the corrected library, not the historical binary
 
-The tracked `sdl/libSDL3.0.dylib` is a historical upstream binary. It does
+The tracked `sdl/libSDL3.0.dylib` is a historical binary. It does
 **not** incorporate later input-edge, USB identity, or Pro Controller source
 repairs. Editing a patch does not rebuild that binary.
 
@@ -18,7 +18,7 @@ the required C/C++ build tools, CMake, and libusb, then provide an SDL git
 checkout containing that commit:
 
 ```sh
-git clone --branch release-3.4.14 https://github.com/libsdl-org/SDL.git /path/to/SDL
+git clone https://github.com/libsdl-org/SDL.git /path/to/SDL
 bash sdl/build-sdl.sh /path/to/SDL
 ```
 
@@ -92,4 +92,4 @@ Based on SDL 3.4.14 by Sam Lantinga and the SDL contributors, under the
 This is a modified SDL build, not an official SDL release. The original
 `sdl3-3.4.14-s2udp.patch` and the three follow-up patches remain separately
 tracked; [build-sdl.sh](build-sdl.sh) is the authoritative application order.
-Application-wide licensing is a separate unresolved upstream question.
+Application-wide licensing is documented separately in [CREDITS.md](../CREDITS.md).

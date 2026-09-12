@@ -1,8 +1,6 @@
 # Research
 
-Protocol documentation and reverse-engineering write-ups produced while
-building Finally the Controller Works. Published so the next person
-doesn't have to rediscover any of it.
+Controller protocol documentation and reverse-engineering notes for GameCubed.
 
 | Document | What it covers |
 |---|---|
@@ -12,8 +10,7 @@ doesn't have to rediscover any of it.
 
 Everything here was observed on real hardware (Pro Controller 2,
 firmware 2.0+, macOS host) unless explicitly marked as inference.
-Community groundwork is credited inline — especially
-[ndeadly/switch2_controller_research](https://github.com/ndeadly/switch2_controller_research).
+See [Credits](../CREDITS.md) for research contributors.
 
 Corrections welcome: if you have captures or hardware that contradicts
 anything here, please open an issue.

@@ -1,6 +1,6 @@
 # Input delivery correction
 
-The tracked upstream libSDL3.0.dylib predates this fix. Editing a source patch
+The tracked libSDL3.0.dylib predates this fix. Editing a source patch
 cannot change that binary. Build the corrected library on macOS:
 
 ```sh
@@ -10,7 +10,7 @@ bash sdl/make-gopher64-both.sh
 ```
 
 The build script exports exact commit 147a8ee32dbf9ac02f3794964490687b6bbda1bc,
-applies the original patch and then s2udp-input-edges.patch, and writes
+applies the four patches listed in sdl/build-sdl.sh, and writes
 build/sdl/libSDL3.0.dylib without modifying the checkout or tracked binary.
 The Gopher64 wrapper defaults to that rebuilt library and refuses to proceed
 when it is missing. SDL3_LIBRARY may explicitly select another compatible

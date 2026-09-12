@@ -1,7 +1,7 @@
 # The Hunt for Switch 2 Controller Audio over BLE
 
 *Status report of an ongoing investigation. Part of the
-[FinallyTheControllerWorks research series](README.md). Last updated
+[controller research notes](README.md). Last updated
 2026-08-10.*
 
 The Pro Controller 2 has a 3.5 mm headset jack. On a console, GameChat
@@ -94,11 +94,3 @@ voices (the app's "haptic melody" experiment plays tunes through them).
    `00 00 40 f0 00 00 60 00` and is unexplored.)
 4. What are the semantics of audio-state byte values beyond
    0x00/0x05/0x07 (nothing/headphones/headset)?
-
-## Credits
-
-Built on [ndeadly/switch2_controller_research](https://github.com/ndeadly/switch2_controller_research)
-(characteristic map, report layouts, USB descriptors, rumble captures)
-and the wider Switch homebrew community. Local findings (capture
-analysis, codec rule-outs, the 46 Hz explanation, tick-counter decode,
-backpressure fixes) are contributions of this project.

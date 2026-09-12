@@ -1,8 +1,8 @@
 # Maintainer-controlled trusted release packaging
 
 This is release **tooling**, not a notarized release or an enabled update feed.
-The fork updater remains disabled, including saved feed overrides. The tool
-never signs with an upstream identity, publishes a GitHub release, installs an
+Automatic updates remain disabled, including saved feed overrides. The tool
+requires an explicit signing identity and never publishes a release, installs an
 app, grants HID entitlements, modifies the input app, or changes macOS policy.
 
 ## Preconditions and deliberate submission
@@ -20,7 +20,7 @@ Build and test the intended commit with the maintainer's own signing identity:
 SIGN_IDENTITY='Developer ID Application: YOUR IDENTITY' bash scripts/build-app.sh
 bash tests/run.sh
 python3 scripts/notarize-release.py \
-  --app 'build/Finally the Controller Works (jmonster).app' \
+  --app 'build/GameCubed.app' \
   --output build/notarized-candidate \
   --team-id YOURTEAMID \
   --keychain-profile YOUR_EXISTING_PROFILE
@@ -30,7 +30,7 @@ python3 scripts/notarize-release.py \
 path must not exist. Team ID is exactly ten uppercase letters/digits; use the
 actual value, not the placeholder. The existing build script enables hardened
 runtime with Developer ID signing. A profile-bearing HID build additionally
-requires explicit fork-specific entitlements and matching provisioning.
+requires explicit application-specific entitlements and matching provisioning.
 
 The packager verifies the app signature, expected team, Developer ID Application
 authority, secure timestamp, hardened runtime, clean source provenance and known
@@ -57,8 +57,8 @@ and each claimed controller/game combination. Obtain distribution/license and
 entitlement approvals before representing those claims as established.
 
 Only then publish the reviewed ZIP and evidence through a maintainer-controlled
-release. Do not reuse the upstream updater or enable the existing custom updater
-merely because this tool produced a ZIP. A future update PR needs an authenticated
+release. Do not enable automatic updates merely because this tool produced a ZIP.
+An update system needs an authenticated
 manifest/signature trust root, pinned team/bundle verification, version/rollback
 rules, size bounds, atomic replacement/recovery and signing-key rotation tests.
 None of those guarantees can be provided by an unsigned checksum/feed alone.
