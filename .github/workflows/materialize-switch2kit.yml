@@ -1,0 +1,110 @@
+name: Switch2Kit extraction transport and native checks
+on:
+  push:
+    branches: [automation/materialize-switch2kit]
+    paths:
+      - .github/materialize/manifest.json
+      - .github/workflows/materialize-switch2kit.yml
+permissions:
+  contents: read
+concurrency:
+  group: switch2kit-reviewed-source-materialization
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    outputs:
+      source-sha: ${{ steps.publish.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: true
+      - name: Verify patch and publish normal source commit
+        id: publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/materialize/materialize.py
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Preserve exact published source
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: materialized-switch2kit-source
+          path: ${{ runner.temp }}/switch2kit-verification
+          if-no-files-found: warn
+  verify:
+    needs: publish
+    runs-on: macos-26
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.publish.outputs.source-sha }}
+          persist-credentials: false
+      - name: Run independent native verification commands
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p "$RUNNER_TEMP/switch2kit-native"
+          cd "$GITHUB_WORKSPACE"
+          git rev-parse HEAD > "$RUNNER_TEMP/switch2kit-native/revision.txt"
+          {
+            sw_vers
+            uname -m
+            swift --version
+            xcodebuild -version
+          } | tee "$RUNNER_TEMP/switch2kit-native/toolchain.txt"
+          failed=0
+          run_check() {
+            label=$1
+            shift
+            echo "::group::$label"
+            "$@" 2>&1 | tee "$RUNNER_TEMP/switch2kit-native/$label.log"
+            status=${PIPESTATUS[0]}
+            echo "$label=$status" | tee -a "$RUNNER_TEMP/switch2kit-native/results.txt"
+            echo "::endgroup::"
+            [ "$status" -eq 0 ] || failed=1
+          }
+          run_check package-describe swift package describe
+          run_check library-build swift build --target Switch2Kit
+          run_check experimental-build swift build --target Switch2KitExperimental
+          run_check app-build swift build --product FinallyTheControllerWorks
+          run_check example-build swift build --product Switch2KitDemo
+          run_check swift-tests swift test
+          run_check regression-runner bash tests/run.sh
+          run_check app-bundle bash scripts/build-app.sh
+          if [ -f scripts/build-switch2kit-xcframework.sh ]; then
+            run_check xcframework bash scripts/build-switch2kit-xcframework.sh
+          fi
+          {
+            echo '### Native command exit statuses'
+            echo '```'
+            cat "$RUNNER_TEMP/switch2kit-native/revision.txt"
+            cat "$RUNNER_TEMP/switch2kit-native/results.txt"
+            echo '```'
+            echo 'Synthetic tests and build checks are not physical-controller validation.'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$failed"
+      - name: Preserve all native logs including failures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: switch2kit-native-verification
+          path: ${{ runner.temp }}/switch2kit-native
+          if-no-files-found: error
+      - name: Preserve framework when built
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: switch2kit-framework-build
+          path: |
+            build/Switch2Kit.xcframework
+            build/Switch2Kit.xcframework.zip
+            build/Switch2Kit.xcframework.zip.sha256
+          if-no-files-found: ignore
