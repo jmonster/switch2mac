@@ -1,65 +1,36 @@
 import Foundation
 
+// Only the radio is fake. tests/support/prepare-sources.py compiles the complete
+// production ControllerTransport, retaining every lifecycle/retry method body.
 let CBCentralManagerScanOptionAllowDuplicatesKey = "duplicates"
 let CBAdvertisementDataManufacturerDataKey = "manufacturer"
-typealias CBCentralManager = Central
-final class Central {
-    enum State { case poweredOn, poweredOff }
+protocol CBCentralManagerDelegate: AnyObject {}
+final class CBCentralManager {
+    enum State { case unknown, resetting, unsupported, unauthorized, poweredOn, poweredOff }
+    weak var delegate: (any CBCentralManagerDelegate)?
     var state = State.poweredOn
     var isScanning = false
     var scans = 0, stops = 0
     var connections: [UUID] = []
+    var cancelled: [UUID] = []
+    init(delegate: (any CBCentralManagerDelegate)?, queue: DispatchQueue?) { self.delegate = delegate }
     func scanForPeripherals(withServices: [String]?, options: [String: Any]?) {
         precondition(options?[CBCentralManagerScanOptionAllowDuplicatesKey] as? Bool == false)
         isScanning = true; scans += 1
     }
     func connect(_ peripheral: CBPeripheral, options: [String: Any]?) { connections.append(peripheral.identifier) }
-    var cancelled: [UUID] = []
     func stopScan() { isScanning = false; stops += 1 }
     func cancelPeripheralConnection(_ peripheral: CBPeripheral) { cancelled.append(peripheral.identifier) }
 }
-final class Output {
-    var resets = 0
-    var acceptsPointer = false
-    func handle(serial: String, model: Switch2.Model, state: ControllerState, configuration: ControllerConfiguration) -> Bool { acceptsPointer }
-    func reset() { resets += 1 }
-    func reset(serial: String) { resets += 1 }
+
+// The dashboard's automatic/eight-device policy is explicit, not the kit default.
+typealias BridgeEngine = ControllerTransport
+extension ControllerTransport {
+    static func fixture() -> ControllerTransport {
+        let transport = ControllerTransport(configuration: .init(discoveryMode: .automatic, maximumControllers: 8),
+                                            hub: ControllerEventHub(), diagnostics: Switch2Diagnostics())
+        transport.start()
+        transport.btQueue.sync { transport.centralManagerDidUpdateState(transport.central) }
+        return transport
+    }
 }
-enum AppConfig { static var idleSleepMinutes = 1.0 }
-final class BridgeEngine: ControllerSessionDelegate, @unchecked Sendable {
-    enum State { case paused, scanning, idle, ready, connecting }
-    static let maxSessions = 8
-    let preferenceSuite = "discovery-test-" + UUID().uuidString
-    lazy var discoveryDefaults = UserDefaults(suiteName: preferenceSuite)!
-    lazy var discovery = DiscoveryPolicy(queue: btQueue, defaults: discoveryDefaults) { [weak self] in self?.updateScanning() }
-    deinit { UserDefaults.standard.removePersistentDomain(forName: preferenceSuite) }
-    var lastState: State?
-    let btQueue = DispatchQueue(label: "engine-tests")
-    let central = Central()
-    let mouseController = Output(), keyboardMapper = Output(), gestureRecognizer = Output()
-    var running = true, suspended = false
-    var sessions: [Int: ControllerSession] = [:]
-    var connecting: [UUID: (session: ControllerSession, slot: Int)] = [:]
-    var disconnecting = Set<UUID>()
-    var deadlines: [UUID: DispatchWorkItem] = [:]
-    var connectedAt: [Int: Date] = [:]
-    var retryAfter: [UUID: TimeInterval] = [:]
-    var retryAdvertisements: [UUID: RetryAdvertisement] = [:]
-    var retryWake: DispatchWorkItem?
-    var retryWakeAt: TimeInterval?
-    var retryWakeGeneration: UInt64 = 0
-    var retryBlockedUntil: TimeInterval = 0
-    var lastButtonsByPlayer: [Int: Int] = [:], captureLast: [Int: Int] = [:]
-    @MainActor var liveStates: [Int: ControllerState] = [:]
-    weak var findingSession: ControllerSession?
-    let visualizer = VisualizerMailbox<ControllerState>(maxSlots: 4)
-    var pointerActivity: [UUID: TimeInterval] = [:]
-    var configurations: [String: ControllerConfiguration] = [:]
-    var idleSweepTimer: DispatchSourceTimer?
-    func scheduleVisualizerDrain() {}
-    var recomputes = 0, publishes = 0, emissions = 0
-    func stopFinding() { findingSession = nil }
-    func recomputeLogical() { recomputes += 1 }
-    func publishState(_ state: State) { lastState = state }
-    func publishControllers() { publishes += 1 }
-    func emitState(slot: Int, state: ControllerState) { emissions += 1 }

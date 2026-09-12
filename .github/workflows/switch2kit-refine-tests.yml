@@ -1,0 +1,30 @@
+name: Apply reviewed test ownership migration
+on:
+  push:
+    branches: [refactor/switch2kit-library]
+    paths: [.github/refine-tests.py, .github/workflows/switch2kit-refine-tests.yml]
+permissions:
+  contents: write
+jobs:
+  apply:
+    if: github.repository == 'jmonster/Switch2Kit' && github.ref == 'refs/heads/refactor/switch2kit-library'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+      - name: Apply the reviewed migration without changing test assertions
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = 5d26f9dc5a9173dfe8be769aadd5bb2b913234cc
+          python3 .github/refine-tests.py
+          git add -- tests Sources/FinallyTheControllerWorks/Runtime
+          git diff --cached --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Migrate retained controller/output regressions to the single kit implementation'
+          git push origin HEAD:refs/heads/refactor/switch2kit-library
+          git rev-parse HEAD
